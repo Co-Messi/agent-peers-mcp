@@ -136,15 +136,23 @@ HTTP daemon on `127.0.0.1:7900`. Uses `Bun.serve()` and `bun:sqlite`.
 
 **Behavior:**
 
-*Leased delivery (new Phase 1 primitive — replaces mark-on-poll):*
-- On `/poll-messages`, broker selects all messages for the peer where `acked=0 AND (lease_token IS NULL OR lease_expires_at < now())`. In the same SQL transaction, each selected row gets a fresh `lease_token = crypto.randomUUID()` and `lease_expires_at = now() + 30s`. Response includes each message's `lease_token`.
-- On `/ack-messages`, broker marks rows with matching `lease_tokens` as `acked=1`. Rows with expired leases will not match (defensive — stale acks are ignored).
-- If the client never acks (crash, MCP transport failure, etc.), the lease expires and the same messages are returned on the next poll. Client code is responsible for idempotency — Claude already handles duplicate channel pushes gracefully; Codex sees duplicate `[PEER INBOX]` blocks and can no-op on already-responded message IDs (each block includes the immutable `message_id`).
+*Leased delivery (Phase 1 primitive):*
+- On `/poll-messages`, broker selects all messages for the peer where `acked=0 AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at < now())`. In the same SQL transaction, each selected row gets a fresh `lease_token = crypto.randomUUID()` and `lease_expires_at = now() + 30s`. Response includes each message's `lease_token`.
+- On `/ack-messages`, broker marks rows with matching `lease_tokens` as `acked=1` **only if** `lease_expires_at >= now()` at the time of ack (stale acks explicitly ignored — addresses Codex review-2 finding). If the ack arrives late, the `UPDATE` matches zero rows and the broker's response reports `acked: 0`; the message will be re-leased on the next poll and re-delivered.
+- If the client never acks at all (crash, MCP transport failure), the lease expires and the same message is returned on the next poll. The client is responsible for deduplication via the immutable `message_id` (see §5.4 and §5.5 "seen-set" patterns).
 
-*Timer-driven peer GC + liveness checks:*
-- `setInterval(gcStaleP eers, 30_000)` runs inside the broker process. Deletes peers whose `last_seen` is > 60s old. Deletes any **unacked** messages addressed to GC'd peers in the same transaction (prevents orphan accumulation — Codex finding).
-- `/send-message` runs a liveness check on the resolved target (`last_seen` fresh within 60s). If stale, returns `{ ok: false, error: "target peer stale" }` rather than accepting a message that cannot land.
-- `/rename-peer` and `/heartbeat` also refresh `last_seen` (heartbeat already does; rename does so to prevent GC from racing a live session that just renamed).
+*Atomic name allocation (addresses Codex review-2 finding):*
+- `/register` and `/rename-peer` never do read-then-write. They execute `INSERT` (or `UPDATE`) inside a transaction; on SQLite `UNIQUE` violation, catch the exception and try the next suffix. For `/register`, the retry ladder is `name`, `name-2`, `name-3`, ..., `name-99`, then auto-generate. For `/rename-peer`, a `UNIQUE` violation returns `{ ok: false, error: "name taken" }` deterministically — no retry ladder because rename has caller-specified target.
+- Concurrent `/register` with identical `PEER_NAME` is therefore deterministic: one succeeds, the other gets the next free suffix. No 500-class errors surface to the caller.
+
+*Timer-driven peer GC with orphan preservation (revised per Codex review-2):*
+- `setInterval(gcStalePeers, 30_000)` runs inside the broker process. Deletes peers whose `last_seen` is > 60s old.
+- **Does NOT delete undelivered messages addressed to GC'd peers.** Instead the messages stay in the DB with their `to_id` intact, no longer routable (nobody polls for them), but visible to `cli.ts orphaned-messages` for operator inspection. This means "send succeeded, then recipient died before delivery" is observable to the operator rather than silently discarded.
+- `/send-message` still runs a liveness check on the resolved target (last_seen < 60s). If stale, returns `{ ok: false, error: "target peer stale" }` up front so the sender sees the problem before the message is written.
+- `/rename-peer` and `/heartbeat` also refresh `last_seen`.
+
+*Known limitation — "accepted for delivery" is best-effort:*
+A `send_message` returning `ok: true` means the message was durably written to the broker and the target was alive at that moment. It does **not** guarantee delivery: the target can die between accept and the recipient's next poll. This is an honest contract; observability is via `cli.ts orphaned-messages`. Phase 2 may add sender-side delivery receipts (callback when message is acked) if the user wants stronger guarantees.
 
 **Startup ordering (load-bearing):**
 Broker must fully initialize SQLite — open the DB file, run all `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` statements, enable WAL mode — **before** calling `Bun.serve({ port: 7900, ... })`, AND before starting the GC timer. Implementation: DB init is synchronous (bun:sqlite is sync), so ordering is just top-to-bottom statement order inside `main()`; GC timer is started after `Bun.serve` resolves.
@@ -225,7 +233,14 @@ Behavior identical to existing `claude-peers-mcp/server.ts`, with these differen
 - `instructions` field uses the new naming (see exact text below)
 
 Tools: `list_peers`, `send_message`, `set_summary`, `check_messages`, `rename_peer`.
-Polling: every 1s, push via `notifications/claude/channel`. After `mcp.notification()` resolves for a given message, call `/ack-messages` with that message's `lease_token` so the broker knows the push reached transport. If `mcp.notification()` throws or the ack call fails, the broker's lease expires after 30s and the message becomes pollable again, so Claude will re-push it (Claude is expected to deduplicate by `message_id`, which is included in the channel payload `meta`).
+Polling: every 1s, push via `notifications/claude/channel`. **Deterministic dedupe via in-memory seen-set**: the server keeps a `Set<number>` of `message_id`s it has already pushed successfully in this session. On each poll tick:
+1. For each leased message `m`, check `seen.has(m.id)`.
+   - If yes → this is a re-delivery due to a lost ack. Skip `mcp.notification()`, but still include `m.lease_token` in the ack batch so the broker's stuck lease can finally close.
+   - If no → call `mcp.notification()`. On success, `seen.add(m.id)` THEN queue `m.lease_token` for the ack batch. On failure, leave `seen` alone and skip the ack so the lease expires cleanly and gets retried.
+2. After the per-message loop, issue a single `/ack-messages` call for all collected tokens. Ack failure is fine — next poll will re-attempt.
+
+The seen-set is in-memory only. On process restart, it starts empty, but any previously-delivered message has also been acked before the restart (or its lease has expired in the broker), so there's no stale state to reconcile.
+
 Heartbeat: every 15s.
 
 **Claude `instructions` field (exact text):**
@@ -262,10 +277,28 @@ The channel notification payload `meta` field includes **both** `from_peer_type`
 
 Same MCP server skeleton, **without** `claude/channel` capability. Differences from claude-server.ts:
 - Capabilities: `{ tools: {} }` only
-- **Piggyback delivery on every tool handler** (Phase 1 correctness mechanism — was Phase 2 before Codex adversarial review). Every tool call starts by calling `/poll-messages`. Any leased messages are prepended to the tool's response text. After the MCP server has serialized the response to stdout, it calls `/ack-messages` with the lease tokens. This is deterministic: it does not depend on Codex honoring any prompt, because the `[PEER INBOX]` text appears in the tool response regardless.
+- **Piggyback delivery on every tool handler** with **ack-on-next-call** (revised per Codex review-2 to avoid "ack before transport confirmation" silent-loss).
 - Registers with `peer_type: "codex"`
 - Heartbeat still runs every 15s (independent of messaging)
 - `instructions` field is informational only — design does not depend on Codex honoring it (see §6)
+
+**Ack-on-next-call pattern (the fix for Codex's critical finding):**
+
+The codex-server holds a module-level `pendingAcks: string[]` (lease tokens from the previous tool call) and a `seen: Set<number>` of message IDs it has already injected into a response in this session.
+
+Every tool handler does, in order:
+1. **Flush the previous call's acks** — if `pendingAcks.length > 0`, call `/ack-messages`. This is the moment we KNOW the previous tool response actually reached Codex (because Codex is calling us again). Success means the broker finally closes those leases. Failure means the leases will re-expire and re-deliver — no loss.
+2. **Poll for new messages** — `/poll-messages` returns freshly-leased messages. For each: if `seen.has(m.id)` it's a re-delivery after a lost ack from an earlier call; keep its lease_token queued for next-call ack (no re-injection). Else `seen.add(m.id)` and include it in this call's inbox block. Record new tokens in `pendingAcks` (replaces any previous value).
+3. **Run the tool's own logic**.
+4. **Return response with inbox block prepended**.
+
+If the MCP transport fails to deliver the response: Codex never calls again, so `pendingAcks` is never flushed, leases expire, next Codex process re-delivers everything in `seen`'s absence (new process, fresh seen-set).
+
+If Codex exits before calling another tool: same outcome — leases expire, next session re-delivers.
+
+If the user runs a single-shot Codex command (no follow-up call) and the message was in the inbox block: best-effort acknowledged. The lease will expire 30s later and, if no other Codex session takes over, the message becomes an orphan (observable via `cli.ts orphaned-messages`). This is the honest cost of Codex having no push channel — documented rather than hidden.
+
+This pattern makes Codex ack behavior **deterministically tied to an observable event** (next tool invocation) rather than a hoped-for stdout-flush callback.
 
 Tools: `list_peers`, `send_message`, `set_summary`, `check_messages`, `rename_peer` (same names as claude-server for consistency — peers don't need to know what type they're talking to).
 
@@ -317,6 +350,7 @@ Reused from existing pattern, repointed at port 7900. Subcommands:
 - `bun cli.ts peers` — peer list only (shows `name` prominently, id as secondary)
 - `bun cli.ts send <name-or-id> <message>` — inject a message into a session (accepts name OR UUID)
 - `bun cli.ts rename <name-or-id> <new-name>` — admin rename a peer
+- `bun cli.ts orphaned-messages` — list messages whose `to_id` no longer matches any active peer (from recipient-death-after-accept). Shows `id, from_id, to_id, sent_at, text preview`. Phase 2 may add an option to re-route or purge.
 - `bun cli.ts kill-broker` — stop daemon
 
 ### 5.7 Identity & naming (rationale, schema, tools, flows)
@@ -559,8 +593,13 @@ codex   # Codex auto-loads MCP from config.toml
 |---|---|
 | Broker not running on first server start | `ensureBroker()` spawns it; throws after 6s if cannot start |
 | Broker dies during session | All broker calls fail → MCP tool returns error message → user/agent sees the failure → restart session to recover (Phase 2 will add reconnect). Messages already leased but not acked survive broker restart (they're in SQLite, lease expires in 30s, next poll re-delivers). |
-| Client polled a message but crashed before ack | Lease expires after 30s → message re-polled on next request → retry transparent to sender. Recipient dedupes by `message_id`. |
-| `mcp.notification()` throws on Claude push | Ack is not called → lease expires → message re-pushed on next poll. Claude dedupes. |
+| Client polled a message but crashed before ack | Lease expires after 30s → message re-polled on next request → retry transparent to sender. Recipient dedupes by `message_id` via in-memory seen-set (§5.4, §5.5). |
+| `mcp.notification()` throws on Claude push | Server does NOT add to seen-set and does NOT ack. Lease expires → next poll re-pushes. Claude dedupes. |
+| Codex tool response fails to reach Codex (transport error) | `pendingAcks` never flushed → leases expire → next poll re-leases and re-injects (seen-set caught up when previous inject succeeded, but since the transport failed the whole session may be gone too). |
+| Stale `/ack-messages` arrives after lease expiry | Broker's `lease_expires_at >= now()` predicate rejects it (`acked: 0` returned) → message stays pollable → next poll re-delivers. |
+| Two peers concurrently register with identical `PEER_NAME` | Broker's atomic INSERT + UNIQUE-violation retry ladder assigns `name`, `name-2`, `name-3`, ... deterministically. No 500-class errors. |
+| Two peers concurrently rename to the same `new_name` | Broker's atomic UPDATE + UNIQUE-violation catch returns `{ ok: false, error: "name taken" }` to the loser. Winner keeps new name. |
+| Send succeeds, target dies before poll | `send_message` returns `ok: true` (honest best-effort contract). GC does NOT delete the undelivered row — it stays as an orphan, surfaced via `cli.ts orphaned-messages`. |
 | `send_message` to unknown peer (bad id/name) | Broker returns `{ ok: false, error: "unknown peer" }` → tool returns visible error |
 | `send_message` to **stale** peer (alive in DB but heartbeat > 60s old) | Broker returns `{ ok: false, error: "target peer stale" }` → sender sees it and can pick a different target or retry later |
 | Auto-summary (gpt-5.4-nano) fails | Logged to stderr, peer registers with empty summary |
@@ -613,7 +652,15 @@ Automated tests (Phase 1, minimal): `bun test` for `shared/broker-client.ts` aga
 
 - 2026-04-13 — Initial spec written. Phase 1 scope locked. Approved by user.
 - 2026-04-13 — Added §5.7 Identity & naming system. Immutable UUID `id` + mutable `name` column, auto-generated adjective-noun names, `PEER_NAME` env override, terminal tab title via OSC escape, `rename_peer` tool, `send_message` accepts name or id. Motivated by user's PR-workflow need for stable human-readable handles across sessions.
-- 2026-04-13 — Incorporated Codex adversarial-review findings:
+- 2026-04-13 — Incorporated Codex adversarial review round 2 findings:
+  - [critical] Codex piggyback was acking before transport confirmation → replaced with **ack-on-next-call** pattern (§5.5). Ack happens when the NEXT tool call proves the PREVIOUS response landed. Crashes and transport failures cause lease expiry + re-delivery, never silent loss.
+  - [high] Stale ack acceptance → broker's `/ack-messages` now requires `lease_expires_at >= now()` (§5.1). Late acks return `acked: 0` and the lease expires cleanly.
+  - [high] GC silently deleted undelivered messages after recipient death → GC now preserves undelivered rows as **orphans** visible via `cli.ts orphaned-messages` (§5.1, §5.6). Accepted-then-lost is observable, not hidden.
+  - [high] Register/rename name allocation race (read-then-insert) → replaced with atomic INSERT/UPDATE + UNIQUE-violation catch loop (§5.1). Concurrent registers with same `PEER_NAME` are deterministic.
+  - [medium] Duplicate detection relied on model judgment → both servers now keep an in-memory `seen: Set<message_id>` and deterministically skip re-injection of already-delivered messages (§5.4, §5.5). No model intelligence required for correctness.
+  - Spec now includes a "best-effort delivery" honest-contract note (§5.1) because lease+ack fixes poll-to-delivery loss but does not fix accept-to-recipient-death loss. Observability via orphan table replaces hiding that failure mode.
+
+- 2026-04-13 — Incorporated Codex adversarial review round 1 findings:
   - Promoted explicit **lease + ack** message delivery from Phase 2 to Phase 1 (eliminates silent data loss when poll succeeds but delivery fails)
   - Replaced reactive `list_peers`-triggered GC with **broker-owned timer GC** every 30s + liveness checks on `/send-message` (prevents accepting messages for dead sessions; cleans up orphaned messages when peer is GC'd)
   - Restricted `rename_peer` MCP tool to **self-rename only**; admin rename stays in `cli.ts` as a local operator action (removes peer-to-peer impersonation risk)

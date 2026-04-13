@@ -554,6 +554,20 @@ test("registerPeer appends -2 on name collision", () => {
   expect(b.name).toBe("dup-2");
 });
 
+test("registerPeer is atomic under simulated interleaving (round-2 fix)", () => {
+  // We can't trivially drive multi-thread concurrency on bun:sqlite from the test, but we can
+  // prove the check-then-write race is closed by inserting a row with name="race"
+  // under broker's very nose, then asking the broker to register with name="race" —
+  // the broker's atomic INSERT must catch UNIQUE and advance to "race-2".
+  db.query(
+    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, registered_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run("external-id", "race", "claude", 99, "/ext", null, null, "", new Date().toISOString(), new Date().toISOString());
+
+  const res = registerPeer(db, { peer_type: "claude", pid: 1, cwd: "/a", git_root: null, tty: null, summary: "", name: "race" });
+  expect(res.name).toBe("race-2");
+});
+
 test("heartbeatPeer bumps last_seen", async () => {
   const { id } = registerPeer(db, { peer_type: "claude", pid: 1, cwd: "/a", git_root: null, tty: null, summary: "" });
   const initial = getPeer(db, id)!.last_seen;
@@ -583,7 +597,7 @@ bun test tests/broker-peers.test.ts
 ```
 Expected: FAIL on missing exports.
 
-- [ ] **Step 3: Extend `broker.ts` with peer CRUD**
+- [ ] **Step 3: Extend `broker.ts` with peer CRUD (atomic name allocation via INSERT + catch UNIQUE)**
 
 Append to `broker.ts`:
 ```ts
@@ -595,44 +609,47 @@ import { generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/na
 
 function nowIso(): string { return new Date().toISOString(); }
 
-function nameTaken(db: Database, name: string): boolean {
-  const row = db.query<{ c: number }, [string]>("SELECT COUNT(*) AS c FROM peers WHERE name = ?").get(name);
-  return (row?.c ?? 0) > 0;
+function isUniqueViolation(e: unknown): boolean {
+  // bun:sqlite surfaces this as an Error with message including "UNIQUE constraint failed"
+  return e instanceof Error && /UNIQUE constraint failed/i.test(e.message);
 }
 
-function resolveRequestedName(db: Database, requested: string | undefined): string {
-  // 1. explicit + valid + free → use as-is
-  if (requested && isValidName(requested) && !nameTaken(db, requested)) return requested;
-
-  // 2. explicit but taken → append -2, -3, ... up to -99
+function* nameCandidates(requested: string | undefined): Generator<string> {
+  // 1. Explicit + valid → try as-is, then requested-2 ... requested-99
   if (requested && isValidName(requested)) {
+    yield requested;
     for (let i = 2; i <= 99; i++) {
       const candidate = `${requested}-${i}`;
-      if (candidate.length <= NAME_MAX_LEN && !nameTaken(db, candidate)) return candidate;
+      if (candidate.length <= NAME_MAX_LEN) yield candidate;
     }
   }
-
-  // 3. auto-generate; retry up to 10 times before numeric suffix
-  for (let i = 0; i < 10; i++) {
-    const candidate = generateName();
-    if (!nameTaken(db, candidate)) return candidate;
-  }
+  // 2. Auto-generate; tight pool, low collision probability
+  for (let i = 0; i < 100; i++) yield generateName();
+  // 3. Exhaustive fallback with numeric suffix on auto names
   for (let i = 2; i <= 999; i++) {
     const candidate = `${generateName()}-${i}`;
-    if (candidate.length <= NAME_MAX_LEN && !nameTaken(db, candidate)) return candidate;
+    if (candidate.length <= NAME_MAX_LEN) yield candidate;
   }
-  throw new Error("broker: unable to allocate unique peer name after exhaustive retry");
 }
 
 export function registerPeer(db: Database, req: RegisterRequest): RegisterResponse {
   const id = randomUUID();
-  const name = resolveRequestedName(db, req.name);
   const ts = nowIso();
-  db.query(
+  const insert = db.query(
     `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, registered_at, last_seen)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, name, req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary, ts, ts);
-  return { id, name };
+  );
+
+  for (const candidate of nameCandidates(req.name)) {
+    try {
+      insert.run(id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary, ts, ts);
+      return { id, name: candidate };
+    } catch (e) {
+      if (!isUniqueViolation(e)) throw e;
+      // UNIQUE violation → name taken, advance to next candidate
+    }
+  }
+  throw new Error("broker: unable to allocate unique peer name after exhaustive retry");
 }
 
 export function heartbeatPeer(db: Database, id: string): void {
@@ -641,8 +658,9 @@ export function heartbeatPeer(db: Database, id: string): void {
 
 export function unregisterPeer(db: Database, id: string): void {
   db.query("DELETE FROM peers WHERE id = ?").run(id);
-  // Also remove any unacked messages addressed to this peer to prevent orphans.
-  db.query("DELETE FROM messages WHERE to_id = ? AND acked = 0").run(id);
+  // Note: undelivered messages addressed to this peer are intentionally left in the
+  // DB as orphans (observable via cli.ts orphaned-messages). This matches the
+  // honest best-effort delivery contract — see spec §5.1.
 }
 
 export function setPeerSummary(db: Database, id: string, summary: string): void {
@@ -1057,7 +1075,7 @@ git commit -m "feat(broker): poll-messages with lease allocation"
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import {
   initDb, registerPeer, sendMessage, pollMessages, ackMessages,
-  renamePeer, gcStalePeers, getPeer, getPeerByName,
+  renamePeer, gcStalePeers, listOrphanedMessages, getPeer, getPeerByName,
 } from "../broker";
 import type { Database } from "bun:sqlite";
 import { unlinkSync, existsSync } from "node:fs";
@@ -1079,6 +1097,21 @@ test("ackMessages marks matching rows as acked; later polls skip them", () => {
   expect(pollMessages(db, b.id).length).toBe(0);
 });
 
+test("ackMessages REJECTS late acks whose lease has already expired (round-2 fix)", () => {
+  const a = registerPeer(db, { peer_type: "claude", pid: 1, cwd: "/x", git_root: null, tty: null, summary: "", name: "a" });
+  const b = registerPeer(db, { peer_type: "claude", pid: 2, cwd: "/x", git_root: null, tty: null, summary: "", name: "b" });
+  sendMessage(db, { from_id: a.id, to_id_or_name: "b", text: "m" });
+  const leased = pollMessages(db, b.id);
+  // Force lease to be in the past
+  db.query("UPDATE messages SET lease_expires_at = ? WHERE id = ?").run("1970-01-01T00:00:00.000Z", leased[0]!.id);
+  // Late ack arrives
+  const res = ackMessages(db, { id: b.id, lease_tokens: leased.map(m => m.lease_token) });
+  expect(res.acked).toBe(0); // predicate rejected the stale lease
+  // Message should therefore still be deliverable
+  const redelivered = pollMessages(db, b.id);
+  expect(redelivered.length).toBe(1);
+});
+
 test("renamePeer to new unique name succeeds; duplicate rejects; invalid rejects", () => {
   const a = registerPeer(db, { peer_type: "claude", pid: 1, cwd: "/x", git_root: null, tty: null, summary: "", name: "alpha" });
   const b = registerPeer(db, { peer_type: "claude", pid: 2, cwd: "/x", git_root: null, tty: null, summary: "", name: "beta"  });
@@ -1097,17 +1130,21 @@ test("renamePeer to new unique name succeeds; duplicate rejects; invalid rejects
   expect(bad.error).toMatch(/invalid/i);
 });
 
-test("gcStalePeers removes peers with last_seen older than threshold AND their unacked messages", () => {
+test("gcStalePeers removes peer rows but PRESERVES undelivered messages as orphans (round-2 fix)", () => {
   const a = registerPeer(db, { peer_type: "claude", pid: 1, cwd: "/x", git_root: null, tty: null, summary: "", name: "alpha" });
   const b = registerPeer(db, { peer_type: "claude", pid: 2, cwd: "/x", git_root: null, tty: null, summary: "", name: "beta" });
-  sendMessage(db, { from_id: a.id, to_id_or_name: "beta", text: "orphan?" });
-  // Backdate beta
+  sendMessage(db, { from_id: a.id, to_id_or_name: "beta", text: "you will die before reading this" });
   db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run("1970-01-01T00:00:00.000Z", b.id);
   const removed = gcStalePeers(db);
   expect(removed).toBe(1);
   expect(getPeer(db, b.id)).toBeNull();
+  // Message is still in the DB (orphaned) — observable via listOrphanedMessages
   const remaining = db.query<{ c: number }, [string]>("SELECT COUNT(*) AS c FROM messages WHERE to_id = ?").get(b.id);
-  expect(remaining?.c).toBe(0);
+  expect(remaining?.c).toBe(1);
+  const orphans = listOrphanedMessages(db);
+  expect(orphans.length).toBe(1);
+  expect(orphans[0]!.to_id).toBe(b.id);
+  expect(orphans[0]!.text).toBe("you will die before reading this");
 });
 ```
 
@@ -1118,7 +1155,7 @@ bun test tests/broker-ack-rename-gc.test.ts
 ```
 Expected: FAIL.
 
-- [ ] **Step 3: Add ack/rename/gc functions to `broker.ts`**
+- [ ] **Step 3: Add ack/rename/gc/orphan functions to `broker.ts`**
 
 Append:
 ```ts
@@ -1127,21 +1164,28 @@ import type { AckMessagesRequest, AckMessagesResponse, RenamePeerRequest, Rename
 export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesResponse {
   if (req.lease_tokens.length === 0) return { ok: true, acked: 0 };
   const placeholders = req.lease_tokens.map(() => "?").join(",");
+  // Reject stale acks: lease must not be expired at this moment.
   const sql = `UPDATE messages SET acked = 1, lease_token = NULL, lease_expires_at = NULL
-               WHERE lease_token IN (${placeholders}) AND to_id = ? AND acked = 0`;
-  const info = db.query(sql).run(...req.lease_tokens, req.id);
-  // Bun's SQL returns { changes }
+               WHERE lease_token IN (${placeholders})
+                 AND to_id = ?
+                 AND acked = 0
+                 AND lease_expires_at IS NOT NULL
+                 AND lease_expires_at >= ?`;
+  const info = db.query(sql).run(...req.lease_tokens, req.id, nowIso());
   return { ok: true, acked: (info as any).changes ?? 0 };
 }
 
 export function renamePeer(db: Database, req: RenamePeerRequest): RenamePeerResponse {
   if (!isValidName(req.new_name)) return { ok: false, error: "invalid name" };
-  if (nameTaken(db, req.new_name)) return { ok: false, error: "name taken" };
-  const ts = nowIso();
-  const info = db.query("UPDATE peers SET name = ?, last_seen = ? WHERE id = ?")
-    .run(req.new_name, ts, req.id);
-  if (((info as any).changes ?? 0) === 0) return { ok: false, error: "unknown peer" };
-  return { ok: true, name: req.new_name };
+  try {
+    const info = db.query("UPDATE peers SET name = ?, last_seen = ? WHERE id = ?")
+      .run(req.new_name, nowIso(), req.id);
+    if (((info as any).changes ?? 0) === 0) return { ok: false, error: "unknown peer" };
+    return { ok: true, name: req.new_name };
+  } catch (e) {
+    if (isUniqueViolation(e)) return { ok: false, error: "name taken" };
+    throw e;
+  }
 }
 
 export function gcStalePeers(db: Database): number {
@@ -1149,12 +1193,31 @@ export function gcStalePeers(db: Database): number {
   const tx = db.transaction(() => {
     const stale = db.query<{ id: string }, [string]>("SELECT id FROM peers WHERE last_seen < ?").all(cutoff);
     for (const row of stale) {
-      db.query("DELETE FROM messages WHERE to_id = ? AND acked = 0").run(row.id);
+      // Intentionally do NOT delete unacked messages — spec §5.1 orphan-preserving GC.
       db.query("DELETE FROM peers WHERE id = ?").run(row.id);
     }
     return stale.length;
   });
   return tx();
+}
+
+// Orphans: undelivered messages whose to_id no longer matches any active peer.
+export interface OrphanMessage {
+  id: number;
+  from_id: string;
+  to_id: string;
+  text: string;
+  sent_at: string;
+}
+
+export function listOrphanedMessages(db: Database): OrphanMessage[] {
+  return db.query<OrphanMessage, []>(
+    `SELECT m.id, m.from_id, m.to_id, m.text, m.sent_at
+     FROM messages m
+     LEFT JOIN peers p ON p.id = m.to_id
+     WHERE p.id IS NULL AND m.acked = 0
+     ORDER BY m.id ASC`
+  ).all();
 }
 ```
 
@@ -1961,18 +2024,27 @@ git commit -m "feat(claude-server): register, tools, heartbeat (push in next tas
 **Files:**
 - Modify: `claude-server.ts`
 
-- [ ] **Step 1: Add a polling loop that pushes via channel and acks**
+- [ ] **Step 1: Add a polling loop that pushes via channel with seen-set dedupe, then acks**
 
 Insert after the `// MCP` block in `main()` (before the heartbeat block):
 
 ```ts
-  // Polling + channel push + ack
+  // In-memory dedupe: message_ids we have already pushed successfully this session.
+  // See spec §5.4 for rationale — deterministic dedupe, no model intelligence required.
+  const seen = new Set<number>();
+
   const pollAndPush = async () => {
     if (!myId) return;
     try {
       const msgs = await client.pollMessages(myId);
-      const acked: string[] = [];
+      const toAck: string[] = [];
       for (const m of msgs) {
+        if (seen.has(m.id)) {
+          // Re-delivery after a lost ack. Queue the new lease_token so the broker can close
+          // the stuck lease, but DO NOT push again.
+          toAck.push(m.lease_token);
+          continue;
+        }
         try {
           await mcp.notification({
             method: "notifications/claude/channel",
@@ -1990,13 +2062,15 @@ Insert after the `// MCP` block in `main()` (before the heartbeat block):
               },
             },
           });
-          acked.push(m.lease_token);
+          // Mark delivered in seen BEFORE ack so a later ack failure cannot cause a re-push.
+          seen.add(m.id);
+          toAck.push(m.lease_token);
         } catch (e) {
           log(`push failed (lease will expire + redeliver): ${e instanceof Error ? e.message : String(e)}`);
         }
       }
-      if (acked.length > 0) {
-        try { await client.ackMessages({ id: myId, lease_tokens: acked }); } catch { /* next poll picks up remainder */ }
+      if (toAck.length > 0) {
+        try { await client.ackMessages({ id: myId, lease_tokens: toAck }); } catch { /* next poll picks up remainder */ }
       }
     } catch (e) {
       log(`poll error: ${e instanceof Error ? e.message : String(e)}`);
@@ -2110,16 +2184,45 @@ const TOOLS = [
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-// Piggyback wrapper: every tool handler first polls the inbox, then runs the tool,
-// then prepends the inbox block to the returned text, and finally acks.
+// Module-level ack-on-next-call state (spec §5.5).
+// Each tool call flushes acks from the PREVIOUS call (proof the previous response was
+// delivered to Codex, because Codex is calling us again), then polls and stores new tokens
+// for the NEXT call. See Codex adversarial review round-2 for why ack-during-handler-return
+// is insufficient.
+const pendingAcks: string[] = [];
+const seen = new Set<number>();
+
 async function withPiggyback(
   handler: () => Promise<{ text: string; isError?: boolean }>,
 ): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
   if (!myId) return { content: [{ type: "text", text: "Not registered with broker yet" }], isError: true };
 
+  // 1. Flush previous-call acks — only now do we know the previous response reached Codex.
+  if (pendingAcks.length > 0) {
+    const toFlush = pendingAcks.splice(0, pendingAcks.length);
+    try { await client.ackMessages({ id: myId, lease_tokens: toFlush }); }
+    catch (e) { log(`pending ack flush failed (lease will expire): ${e instanceof Error ? e.message : String(e)}`); }
+  }
+
+  // 2. Poll for new messages.
   let leased: LeasedMessage[] = [];
   try { leased = await client.pollMessages(myId); } catch (e) { log(`poll failed: ${e instanceof Error ? e.message : String(e)}`); }
 
+  // 3. Partition polled messages into fresh vs re-delivery.
+  const fresh: LeasedMessage[] = [];
+  for (const m of leased) {
+    if (seen.has(m.id)) {
+      // Re-delivery after lost ack. Queue its lease_token for next-call ack so the broker
+      // can finally close the stuck lease. Do NOT re-inject.
+      pendingAcks.push(m.lease_token);
+    } else {
+      fresh.push(m);
+      seen.add(m.id);
+      pendingAcks.push(m.lease_token);
+    }
+  }
+
+  // 4. Run the tool's own logic.
   let toolText = "";
   let toolError: boolean | undefined;
   try {
@@ -2131,17 +2234,9 @@ async function withPiggyback(
     toolError = true;
   }
 
-  const inbox = formatInboxBlock(leased);
+  // 5. Return response with inbox prepended. Ack of these leases will happen on the NEXT call.
+  const inbox = formatInboxBlock(fresh);
   const finalText = inbox + toolText;
-
-  if (leased.length > 0) {
-    try {
-      await client.ackMessages({ id: myId, lease_tokens: leased.map(m => m.lease_token) });
-    } catch (e) {
-      log(`ack failed (lease will expire + redeliver): ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-
   return { content: [{ type: "text", text: finalText }], isError: toolError };
 }
 
@@ -2234,6 +2329,12 @@ async function main() {
 
   const cleanup = async () => {
     clearInterval(hb);
+    // Best-effort: flush any outstanding acks before exiting. If this fails, leases will
+    // expire and messages will be re-delivered when a Codex session comes back.
+    if (myId && pendingAcks.length > 0) {
+      try { await client.ackMessages({ id: myId, lease_tokens: pendingAcks.splice(0, pendingAcks.length) }); }
+      catch { /* best effort */ }
+    }
     if (myId) { try { await client.unregister(myId); } catch { /* best effort */ } }
     process.exit(0);
   };
@@ -2255,7 +2356,7 @@ Expected: exit 0.
 
 ```bash
 git add codex-server.ts
-git commit -m "feat(codex-server): piggyback-wrapped tools + ack"
+git commit -m "feat(codex-server): piggyback + ack-on-next-call + seen-set dedupe"
 ```
 
 ---
@@ -2318,6 +2419,32 @@ async function cmdRename(target: string, newName: string) {
   console.log(`renamed ${found.name} -> ${res.name}`);
 }
 
+async function cmdOrphans() {
+  // Orphans need DB access, which the CLI doesn't have natively — hit a small broker
+  // endpoint. For Phase 1 we expose this by opening the SQLite file directly in read-only
+  // mode. This works because SQLite WAL allows concurrent readers.
+  const { Database } = await import("bun:sqlite");
+  const { resolve } = await import("node:path");
+  const { homedir } = await import("node:os");
+  const dbPath = process.env.AGENT_PEERS_DB || resolve(homedir(), ".agent-peers.db");
+  const db = new Database(dbPath, { readonly: true });
+  type Row = { id: number; from_id: string; to_id: string; text: string; sent_at: string };
+  const rows = db.query<Row, []>(
+    `SELECT m.id, m.from_id, m.to_id, m.text, m.sent_at
+     FROM messages m
+     LEFT JOIN peers p ON p.id = m.to_id
+     WHERE p.id IS NULL AND m.acked = 0
+     ORDER BY m.id ASC`
+  ).all();
+  db.close();
+  if (rows.length === 0) { console.log("(no orphaned messages)"); return; }
+  for (const r of rows) {
+    const preview = r.text.length > 80 ? r.text.slice(0, 77) + "..." : r.text;
+    console.log(`#${r.id}  from=${r.from_id}  to=${r.to_id}  sent=${r.sent_at}`);
+    console.log(`  ${preview}`);
+  }
+}
+
 async function cmdKillBroker() {
   // No admin endpoint — use lsof + kill as a pragmatic helper.
   const proc = Bun.spawn(["lsof", "-t", "-i", `:${BROKER_PORT}`], { stdout: "pipe", stderr: "ignore" });
@@ -2336,6 +2463,7 @@ switch (sub) {
   case "peers":       await cmdPeers(); break;
   case "send":        if (rest.length < 2) { console.error("usage: cli.ts send <name-or-id> <message>"); process.exit(2); } await cmdSend(rest[0]!, rest.slice(1).join(" ")); break;
   case "rename":      if (rest.length !== 2) { console.error("usage: cli.ts rename <name-or-id> <new-name>"); process.exit(2); } await cmdRename(rest[0]!, rest[1]!); break;
+  case "orphaned-messages": await cmdOrphans(); break;
   case "kill-broker": await cmdKillBroker(); break;
   default:
     console.log(`usage:
@@ -2343,6 +2471,7 @@ switch (sub) {
   bun cli.ts peers
   bun cli.ts send <name-or-id> <message>
   bun cli.ts rename <name-or-id> <new-name>
+  bun cli.ts orphaned-messages
   bun cli.ts kill-broker`);
     process.exit(sub ? 2 : 0);
 }
@@ -2443,6 +2572,7 @@ bun cli.ts status                       # broker + peer list
 bun cli.ts peers                        # peer list only
 bun cli.ts send <name-or-id> "<msg>"    # inject a message from the shell
 bun cli.ts rename <name-or-id> <new>    # admin rename a peer
+bun cli.ts orphaned-messages            # list messages whose recipient died before delivery
 bun cli.ts kill-broker                  # stop the broker daemon
 ```
 
