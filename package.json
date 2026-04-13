@@ -1,0 +1,18 @@
+{
+  "name": "agent-peers-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Unified peer-discovery and messaging MCP for Claude Code + Codex CLI sessions",
+  "private": true,
+  "scripts": {
+    "broker": "bun broker.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.11",
+    "typescript": "^5.9.3"
+  }
+}
