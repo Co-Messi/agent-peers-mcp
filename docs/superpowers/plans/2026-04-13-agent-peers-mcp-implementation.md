@@ -982,6 +982,35 @@ test("pollMessages re-delivers after lease expiry", () => {
   // Lease token must change on re-delivery
   expect(second[0]!.lease_token).not.toBe(first[0]!.lease_token);
 });
+
+test("pollMessages heartbeat is rolled back if tx throws (round-4 fix)", () => {
+  const { a, b } = mkPeers();
+  sendMessage(db, { from_id: a.id, to_id_or_name: "beta", text: "once" });
+
+  // Backdate last_seen so we can observe whether the heartbeat fires
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", b.id);
+  const before = db.query<{ last_seen: string }, [string]>(
+    "SELECT last_seen FROM peers WHERE id = ?"
+  ).get(b.id)!.last_seen;
+
+  // Force the SELECT inside the tx to fail by temporarily dropping the index it uses.
+  // (SELECT still works without the index, so we need a harsher trick: rename the
+  // messages table mid-transaction from a trigger-prepared corruption. Instead we
+  // use the simpler approach: feed pollMessages a non-existent peer id AFTER dropping
+  // the messages table, then restore it.)
+  db.exec("ALTER TABLE messages RENAME TO messages_bak");
+  try {
+    expect(() => pollMessages(db, b.id)).toThrow();
+  } finally {
+    db.exec("ALTER TABLE messages_bak RENAME TO messages");
+  }
+
+  // Heartbeat was inside the tx → rolled back with the failing SELECT.
+  const after = db.query<{ last_seen: string }, [string]>(
+    "SELECT last_seen FROM peers WHERE id = ?"
+  ).get(b.id)!.last_seen;
+  expect(after).toBe(before);
+});
 ```
 
 - [ ] **Step 2: Run to verify fail**
@@ -1004,8 +1033,14 @@ export function pollMessages(db: Database, id: string): LeasedMessage[] {
   const nowStr = now.toISOString();
   const leaseUntil = new Date(now.getTime() + LEASE_DURATION_MS).toISOString();
 
-  // One transaction: select undelivered-and-unleased rows, stamp them with a fresh lease, return enriched rows.
+  // Single transaction: heartbeat + lease selection + lease update. The heartbeat
+  // MUST live inside the transaction so a poll that throws mid-way does NOT
+  // refresh last_seen — otherwise a broken session stays "alive" in the broker's
+  // eyes and never gets GC'd (Codex review round-4 fix).
   const tx = db.transaction(() => {
+    // Liveness bump inside tx → rolls back on any failure below
+    db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run(nowStr, id);
+
     const rows = db.query<
       { id: number; from_id: string; to_id: string; text: string; sent_at: string },
       [string, string, string]
@@ -1038,9 +1073,6 @@ export function pollMessages(db: Database, id: string): LeasedMessage[] {
     }
     return result;
   });
-
-  // Update heartbeat in same call (cheap, makes polling also liveness-bump)
-  heartbeatPeer(db, id);
 
   return tx();
 }
@@ -2754,7 +2786,40 @@ bun "/Users/siewbrayden/Desktop/Brayden's Projects/agent-peers-mcp/cli.ts" kill-
 
 ---
 
-## Task 25: Final commit + tag
+## Task 25: Regression smoke tests for round-3/4 delivery guarantees
+
+Manual validation for the invariants Codex asked us to protect. Do not mark this task complete until every step passes.
+
+- [ ] **Step 1: Shutdown does NOT flush pendingAcks (round-3 critical)**
+
+```bash
+# Start Codex session A (sender) and Codex session B (receiver)
+PEER_NAME=sender codex &
+PEER_NAME=receiver codex &
+
+# In sender: send a message to receiver
+# Then IMMEDIATELY send SIGTERM to receiver BEFORE receiver acknowledges by calling another tool
+kill -TERM <receiver-pid>
+
+# Restart receiver as a fresh process
+PEER_NAME=receiver codex
+# In receiver, call any tool (e.g., list_peers)
+# Expected: [PEER INBOX] block contains the message — it was NOT silently acked on shutdown.
+```
+
+- [ ] **Step 2: Codex inbox surfaces on ANY tool call, not just check_messages (round-4 medium)**
+
+Start a Codex session. Have another session send a message. In Codex:
+- Call `list_peers` (not `check_messages`)
+- Expected: `[PEER INBOX]` block is prepended to the `list_peers` response.
+
+- [ ] **Step 3: Residual narrow-window documentation is accurate (round-4 residual limit)**
+
+Read spec §5.5 "Residual limitations" out loud. Confirm the known-limitation scenarios match what's actually implemented. File a Phase 2 ticket for explicit client receipts if you want stricter delivery.
+
+---
+
+## Task 26: Final commit + tag
 
 - [ ] **Step 1: Ensure tree is clean**
 

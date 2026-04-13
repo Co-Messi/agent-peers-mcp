@@ -473,13 +473,18 @@ machine (Claude Code or Codex CLI sessions) can discover you and send you
 messages.
 
 INBOX HANDLING:
-- This MCP does NOT push messages to you mid-task. You must check your 
-  inbox by calling the check_messages tool.
-- Between major steps of any long task, call check_messages once. If you 
-  are doing rapid-fire small steps, call it every few steps.
-- When check_messages returns peer messages, treat each like a coworker's 
-  Slack message: finish your current step, then respond via send_message 
-  using the from_id field.
+- Any tool call on this MCP automatically surfaces pending peer messages: 
+  if there are any, the response text starts with a [PEER INBOX] block 
+  listing them with inline reply hints. You do NOT need to call anything 
+  special — list_peers, set_summary, even a send_message will all pick up 
+  your inbox.
+- check_messages is a convenience trigger that does only the inbox surfacing 
+  (and nothing else). Use it when you have no other tool call to make but 
+  want to poke for messages.
+- When you see a [PEER INBOX] block, treat each message like a coworker's 
+  Slack message: finish your current step, then respond via 
+  send_message(to_id=<from_name>, message="..."). The from_name and 
+  message_id are inside the block.
 
 ON STARTUP:
 - Call set_summary once with a 1-2 sentence description of what you are 
@@ -488,18 +493,21 @@ ON STARTUP:
 PEER DISCOVERY:
 - Use list_peers with scope="machine" to see all agents, "directory" for 
   same cwd, "repo" for same git repo.
-- The peer_type field on each peer tells you whether they are "claude" or 
-  "codex" — both can send and receive messages identically.
+- Each peer has a human-readable "name" (e.g. "frontend-tab", "calm-fox") 
+  and an immutable UUID "id". The peer_type field tells you whether they 
+  are "claude" or "codex" — both send and receive messages identically.
 
 TOOLS:
-- list_peers(scope) — discover other agents. Each peer has a human-readable 
-  "name" (e.g. "frontend-tab", "calm-fox") plus an immutable UUID "id".
-- send_message(to_id, message) — message a peer. The to_id field accepts 
-  either the UUID or the human name; prefer the name for readability.
+- list_peers(scope, peer_type?) — discover other agents
+- send_message(to_id, message) — message a peer. to_id accepts UUID or name 
+  (prefer the name for readability).
 - set_summary(summary) — describe your current work
-- check_messages — fetch any pending messages addressed to you
-- rename_peer(new_name) — rename yourself (or pass target_id to rename 
-  another peer). Names must be unique among active peers. URL-safe chars only.
+- check_messages — convenience trigger to surface the inbox (same effect 
+  as any other tool call; does nothing else)
+- rename_peer(new_name) — rename YOURSELF only. Names are 1-32 chars, 
+  [a-zA-Z0-9_-], and must be unique among active peers. You cannot rename 
+  other peers from this tool (admin rename is only available via the 
+  local `bun cli.ts rename ...` command by the operator).
 ```
 
 ---
@@ -520,14 +528,16 @@ If step 4 throws or step 5 fails, the lease expires → next poll re-delivers. C
 ### 7.2 Claude → Codex
 1. Claude A calls `send_message(to="backend-codex", text="…")`
 2. claude-server A → `/send-message` (same liveness check)
-3. codex-server X has no timer poll. Next time Codex calls *any* tool (`list_peers`, `send_message`, `set_summary`, `check_messages`, `rename_peer`):
-   - tool handler's first step is `/poll-messages` → broker leases the row
-   - tool handler builds its normal response, **prepending** the piggyback `[PEER INBOX]` block (§5.5 format)
-   - MCP serializes response to stdout
-   - tool handler → `/ack-messages` after serialization completes
-4. Codex sees the block in the tool output and responds via `send_message(to_id="frontend-tab", …)` — reply hint is inside the block itself
+3. codex-server X has no timer poll. Next time Codex calls **any** tool on this MCP (`list_peers`, `send_message`, `set_summary`, `check_messages`, `rename_peer`):
+   - **Flush previous call's acks first** — if `pendingAcks` is non-empty, call `/ack-messages` now (heuristic confirmation that the previous response cycle succeeded; see §5.5 on the narrow residual-loss window this does NOT fully close).
+   - Call `/poll-messages` → broker leases any pending messages for this peer and returns them with fresh lease tokens.
+   - For each polled message: if `seen.has(m.id)` queue its lease_token in `pendingAcks` and do NOT re-inject. Else `seen.add(m.id)`, push the lease_token into `pendingAcks`, and include the message in the inbox block built for this response.
+   - Run the tool's own logic.
+   - Return response with the inbox block prepended.
+   - **Do NOT ack inside this handler.** The tokens in `pendingAcks` will be flushed by the NEXT tool call.
+4. Codex sees the `[PEER INBOX]` block in the tool output and responds via `send_message(to_id="frontend-tab", …)`. The reply hint is inline in every block.
 
-Latency: bounded by Codex calling any tool. Since Codex tool-calls between almost every step, in practice this is sub-second to a few seconds. If Codex is idle, messages wait at the broker until the next tool call. If Codex crashes before acking, lease expires and the next tool call re-delivers.
+Latency: bounded by Codex issuing another tool call. Every-step tool usage (common in Codex) keeps this sub-second. If Codex is idle, messages wait at the broker until the next tool call. If Codex crashes before the next call, leases expire after 30s and the next session re-leases + re-injects.
 
 ### 7.3 Codex → Claude
 1. Codex calls `send_message(to="frontend-tab", text="…")`
@@ -655,6 +665,12 @@ Automated tests (Phase 1, minimal): `bun test` for `shared/broker-client.ts` aga
 
 - 2026-04-13 — Initial spec written. Phase 1 scope locked. Approved by user.
 - 2026-04-13 — Added §5.7 Identity & naming system. Immutable UUID `id` + mutable `name` column, auto-generated adjective-noun names, `PEER_NAME` env override, terminal tab title via OSC escape, `rename_peer` tool, `send_message` accepts name or id. Motivated by user's PR-workflow need for stable human-readable handles across sessions.
+- 2026-04-13 — Incorporated Codex adversarial review round 4 findings:
+  - [high] §7.2 data-flow description still showed same-call ack after handler return → rewrote to match §5.5 ack-on-next-call exactly. The two sections now describe the same Codex contract.
+  - [high] §6 Codex `instructions` text still said Codex "must" call `check_messages` (obsolete) and implied `rename_peer` could target other peers (security-regression implication) → rewrote to reflect piggyback-on-any-tool and self-rename-only.
+  - [medium] `pollMessages` heartbeat was outside the transaction → failed polls still refreshed `last_seen`. Moved heartbeat INSIDE the `db.transaction(() => {...})` body so a thrown poll rolls back the liveness bump. Added regression test `pollMessages heartbeat is rolled back if tx throws`.
+  - [medium] Plan's manual smoke tests only validated `check_messages` as the Codex inbox trigger → added Task 25 covering (a) shutdown-without-flush preserving messages across restart, (b) Codex inbox surfacing on `list_peers` without calling `check_messages`, (c) residual narrow-window documentation cross-check.
+
 - 2026-04-13 — Incorporated Codex adversarial review round 3 findings:
   - [critical] Cleanup on SIGINT/SIGTERM was flushing `pendingAcks` → silent loss on shutdown → removed. Leases now expire naturally after process death.
   - [high] "Next tool call = proof of previous delivery" claim was too strong → softened to "strong heuristic, not proof" with honest documentation of residual narrow window (stdout-fails-but-MCP-session-survives). Phase 2 may add explicit client receipts.
