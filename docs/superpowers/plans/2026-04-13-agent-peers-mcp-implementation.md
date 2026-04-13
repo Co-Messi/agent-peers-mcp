@@ -554,6 +554,38 @@ test("registerPeer appends -2 on name collision", () => {
   expect(b.name).toBe("dup-2");
 });
 
+test("registerPeer reclaims stale peer with same name, preserving UUID (round-5 fix)", () => {
+  const first = registerPeer(db, {
+    peer_type: "claude", pid: 111, cwd: "/original", git_root: null, tty: null, summary: "orig", name: "persistent"
+  });
+  // Backdate last_seen so the original peer looks stale
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", first.id);
+  // Restart with same PEER_NAME
+  const second = registerPeer(db, {
+    peer_type: "claude", pid: 222, cwd: "/new-cwd", git_root: null, tty: null, summary: "new", name: "persistent"
+  });
+  expect(second.id).toBe(first.id); // same UUID preserved
+  expect(second.name).toBe("persistent");
+  // Metadata refreshed
+  const row = db.query<{ pid: number; cwd: string; summary: string }, [string]>(
+    "SELECT pid, cwd, summary FROM peers WHERE id = ?"
+  ).get(second.id)!;
+  expect(row.pid).toBe(222);
+  expect(row.cwd).toBe("/new-cwd");
+  expect(row.summary).toBe("new");
+});
+
+test("registerPeer does NOT reclaim a LIVE peer with same name (falls through to suffix)", () => {
+  const live = registerPeer(db, {
+    peer_type: "claude", pid: 111, cwd: "/a", git_root: null, tty: null, summary: "", name: "active"
+  });
+  const second = registerPeer(db, {
+    peer_type: "claude", pid: 222, cwd: "/b", git_root: null, tty: null, summary: "", name: "active"
+  });
+  expect(second.id).not.toBe(live.id); // fresh UUID
+  expect(second.name).toBe("active-2");
+});
+
 test("registerPeer is atomic under simulated interleaving (round-2 fix)", () => {
   // We can't trivially drive multi-thread concurrency on bun:sqlite from the test, but we can
   // prove the check-then-write race is closed by inserting a row with name="race"
@@ -632,21 +664,44 @@ function* nameCandidates(requested: string | undefined): Generator<string> {
   }
 }
 
+export const STALE_RECLAIM_THRESHOLD_MS = 60_000;
+
 export function registerPeer(db: Database, req: RegisterRequest): RegisterResponse {
-  const id = randomUUID();
   const ts = nowIso();
+
+  // Fast path: reclaim a stale peer with matching PEER_NAME so a restarted session
+  // keeps the same UUID and any undelivered messages re-route to it automatically.
+  // See spec §5.1 "Reclaim window vs GC".
+  if (req.name && isValidName(req.name)) {
+    const cutoff = new Date(Date.now() - STALE_RECLAIM_THRESHOLD_MS).toISOString();
+    const reclaim = db.query(
+      `UPDATE peers
+         SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?, last_seen = ?
+       WHERE name = ? AND last_seen < ?`
+    ).run(req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary, ts, req.name, cutoff);
+    if (((reclaim as any).changes ?? 0) > 0) {
+      const row = db.query<{ id: string }, [string]>(
+        "SELECT id FROM peers WHERE name = ?"
+      ).get(req.name);
+      if (row) return { id: row.id, name: req.name };
+      // If the row disappeared between UPDATE and SELECT (would require a concurrent
+      // delete that we didn't cause), fall through to the INSERT ladder.
+    }
+  }
+
+  // Fresh-INSERT path with suffix ladder + auto-generated candidates.
+  const id = randomUUID();
   const insert = db.query(
     `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, registered_at, last_seen)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
-
   for (const candidate of nameCandidates(req.name)) {
     try {
       insert.run(id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary, ts, ts);
       return { id, name: candidate };
     } catch (e) {
       if (!isUniqueViolation(e)) throw e;
-      // UNIQUE violation → name taken, advance to next candidate
+      // UNIQUE violation → name taken by a LIVE peer, advance to next candidate
     }
   }
   throw new Error("broker: unable to allocate unique peer name after exhaustive retry");
@@ -2027,7 +2082,11 @@ async function main() {
 
   const cleanup = async () => {
     clearInterval(hb);
-    if (myId) { try { await client.unregister(myId); } catch { /* best effort */ } }
+    // Deliberately do NOT call client.unregister(myId) (Codex review round-5 fix).
+    // Unregistering would remove the peer row immediately, defeating the
+    // reclaim-by-name mechanism in registerPeer that lets a restart with the same
+    // PEER_NAME preserve the UUID and recover undelivered messages. The broker's
+    // 30-second GC will reap us within 60-90s of our heartbeat stopping.
     process.exit(0);
   };
   process.on("SIGINT", cleanup);
@@ -2219,10 +2278,11 @@ const TOOLS = [
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 // Module-level ack-on-next-call state (spec §5.5).
-// Each tool call flushes acks from the PREVIOUS call (proof the previous response was
-// delivered to Codex, because Codex is calling us again), then polls and stores new tokens
-// for the NEXT call. See Codex adversarial review round-2 for why ack-during-handler-return
-// is insufficient.
+// Each tool call flushes acks from the PREVIOUS call. A subsequent request from Codex
+// is a STRONG HEURISTIC (not a proof) that the previous response cycle completed. The
+// residual narrow window — stdout write fails after handler return while the same MCP
+// session keeps issuing requests — is documented in spec §5.5 "Residual limitations"
+// as an accepted Phase 1 limitation; Phase 2 may add explicit client receipts.
 const pendingAcks: string[] = [];
 const seen = new Set<number>();
 
@@ -2366,9 +2426,12 @@ async function main() {
     // INTENTIONALLY do NOT flush pendingAcks on shutdown (Codex review round-3 fix).
     // Those tokens correspond to the MOST RECENT response, whose delivery we cannot
     // confirm. Flushing them here would silently ack messages that may never have
-    // reached Codex. Instead let leases expire — when the next Codex session comes
-    // up with a fresh seen-set, the broker will re-lease and re-inject.
-    if (myId) { try { await client.unregister(myId); } catch { /* best effort */ } }
+    // reached Codex. Instead let leases expire.
+    //
+    // Also INTENTIONALLY do NOT call client.unregister(myId) (Codex review round-5 fix).
+    // Removing the peer row immediately defeats reclaim-by-name. Let the broker's GC
+    // reap us in 60-90s; if the user restarts within that window with the same
+    // PEER_NAME, they recover the same UUID and any undelivered messages.
     process.exit(0);
   };
   process.on("SIGINT", cleanup);
@@ -2790,21 +2853,25 @@ bun "/Users/siewbrayden/Desktop/Brayden's Projects/agent-peers-mcp/cli.ts" kill-
 
 Manual validation for the invariants Codex asked us to protect. Do not mark this task complete until every step passes.
 
-- [ ] **Step 1: Shutdown does NOT flush pendingAcks (round-3 critical)**
+- [ ] **Step 1: Shutdown does NOT flush pendingAcks AND restart reclaims same UUID (round-3 critical + round-5 fix)**
 
 ```bash
-# Start Codex session A (sender) and Codex session B (receiver)
+# Start Codex session A (sender) and Codex session B (receiver). Note their UUIDs from list_peers.
 PEER_NAME=sender codex &
 PEER_NAME=receiver codex &
 
 # In sender: send a message to receiver
-# Then IMMEDIATELY send SIGTERM to receiver BEFORE receiver acknowledges by calling another tool
+# Then IMMEDIATELY SIGTERM receiver BEFORE the message has a chance to be acked
 kill -TERM <receiver-pid>
 
-# Restart receiver as a fresh process
+# Restart receiver IMMEDIATELY (well within the 60s GC window) using the same PEER_NAME
 PEER_NAME=receiver codex
-# In receiver, call any tool (e.g., list_peers)
-# Expected: [PEER INBOX] block contains the message — it was NOT silently acked on shutdown.
+
+# In the restarted receiver, ask: "list peers"
+# Expected:
+#   - [PEER INBOX] block contains the original message from sender (proves no shutdown ack flush)
+#   - The receiver's UUID printed by list_peers (or visible in `bun cli.ts peers`) is the SAME
+#     as the original receiver's UUID (proves reclaim-by-name preserved the identity)
 ```
 
 - [ ] **Step 2: Codex inbox surfaces on ANY tool call, not just check_messages (round-4 medium)**

@@ -141,9 +141,16 @@ HTTP daemon on `127.0.0.1:7900`. Uses `Bun.serve()` and `bun:sqlite`.
 - On `/ack-messages`, broker marks rows with matching `lease_tokens` as `acked=1` **only if** `lease_expires_at >= now()` at the time of ack (stale acks explicitly ignored — addresses Codex review-2 finding). If the ack arrives late, the `UPDATE` matches zero rows and the broker's response reports `acked: 0`; the message will be re-leased on the next poll and re-delivered.
 - If the client never acks at all (crash, MCP transport failure), the lease expires and the same message is returned on the next poll. The client is responsible for deduplication via the immutable `message_id` (see §5.4 and §5.5 "seen-set" patterns).
 
-*Atomic name allocation (addresses Codex review-2 finding):*
-- `/register` and `/rename-peer` never do read-then-write. They execute `INSERT` (or `UPDATE`) inside a transaction; on SQLite `UNIQUE` violation, catch the exception and try the next suffix. For `/register`, the retry ladder is `name`, `name-2`, `name-3`, ..., `name-99`, then auto-generate. For `/rename-peer`, a `UNIQUE` violation returns `{ ok: false, error: "name taken" }` deterministically — no retry ladder because rename has caller-specified target.
-- Concurrent `/register` with identical `PEER_NAME` is therefore deterministic: one succeeds, the other gets the next free suffix. No 500-class errors surface to the caller.
+*Atomic name allocation with stale-peer reclaim (addresses Codex reviews round-2 and round-5):*
+- `/register` flow (atomic):
+  1. **Reclaim fast-path**: if `PEER_NAME` is provided AND a peer with that exact name exists AND its `last_seen` is older than 60s, `UPDATE` that row in place — keep the existing `id` (UUID), refresh all process metadata (`pid`, `cwd`, `git_root`, `tty`, `peer_type`, `summary`, `last_seen`). Return `{ id: existing_uuid, name }`. This is the mechanism that makes "crash → restart with same PEER_NAME" recover undelivered messages: the restored peer row has the same UUID, so messages addressed to that UUID route correctly on the next poll.
+  2. **Fresh INSERT path**: if reclaim did not apply, attempt `INSERT` with fresh UUID. On SQLite `UNIQUE` violation (name already taken by a LIVE peer), catch and advance through the suffix ladder `name`, `name-2`, `name-3`, ..., `name-99`, then auto-generated adjective-noun names. Each candidate is its own `INSERT` attempt — no read-then-write race.
+- `/rename-peer` is an atomic `UPDATE`. A `UNIQUE` violation returns `{ ok: false, error: "name taken" }` deterministically — no retry ladder because rename has a caller-specified target.
+- Concurrent `/register` with identical `PEER_NAME`: if both see the reclaim row as stale, one's `UPDATE` succeeds (changes=1), the other's sees `changes=0` (because the `last_seen < cutoff` predicate no longer matches after the first update refreshed it) and falls through to the INSERT ladder. If there is no stale row, both go straight to INSERT and the second gets the `-2` suffix. Deterministic, no 500-class errors.
+
+*Reclaim window vs GC:*
+- Reclaim requires the stale peer row to still exist. GC runs every 30s with a 60s staleness threshold, so an abandoned peer is removable roughly 60-90s after its last heartbeat. Restart within that window → UUID-preserving reclaim. Restart after GC removed the row → fresh INSERT with new UUID; messages to the old UUID become orphans (observable via `cli.ts orphaned-messages`).
+- Graceful cleanup in the MCP servers deliberately does NOT call `/unregister`. Unregister removes the peer row immediately, defeating reclaim. Instead, on SIGINT/SIGTERM we just clear timers and exit; the broker's GC naturally reaps the now-heartbeat-less peer within 60-90s.
 
 *Timer-driven peer GC with orphan preservation (revised per Codex review-2):*
 - `setInterval(gcStalePeers, 30_000)` runs inside the broker process. Deletes peers whose `last_seen` is > 60s old.
@@ -633,10 +640,10 @@ Manual end-to-end tests, in order:
 2. **Single Claude registers** — start `agentpeers`, run `bun cli.ts peers`, see entry with peer_type=claude
 3. **Two Claudes message** — open two `agentpeers` terminals, send between them, confirm push works
 4. **Single Codex registers** — `codex` with config entry, run `bun cli.ts peers`, see entry with peer_type=codex
-5. **Codex check_messages empty** — call check_messages, get "no messages" response
-6. **Claude → Codex** — Claude session sends to Codex peer; Codex calls check_messages, sees it
-7. **Codex → Claude** — Codex sends to Claude peer; Claude receives instant push
-8. **Codex → Codex** — two Codex sessions message each other via check_messages
+5. **Codex empty inbox** — Codex calls `list_peers`. Tool response has no `[PEER INBOX]` block (or block says zero messages). Calling `check_messages` is interchangeable but unnecessary.
+6. **Claude → Codex** — Claude session sends to Codex peer; Codex calls **any** tool (e.g. `list_peers`); the response is prepended with a `[PEER INBOX]` block containing the message. `check_messages` is NOT a required trigger.
+7. **Codex → Claude** — Codex sends to Claude peer; Claude receives instant channel push
+8. **Codex → Codex** — two Codex sessions message each other; the recipient sees the `[PEER INBOX]` block on its next tool call regardless of which tool
 9. **Mixed list_peers** — Claude lists peers, sees both Claude and Codex peers with type column
 10. **Crash recovery** — kill broker mid-session; confirm next call shows error; restart broker; restart sessions; everything works again
 
@@ -652,7 +659,7 @@ Automated tests (Phase 1, minimal): `bun test` for `shared/broker-client.ts` aga
 - Encryption (same)
 - Replacing the existing stable `claude-peers-mcp` (it stays running)
 - Auto-detection of agent type (we use two binaries — explicit beats clever)
-- Message TTL / retention policy — undelivered messages accumulate in `~/.agent-peers.db` forever if a Codex peer never calls `check_messages`. Volume is trivial (text only, tiny rows) and a manual `bun cli.ts kill-broker && rm ~/.agent-peers.db` fully resets state. Phase 2 may add a TTL if accumulation becomes measurable.
+- Message TTL / retention policy — orphaned messages (recipient died before any tool call surfaced them) accumulate in `~/.agent-peers.db` indefinitely. Visible via `cli.ts orphaned-messages`; manual purge via `bun cli.ts kill-broker && rm ~/.agent-peers.db`. Phase 2 may add a TTL if accumulation becomes measurable.
 
 **Resolved:**
 - Codex MCP config format → confirmed `[mcp_servers.NAME]` TOML block via inspection of user's existing config.toml
@@ -665,6 +672,11 @@ Automated tests (Phase 1, minimal): `bun test` for `shared/broker-client.ts` aga
 
 - 2026-04-13 — Initial spec written. Phase 1 scope locked. Approved by user.
 - 2026-04-13 — Added §5.7 Identity & naming system. Immutable UUID `id` + mutable `name` column, auto-generated adjective-noun names, `PEER_NAME` env override, terminal tab title via OSC escape, `rename_peer` tool, `send_message` accepts name or id. Motivated by user's PR-workflow need for stable human-readable handles across sessions.
+- 2026-04-13 — Incorporated Codex adversarial review round 5 findings:
+  - [high] Graceful shutdown was calling `client.unregister()`, which deleted the peer row immediately and made messages addressed to the old UUID permanently unrecoverable. Added **reclaim-by-name** to `/register`: if `PEER_NAME` matches an existing stale peer (last_seen > 60s old), `UPDATE` that row in place and reuse its UUID, so undelivered messages route correctly to the restarted session. Removed `client.unregister()` from both server cleanup paths so the broker GC handles peer removal naturally on the 60-90s window.
+  - [medium] Spec test/non-goals sections still treated `check_messages` as the load-bearing Codex delivery trigger → rewrote test scenarios 5-8 to reference "any tool call" and removed the obsolete TTL line that mentioned `check_messages` as the gating action.
+  - [low] Task 19 module comment still claimed "next call = proof of delivery" → softened to "strong heuristic, not proof", with explicit pointer to spec §5.5 residual-limitations.
+
 - 2026-04-13 — Incorporated Codex adversarial review round 4 findings:
   - [high] §7.2 data-flow description still showed same-call ack after handler return → rewrote to match §5.5 ack-on-next-call exactly. The two sections now describe the same Codex contract.
   - [high] §6 Codex `instructions` text still said Codex "must" call `check_messages` (obsolete) and implied `rename_peer` could target other peers (security-regression implication) → rewrote to reflect piggyback-on-any-tool and self-rename-only.
