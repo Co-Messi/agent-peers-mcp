@@ -144,12 +144,24 @@ async function withPiggyback(
 
   // 1. Flush previous-call acks. Only now do we know the previous response
   //    cycle completed (Codex is calling us again).
+  //
+  // Code review round-1 fix: only remove tokens from pendingAcks on SUCCESSFUL
+  // ack. If the HTTP call throws, keep them so the next call retries instead
+  // of silently waiting for lease expiry (which would cause a guaranteed
+  // duplicate when the message is re-leased + re-injected).
   if (pendingAcks.length > 0) {
-    const toFlush = pendingAcks.splice(0, pendingAcks.length);
+    const toFlush = pendingAcks.slice();
     try {
       await client.ackMessages({ id: myId, lease_tokens: toFlush });
+      // Remove only after success. Use splice by indices-of-toFlush to be
+      // robust against concurrent appends (though withPiggyback is strictly
+      // serialized per tool call, so this is defense in depth).
+      for (const tok of toFlush) {
+        const idx = pendingAcks.indexOf(tok);
+        if (idx !== -1) pendingAcks.splice(idx, 1);
+      }
     } catch (e) {
-      log(`pending ack flush failed (lease will expire): ${e instanceof Error ? e.message : String(e)}`);
+      log(`pending ack flush failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 

@@ -258,6 +258,33 @@ test("sendMessage unknown peer returns ok=false", () => {
   expect(res.error).toMatch(/unknown peer/i);
 });
 
+test("sendMessage with unknown from_id is rejected (identity validation)", () => {
+  const b = registerPeer(db, {
+    peer_type: "claude", pid: 1, cwd: "/x", git_root: null, tty: null, summary: "", name: "beta",
+  });
+  const res = sendMessage(db, {
+    from_id: "not-a-real-id", to_id_or_name: b.name, text: "hi",
+  });
+  expect(res.ok).toBe(false);
+  expect(res.error).toMatch(/unknown sender/i);
+});
+
+test("sendMessage with stale from_id is rejected (identity validation)", () => {
+  const a = registerPeer(db, {
+    peer_type: "claude", pid: 1, cwd: "/x", git_root: null, tty: null, summary: "", name: "alpha",
+  });
+  const b = registerPeer(db, {
+    peer_type: "claude", pid: 2, cwd: "/x", git_root: null, tty: null, summary: "", name: "beta",
+  });
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+    .run("1970-01-01T00:00:00.000Z", a.id);
+  const res = sendMessage(db, {
+    from_id: a.id, to_id_or_name: b.name, text: "hi",
+  });
+  expect(res.ok).toBe(false);
+  expect(res.error).toMatch(/sender stale/i);
+});
+
 test("sendMessage to stale peer rejects", () => {
   const a = registerPeer(db, {
     peer_type: "claude", pid: 1, cwd: "/x", git_root: null, tty: null, summary: "", name: "alpha",
@@ -283,6 +310,24 @@ function mkPeers() {
   });
   return { a, b };
 }
+
+test("pollMessages with unknown peer id returns empty (no queue drain)", () => {
+  const { a, b } = mkPeers();
+  sendMessage(db, { from_id: a.id, to_id_or_name: "beta", text: "secret" });
+  // Stranger with a fake UUID should not see beta's inbox
+  const stranger = pollMessages(db, "00000000-0000-0000-0000-000000000000");
+  expect(stranger).toEqual([]);
+  // Legitimate owner still can
+  expect(pollMessages(db, b.id).length).toBe(1);
+});
+
+test("ackMessages with unknown peer id returns acked: 0 (no queue erase)", () => {
+  const res = ackMessages(db, {
+    id: "00000000-0000-0000-0000-000000000000",
+    lease_tokens: ["anything"],
+  });
+  expect(res.acked).toBe(0);
+});
 
 test("pollMessages returns leased messages with enriched from fields", () => {
   const { a, b } = mkPeers();

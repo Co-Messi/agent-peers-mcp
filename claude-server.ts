@@ -320,7 +320,22 @@ async function main() {
       log(`poll error: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
-  const pushTimer = setInterval(pollAndPush, POLL_INTERVAL_MS);
+
+  // Self-scheduling loop with re-entrancy guard (code review round-1 fix).
+  // Using setInterval would fire a new poll every 1s even if the previous one is
+  // still in flight, causing overlapping reads of the same `seen` set and
+  // duplicate pushes under slow I/O. This pattern guarantees strictly one
+  // in-flight cycle at a time.
+  let pushStopped = false;
+  let pushTickTimer: ReturnType<typeof setTimeout> | null = null;
+  const scheduleNextPush = () => {
+    if (pushStopped) return;
+    pushTickTimer = setTimeout(async () => {
+      try { await pollAndPush(); }
+      finally { scheduleNextPush(); }
+    }, POLL_INTERVAL_MS);
+  };
+  scheduleNextPush();
 
   const hb = setInterval(async () => {
     if (myId) {
@@ -330,7 +345,8 @@ async function main() {
 
   const cleanup = async () => {
     clearInterval(hb);
-    clearInterval(pushTimer);
+    pushStopped = true;
+    if (pushTickTimer) clearTimeout(pushTickTimer);
     // Deliberately NO client.unregister(myId) here.
     // Unregister would immediately delete the peer row and defeat the
     // reclaim-by-name mechanism in /register that lets a restart with the same

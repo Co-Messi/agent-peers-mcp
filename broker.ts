@@ -189,6 +189,13 @@ function resolveTarget(db: Database, to_id_or_name: string): Peer | null {
 }
 
 export function sendMessage(db: Database, req: SendMessageRequest): SendMessageResponse {
+  // Sender identity validation — reject forged/unknown senders.
+  // (Localhost-only deployment, but queue ownership is a correctness concern:
+  // a recipient's `from_name` enrichment must not vouch for a ghost sender.)
+  const sender = getPeer(db, req.from_id);
+  if (!sender) return { ok: false, error: `unknown sender: ${req.from_id}` };
+  if (isStale(sender.last_seen)) return { ok: false, error: `sender stale: ${sender.name}` };
+
   const target = resolveTarget(db, req.to_id_or_name);
   if (!target) return { ok: false, error: `unknown peer: ${req.to_id_or_name}` };
   if (isStale(target.last_seen)) return { ok: false, error: `target peer stale: ${target.name}` };
@@ -208,8 +215,15 @@ export function pollMessages(db: Database, id: string): LeasedMessage[] {
   const leaseUntil = new Date(now.getTime() + LEASE_DURATION_MS).toISOString();
 
   const tx = db.transaction(() => {
-    // Heartbeat inside tx so failure rolls back last_seen bump.
-    db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run(nowStr, id);
+    // Peer identity validation — caller must be a registered peer.
+    // Rejects drain attempts from unknown/GC'd UUIDs and prevents orphaned-message
+    // reads via stale UUIDs that shouldn't own a queue anymore.
+    const hbInfo = db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run(nowStr, id);
+    if ((hbInfo.changes ?? 0) === 0) {
+      // Caller is not a registered peer — return empty inbox (no error; matches the
+      // "no messages" happy path semantically, but without exposing anyone's mailbox).
+      return [] as LeasedMessage[];
+    }
 
     const rows = db.query<
       { id: number; from_id: string; to_id: string; text: string; sent_at: string },
@@ -251,6 +265,11 @@ export function pollMessages(db: Database, id: string): LeasedMessage[] {
 
 export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesResponse {
   if (req.lease_tokens.length === 0) return { ok: true, acked: 0 };
+  // Peer identity validation — caller must still be a registered peer.
+  // An unregistered UUID must not be able to ack (and thereby remove) another
+  // peer's queue, even if it somehow obtained a lease_token.
+  if (!getPeer(db, req.id)) return { ok: true, acked: 0 };
+
   const placeholders = req.lease_tokens.map(() => "?").join(",");
   const sql = `UPDATE messages SET acked = 1, lease_token = NULL, lease_expires_at = NULL
                WHERE lease_token IN (${placeholders})

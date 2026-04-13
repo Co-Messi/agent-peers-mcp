@@ -35,17 +35,31 @@ async function cmdPeers() {
 }
 
 async function cmdSend(targetNameOrId: string, message: string) {
-  // CLI has no peer row of its own; the broker stores from_id verbatim and the
-  // recipient sees from_name=(gone) via the enriched poll path. Fine for
-  // manual testing; deliberate best-effort.
-  const res = await client.sendMessage({
-    from_id: "cli", to_id_or_name: targetNameOrId, text: message,
+  // The broker now requires from_id to resolve to a registered, live peer
+  // (code review round-1 fix). Register a short-lived operator peer for this
+  // send, then unregister it. Name is unique via PID suffix.
+  const operatorName = `cli-operator-${process.pid}`;
+  const reg = await client.register({
+    peer_type: "claude",
+    name: operatorName,
+    pid: process.pid,
+    cwd: process.cwd(),
+    git_root: null,
+    tty: null,
+    summary: "local CLI operator",
   });
-  if (!res.ok) {
-    console.error(`send failed: ${res.error}`);
-    process.exit(1);
+  try {
+    const res = await client.sendMessage({
+      from_id: reg.id, to_id_or_name: targetNameOrId, text: message,
+    });
+    if (!res.ok) {
+      console.error(`send failed: ${res.error}`);
+      process.exit(1);
+    }
+    console.log(`sent (id=${res.message_id}, from=${reg.name})`);
+  } finally {
+    try { await client.unregister(reg.id); } catch { /* best effort */ }
   }
-  console.log(`sent (id=${res.message_id})`);
 }
 
 async function cmdRename(target: string, newName: string) {
