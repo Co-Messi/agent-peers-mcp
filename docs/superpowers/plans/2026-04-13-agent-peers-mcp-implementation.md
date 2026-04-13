@@ -2197,12 +2197,12 @@ Insert after the `// MCP` block in `main()` (before the heartbeat block):
   const pushTimer = setInterval(pollAndPush, POLL_INTERVAL_MS);
 ```
 
-And update `cleanup` to clear the push timer:
+And update `cleanup` to ALSO clear the push timer. Keep the no-unregister behavior from Task 17 (Codex round-5/6/7 fix — unregister would immediately delete the peer row and defeat reclaim-by-name on restart). The only change from Task 17's cleanup is adding `clearInterval(pushTimer)`:
 ```ts
   const cleanup = async () => {
     clearInterval(hb);
     clearInterval(pushTimer);
-    if (myId) { try { await client.unregister(myId); } catch { /* best effort */ } }
+    // Deliberately NO client.unregister(myId) here — see Task 17 cleanup comments.
     process.exit(0);
   };
 ```
@@ -2912,7 +2912,27 @@ Start a Codex session. Have another session send a message. In Codex:
 - Call `list_peers` (not `check_messages`)
 - Expected: `[PEER INBOX]` block is prepended to the `list_peers` response.
 
-- [ ] **Step 3: Residual narrow-window documentation is accurate (round-4 residual limit)**
+- [ ] **Step 3: Replay-after-restart is explicitly at-least-once (round-7 fix, verifies §5.4 contract)**
+
+```bash
+# Session A (sender) + Session B (receiver) with explicit PEER_NAME
+PEER_NAME=sender codex &
+PEER_NAME=receiver codex &
+
+# Sender sends message X to receiver (note the message_id in sender's send_message response)
+# Have receiver call list_peers (which triggers piggyback poll and surfaces [PEER INBOX] with message_id=X)
+# Immediately SIGKILL receiver (kill -9) BEFORE the NEXT receiver tool call runs pendingAcks flush
+kill -9 <receiver-pid>
+
+# Restart receiver within GC window so reclaim preserves UUID
+PEER_NAME=receiver codex
+# Call list_peers again
+# Expected: the SAME message_id=X appears again in the [PEER INBOX] block.
+# This proves (a) reclaim preserved the UUID so the message still routed, and
+# (b) delivery is at-least-once across restart — not a silent loss, not exactly-once dedupe.
+```
+
+- [ ] **Step 4: Residual narrow-window documentation is accurate (round-4 residual limit)**
 
 Read spec §5.5 "Residual limitations" out loud. Confirm the known-limitation scenarios match what's actually implemented. File a Phase 2 ticket for explicit client receipts if you want stricter delivery.
 

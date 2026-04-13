@@ -615,7 +615,7 @@ codex   # Codex auto-loads MCP from config.toml
 |---|---|
 | Broker not running on first server start | `ensureBroker()` spawns it; throws after 6s if cannot start |
 | Broker dies during session | All broker calls fail → MCP tool returns error message → user/agent sees the failure → restart session to recover (Phase 2 will add reconnect). Messages already leased but not acked survive broker restart (they're in SQLite, lease expires in 30s, next poll re-delivers). |
-| Client polled a message but crashed before ack | Lease expires after 30s → message re-polled on next request → retry transparent to sender. Recipient dedupes by `message_id` via in-memory seen-set (§5.4, §5.5). |
+| Client polled a message but crashed before ack | Lease expires after 30s → message re-polled on next request → retry transparent to sender. Dedupe is **session-local only**: within the same process, the in-memory seen-set prevents duplicate injection. Across a process restart (including reclaim-by-name where the UUID is preserved), the seen-set resets and the same message may be delivered again — at-least-once semantics, see §5.4. Acceptable Phase 1 behavior. |
 | `mcp.notification()` throws on Claude push | Server does NOT add to seen-set and does NOT ack. Lease expires → next poll re-pushes. Claude dedupes. |
 | Codex tool response fails to reach Codex (transport error) | `pendingAcks` never flushed → leases expire → next poll re-leases and re-injects (seen-set caught up when previous inject succeeded, but since the transport failed the whole session may be gone too). |
 | Stale `/ack-messages` arrives after lease expiry | Broker's `lease_expires_at >= now()` predicate rejects it (`acked: 0` returned) → message stays pollable → next poll re-delivers. |
@@ -674,6 +674,11 @@ Automated tests (Phase 1, minimal): `bun test` for `shared/broker-client.ts` aga
 
 - 2026-04-13 — Initial spec written. Phase 1 scope locked. Approved by user.
 - 2026-04-13 — Added §5.7 Identity & naming system. Immutable UUID `id` + mutable `name` column, auto-generated adjective-noun names, `PEER_NAME` env override, terminal tab title via OSC escape, `rename_peer` tool, `send_message` accepts name or id. Motivated by user's PR-workflow need for stable human-readable handles across sessions.
+- 2026-04-14 — Incorporated Codex adversarial review round 7 findings:
+  - [critical] Task 18's cleanup snippet was updated to add `clearInterval(pushTimer)` but also reintroduced `client.unregister(myId)` that Task 17 had removed → removed the unregister from the Task 18 snippet with an explicit "NO unregister here" comment. The cleanup path now stays consistent across both tasks.
+  - [medium] §9 error table row for "client polled a message but crashed before ack" said recipient dedupes via seen-set — true only within a session. Added explicit note that post-restart replay is at-least-once behavior per §5.4.
+  - [medium] Task 25 didn't prove replay-on-restart behavior. Added manual Step 3 that sends a message, polls it into the inbox, SIGKILLs the receiver, restarts with same `PEER_NAME`, and asserts the same `message_id` is injected again.
+
 - 2026-04-14 — Incorporated Codex adversarial review round 6 findings:
   - [critical] `gcStalePeers` had SELECT-then-iterate-DELETE → race with reclaim could delete a just-refreshed peer → replaced with single-statement `DELETE FROM peers WHERE last_seen < ?`. Added `gcStalePeers does NOT delete a peer whose last_seen was refreshed` regression test.
   - [high] Duplicate delivery across restart with reclaimed UUID — seen-set is in-memory so replay is possible after reclaim. Explicitly **downgraded spec contract to at-least-once across restart boundaries** with a §5.4/§5.5 note. Exactly-once across restart would require persistent dedupe state; deferred to Phase 2.
