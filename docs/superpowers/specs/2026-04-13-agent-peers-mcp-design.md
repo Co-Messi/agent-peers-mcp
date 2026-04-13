@@ -282,23 +282,26 @@ Same MCP server skeleton, **without** `claude/channel` capability. Differences f
 - Heartbeat still runs every 15s (independent of messaging)
 - `instructions` field is informational only — design does not depend on Codex honoring it (see §6)
 
-**Ack-on-next-call pattern (the fix for Codex's critical finding):**
+**Ack-on-next-call pattern (revised after Codex review round-3):**
 
-The codex-server holds a module-level `pendingAcks: string[]` (lease tokens from the previous tool call) and a `seen: Set<number>` of message IDs it has already injected into a response in this session.
+The codex-server holds a module-level `pendingAcks: string[]` (lease tokens from the previous tool call) and a `seen: Set<number>` of message IDs it has already polled in this session.
 
 Every tool handler does, in order:
-1. **Flush the previous call's acks** — if `pendingAcks.length > 0`, call `/ack-messages`. This is the moment we KNOW the previous tool response actually reached Codex (because Codex is calling us again). Success means the broker finally closes those leases. Failure means the leases will re-expire and re-deliver — no loss.
-2. **Poll for new messages** — `/poll-messages` returns freshly-leased messages. For each: if `seen.has(m.id)` it's a re-delivery after a lost ack from an earlier call; keep its lease_token queued for next-call ack (no re-injection). Else `seen.add(m.id)` and include it in this call's inbox block. Record new tokens in `pendingAcks` (replaces any previous value).
+1. **Flush the previous call's pending acks** — if `pendingAcks.length > 0`, call `/ack-messages`. A subsequent request arriving IS a strong heuristic that the previous response cycle completed (Codex's MCP client is alive and issuing new requests). It is **not a cryptographic proof** — a prior response could in theory be lost after handler return while the same Codex process keeps issuing requests, and in that narrow case an ack would fire without the message ever reaching the model. See "Residual limitations" below.
+2. **Poll for new messages**. For each polled message: if `seen.has(m.id)` this is a re-delivery due to a lost ack; queue its lease_token for next-call ack, do not re-inject. Else `seen.add(m.id)`, queue its lease_token in `pendingAcks`, and include it in this call's inbox block.
 3. **Run the tool's own logic**.
 4. **Return response with inbox block prepended**.
 
-If the MCP transport fails to deliver the response: Codex never calls again, so `pendingAcks` is never flushed, leases expire, next Codex process re-delivers everything in `seen`'s absence (new process, fresh seen-set).
+**On clean shutdown (SIGINT/SIGTERM), `pendingAcks` is NOT flushed.** Those tokens belong to the most recent response whose delivery we cannot confirm. Flushing them on exit would re-introduce silent loss. Instead we unregister the peer (which releases its row for GC but preserves undelivered messages as orphans) and exit. Leases expire 30s later and are re-leased on the next session's first poll.
 
-If Codex exits before calling another tool: same outcome — leases expire, next session re-delivers.
+**On transport failure (stdout write error, Codex MCP client disconnect)**: if Codex's MCP client abandons the connection, the session is effectively dead — no more tool calls means no more flushes, leases expire, next session re-delivers. If Codex's MCP client stays alive and merely drops one malformed response, the narrow silent-loss window below applies.
 
-If the user runs a single-shot Codex command (no follow-up call) and the message was in the inbox block: best-effort acknowledged. The lease will expire 30s later and, if no other Codex session takes over, the message becomes an orphan (observable via `cli.ts orphaned-messages`). This is the honest cost of Codex having no push channel — documented rather than hidden.
+**Residual limitations (Phase 1 accepts these, Phase 2 may address):**
+- `seen.add` happens at poll time, not at proven-delivery time. A message injected into a response that fails to reach the model is marked as seen in the server's memory and as acked in the broker as soon as a subsequent tool call fires. Recovery requires the Codex session to die (fresh process, fresh seen-set) or the user to re-send.
+- The only way to close this fully is an explicit client receipt — a tool call from Codex echoing the `message_id` after the model has acted on it. That would reintroduce prompt-obedience dependence. Phase 2 will explore this as an opt-in stricter mode.
+- The operator-visible safety net is `cli.ts orphaned-messages`, which shows all undelivered messages when their recipient disappears.
 
-This pattern makes Codex ack behavior **deterministically tied to an observable event** (next tool invocation) rather than a hoped-for stdout-flush callback.
+The Phase 1 contract is therefore: **best-effort delivery with observability for the observable failure modes (recipient-death-after-accept, broker crash).** Silent loss is possible only in the narrow window where the Codex MCP client remains live and responsive but loses a specific response mid-transport. This is a substantially narrower failure surface than any of the prior designs.
 
 Tools: `list_peers`, `send_message`, `set_summary`, `check_messages`, `rename_peer` (same names as claude-server for consistency — peers don't need to know what type they're talking to).
 
@@ -604,7 +607,7 @@ codex   # Codex auto-loads MCP from config.toml
 | `send_message` to **stale** peer (alive in DB but heartbeat > 60s old) | Broker returns `{ ok: false, error: "target peer stale" }` → sender sees it and can pick a different target or retry later |
 | Auto-summary (gpt-5.4-nano) fails | Logged to stderr, peer registers with empty summary |
 | Port 7900 already in use | Broker spawn fails → `ensureBroker` throws → user sees clear error in stderr; resolution is `lsof -i :7900` |
-| Peer crashes without unregister | Heartbeat stops → broker GCs peer within 30s–90s (timer fires every 30s, threshold is 60s). Unacked messages addressed to GC'd peer are deleted in the same transaction — no orphans. |
+| Peer crashes without unregister | Heartbeat stops → broker GCs peer within 30s–90s (timer fires every 30s, threshold is 60s). Undelivered messages addressed to the GC'd peer are **preserved** in the DB as orphans (not deleted — spec §5.1). `cli.ts orphaned-messages` surfaces them for the operator. Phase 2 may add TTL-based purge. |
 | Two MCP servers race to spawn broker | Loser gets EADDRINUSE and dies; winner serves both — no harm |
 | Concurrent rename to same new_name | UNIQUE constraint on `peers.name` → one succeeds, the other gets `{ ok: false, error: "name taken" }` — deterministic, no duplication possible |
 | Terminal title write fails (no tty, permission, closed pty) | Swallowed, logged once to stderr. MCP server keeps running. Tab title is cosmetic. |
@@ -652,6 +655,12 @@ Automated tests (Phase 1, minimal): `bun test` for `shared/broker-client.ts` aga
 
 - 2026-04-13 — Initial spec written. Phase 1 scope locked. Approved by user.
 - 2026-04-13 — Added §5.7 Identity & naming system. Immutable UUID `id` + mutable `name` column, auto-generated adjective-noun names, `PEER_NAME` env override, terminal tab title via OSC escape, `rename_peer` tool, `send_message` accepts name or id. Motivated by user's PR-workflow need for stable human-readable handles across sessions.
+- 2026-04-13 — Incorporated Codex adversarial review round 3 findings:
+  - [critical] Cleanup on SIGINT/SIGTERM was flushing `pendingAcks` → silent loss on shutdown → removed. Leases now expire naturally after process death.
+  - [high] "Next tool call = proof of previous delivery" claim was too strong → softened to "strong heuristic, not proof" with honest documentation of residual narrow window (stdout-fails-but-MCP-session-survives). Phase 2 may add explicit client receipts.
+  - [medium] Claude `check_messages` tool was polling + acking inside the handler → same ack-before-delivery-confirmed bug. Replaced with passive "messages arrive via channel, nothing to do" response. The 1s push loop remains the sole ack path on Claude.
+  - [medium] Error-handling table still said GC deletes unacked messages "in same transaction" → updated to explicitly say messages are preserved as orphans, removing the internal contradiction.
+
 - 2026-04-13 — Incorporated Codex adversarial review round 2 findings:
   - [critical] Codex piggyback was acking before transport confirmation → replaced with **ack-on-next-call** pattern (§5.5). Ack happens when the NEXT tool call proves the PREVIOUS response landed. Crashes and transport failures cause lease expiry + re-delivery, never silent loss.
   - [high] Stale ack acceptance → broker's `/ack-messages` now requires `lease_expires_at >= now()` (§5.1). Late acks return `acked: 0` and the lease expires cleanly.

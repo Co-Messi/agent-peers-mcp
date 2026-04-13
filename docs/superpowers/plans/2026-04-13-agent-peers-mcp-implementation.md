@@ -1919,11 +1919,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       return { content: [{ type: "text" as const, text: `Summary set: "${summary}"` }] };
     }
     case "check_messages": {
-      const msgs = await client.pollMessages(myId);
-      if (msgs.length === 0) return { content: [{ type: "text" as const, text: "No new messages." }] };
-      await client.ackMessages({ id: myId, lease_tokens: msgs.map(m => m.lease_token) });
-      const lines = msgs.map(m => `From ${m.from_name} (${m.from_peer_type}) at ${m.sent_at}:\n${m.text}`);
-      return { content: [{ type: "text" as const, text: `${msgs.length} message(s):\n\n${lines.join("\n\n---\n\n")}` }] };
+      // Deliberately do NOT poll+ack inside this handler (Codex review round-3 fix —
+      // that would ack before the tool response is confirmed delivered to Claude).
+      // The background polling loop (started in Task 18) owns delivery + ack via the
+      // channel push path, which is the one place ack actually happens and is
+      // gated on successful mcp.notification() resolution. This tool is a passive
+      // "prompt the model that it's okay" helper — nothing to do here.
+      return { content: [{ type: "text" as const, text: "Messages arrive automatically via the agent-peers channel. If you have not seen one recently, none are pending." }] };
     }
     case "rename_peer": {
       const { new_name } = args as { new_name: string };
@@ -2329,12 +2331,11 @@ async function main() {
 
   const cleanup = async () => {
     clearInterval(hb);
-    // Best-effort: flush any outstanding acks before exiting. If this fails, leases will
-    // expire and messages will be re-delivered when a Codex session comes back.
-    if (myId && pendingAcks.length > 0) {
-      try { await client.ackMessages({ id: myId, lease_tokens: pendingAcks.splice(0, pendingAcks.length) }); }
-      catch { /* best effort */ }
-    }
+    // INTENTIONALLY do NOT flush pendingAcks on shutdown (Codex review round-3 fix).
+    // Those tokens correspond to the MOST RECENT response, whose delivery we cannot
+    // confirm. Flushing them here would silently ack messages that may never have
+    // reached Codex. Instead let leases expire — when the next Codex session comes
+    // up with a fresh seen-set, the broker will re-lease and re-inject.
     if (myId) { try { await client.unregister(myId); } catch { /* best effort */ } }
     process.exit(0);
   };
@@ -2356,7 +2357,7 @@ Expected: exit 0.
 
 ```bash
 git add codex-server.ts
-git commit -m "feat(codex-server): piggyback + ack-on-next-call + seen-set dedupe"
+git commit -m "feat(codex-server): piggyback + ack-on-next-call + seen-set dedupe (no shutdown flush)"
 ```
 
 ---
