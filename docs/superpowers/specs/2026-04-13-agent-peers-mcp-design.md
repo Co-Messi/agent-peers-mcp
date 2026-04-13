@@ -246,7 +246,9 @@ Polling: every 1s, push via `notifications/claude/channel`. **Deterministic dedu
    - If no → call `mcp.notification()`. On success, `seen.add(m.id)` THEN queue `m.lease_token` for the ack batch. On failure, leave `seen` alone and skip the ack so the lease expires cleanly and gets retried.
 2. After the per-message loop, issue a single `/ack-messages` call for all collected tokens. Ack failure is fine — next poll will re-attempt.
 
-The seen-set is in-memory only. On process restart, it starts empty, but any previously-delivered message has also been acked before the restart (or its lease has expired in the broker), so there's no stale state to reconcile.
+**Dedupe scope: within-session only (Phase 1 contract).** The seen-set is in-memory and resets on process restart. Combined with the round-5 reclaim-by-name mechanism that preserves the UUID across restarts, this means **delivery is at-least-once, not exactly-once, across restart boundaries**: if an old session polled message 42 and died before its ack round-tripped, the new session with the reclaimed UUID starts with an empty seen-set, re-leases message 42 from the broker, and re-pushes/re-injects it. Users see the same peer message twice.
+
+This is an intentional Phase 1 trade-off: duplicate-free delivery across restart would require either persistent client-side dedupe state (keyed by `(peer_id, message_id)`) or broker-side per-recipient "already-delivered" tracking. Both are deferred to Phase 2. Callers are expected to treat peer messages as idempotent — replying twice to the same message is a minor UX annoyance, not a correctness bug.
 
 Heartbeat: every 15s.
 
@@ -299,7 +301,7 @@ Every tool handler does, in order:
 3. **Run the tool's own logic**.
 4. **Return response with inbox block prepended**.
 
-**On clean shutdown (SIGINT/SIGTERM), `pendingAcks` is NOT flushed.** Those tokens belong to the most recent response whose delivery we cannot confirm. Flushing them on exit would re-introduce silent loss. Instead we unregister the peer (which releases its row for GC but preserves undelivered messages as orphans) and exit. Leases expire 30s later and are re-leased on the next session's first poll.
+**On clean shutdown (SIGINT/SIGTERM), `pendingAcks` is NOT flushed AND the peer is NOT unregistered.** Those pending ack tokens belong to the most recent response whose delivery we cannot confirm — flushing them on exit would re-introduce silent loss. And unregistering would remove the peer row immediately, defeating the round-5 reclaim-by-name mechanism that lets a restart with the same `PEER_NAME` preserve the UUID (§5.1). Instead the cleanup path only clears timers and exits. The broker's timer-driven GC reaps the peer row 60-90s after heartbeat stops; if a restart happens within that window, `/register` reclaims the row via atomic UPDATE and inherits the UUID, making undelivered messages route correctly. Leases expire 30s later and are re-leased on the restored session's first poll (with at-least-once semantics across the restart — see dedupe scope note).
 
 **On transport failure (stdout write error, Codex MCP client disconnect)**: if Codex's MCP client abandons the connection, the session is effectively dead — no more tool calls means no more flushes, leases expire, next session re-delivers. If Codex's MCP client stays alive and merely drops one malformed response, the narrow silent-loss window below applies.
 
@@ -672,6 +674,12 @@ Automated tests (Phase 1, minimal): `bun test` for `shared/broker-client.ts` aga
 
 - 2026-04-13 — Initial spec written. Phase 1 scope locked. Approved by user.
 - 2026-04-13 — Added §5.7 Identity & naming system. Immutable UUID `id` + mutable `name` column, auto-generated adjective-noun names, `PEER_NAME` env override, terminal tab title via OSC escape, `rename_peer` tool, `send_message` accepts name or id. Motivated by user's PR-workflow need for stable human-readable handles across sessions.
+- 2026-04-14 — Incorporated Codex adversarial review round 6 findings:
+  - [critical] `gcStalePeers` had SELECT-then-iterate-DELETE → race with reclaim could delete a just-refreshed peer → replaced with single-statement `DELETE FROM peers WHERE last_seen < ?`. Added `gcStalePeers does NOT delete a peer whose last_seen was refreshed` regression test.
+  - [high] Duplicate delivery across restart with reclaimed UUID — seen-set is in-memory so replay is possible after reclaim. Explicitly **downgraded spec contract to at-least-once across restart boundaries** with a §5.4/§5.5 note. Exactly-once across restart would require persistent dedupe state; deferred to Phase 2.
+  - [high] Pre-`mcp.connect()` failure left a live peer row that blocked same-name reclaim for 60s → added `main().catch(async e => { if (myId) await client.unregister(myId); })` in both servers so startup failures clean up their row. Post-connect failures still use the signal-handler path that deliberately preserves the row for reclaim.
+  - [medium] §5.5 said "we unregister the peer" on clean shutdown, contradicting §5.1 "cleanup does NOT call /unregister" → rewrote §5.5 to match: no unregister on graceful exit, GC reaps within 60-90s, reclaim preserves UUID if restart happens in that window.
+
 - 2026-04-13 — Incorporated Codex adversarial review round 5 findings:
   - [high] Graceful shutdown was calling `client.unregister()`, which deleted the peer row immediately and made messages addressed to the old UUID permanently unrecoverable. Added **reclaim-by-name** to `/register`: if `PEER_NAME` matches an existing stale peer (last_seen > 60s old), `UPDATE` that row in place and reuse its UUID, so undelivered messages route correctly to the restarted session. Removed `client.unregister()` from both server cleanup paths so the broker GC handles peer removal naturally on the 60-90s window.
   - [medium] Spec test/non-goals sections still treated `check_messages` as the load-bearing Codex delivery trigger → rewrote test scenarios 5-8 to reference "any tool call" and removed the obsolete TTL line that mentioned `check_messages` as the gating action.

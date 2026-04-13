@@ -1217,6 +1217,19 @@ test("renamePeer to new unique name succeeds; duplicate rejects; invalid rejects
   expect(bad.error).toMatch(/invalid/i);
 });
 
+test("gcStalePeers does NOT delete a peer whose last_seen was refreshed between snapshot and delete (round-6 fix)", () => {
+  // Create a peer, backdate it, then simulate a reclaim by refreshing last_seen,
+  // and verify gcStalePeers leaves it alone. Previously (with SELECT-then-DELETE)
+  // this test would delete the refreshed row because the delete wasn't conditional.
+  const p = registerPeer(db, { peer_type: "claude", pid: 1, cwd: "/x", git_root: null, tty: null, summary: "", name: "racewin" });
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", p.id);
+  // Refresh (simulates a concurrent reclaim)
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run(new Date().toISOString(), p.id);
+  const removed = gcStalePeers(db);
+  expect(removed).toBe(0);
+  expect(getPeer(db, p.id)).not.toBeNull();
+});
+
 test("gcStalePeers removes peer rows but PRESERVES undelivered messages as orphans (round-2 fix)", () => {
   const a = registerPeer(db, { peer_type: "claude", pid: 1, cwd: "/x", git_root: null, tty: null, summary: "", name: "alpha" });
   const b = registerPeer(db, { peer_type: "claude", pid: 2, cwd: "/x", git_root: null, tty: null, summary: "", name: "beta" });
@@ -1276,16 +1289,17 @@ export function renamePeer(db: Database, req: RenamePeerRequest): RenamePeerResp
 }
 
 export function gcStalePeers(db: Database): number {
+  // Single atomic DELETE with staleness predicate in the WHERE clause.
+  // Round-6 fix: previously we did SELECT-then-iterate-DELETE, which allowed a
+  // reclaim/UPDATE to land between snapshot and delete — GC would then DELETE a
+  // row that was just reclaimed and refreshed. The single-statement form below
+  // cannot delete a row whose last_seen has already been bumped past the cutoff.
+  //
+  // Note: we intentionally do NOT delete unacked messages here (spec §5.1 orphan
+  // preservation) — they stay as observable orphans via cli.ts orphaned-messages.
   const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
-  const tx = db.transaction(() => {
-    const stale = db.query<{ id: string }, [string]>("SELECT id FROM peers WHERE last_seen < ?").all(cutoff);
-    for (const row of stale) {
-      // Intentionally do NOT delete unacked messages — spec §5.1 orphan-preserving GC.
-      db.query("DELETE FROM peers WHERE id = ?").run(row.id);
-    }
-    return stale.length;
-  });
-  return tx();
+  const info = db.query("DELETE FROM peers WHERE last_seen < ?").run(cutoff);
+  return (info as any).changes ?? 0;
 }
 
 // Orphans: undelivered messages whose to_id no longer matches any active peer.
@@ -2093,7 +2107,18 @@ async function main() {
   process.on("SIGTERM", cleanup);
 }
 
-main().catch(e => { log(`fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}`); process.exit(1); });
+main().catch(async e => {
+  log(`fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+  // Round-6 fix: if we registered with the broker but failed BEFORE mcp.connect() or
+  // before signal handlers were installed, no active session exists to preserve for
+  // reclaim. Unregister explicitly so the row doesn't block same-name reclaim for 60s.
+  // If we fail post-connect, signal-handler cleanup runs instead and deliberately
+  // leaves the row for reclaim.
+  if (myId) {
+    try { await client.unregister(myId); } catch { /* best effort */ }
+  }
+  process.exit(1);
+});
 ```
 
 - [ ] **Step 2: Typecheck**
@@ -2107,7 +2132,7 @@ Expected: exit 0.
 
 ```bash
 git add claude-server.ts
-git commit -m "feat(claude-server): register, tools, heartbeat (push in next task)"
+git commit -m "feat(claude-server): register, tools, heartbeat, pre-connect failure cleanup"
 ```
 
 ---
@@ -2438,7 +2463,14 @@ async function main() {
   process.on("SIGTERM", cleanup);
 }
 
-main().catch(e => { log(`fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}`); process.exit(1); });
+main().catch(async e => {
+  log(`fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+  // Round-6 fix (same rationale as claude-server): unregister on pre-connect failure.
+  if (myId) {
+    try { await client.unregister(myId); } catch { /* best effort */ }
+  }
+  process.exit(1);
+});
 ```
 
 - [ ] **Step 2: Typecheck**
@@ -2452,7 +2484,7 @@ Expected: exit 0.
 
 ```bash
 git add codex-server.ts
-git commit -m "feat(codex-server): piggyback + ack-on-next-call + seen-set dedupe (no shutdown flush)"
+git commit -m "feat(codex-server): piggyback + ack-on-next-call + seen-set dedupe + pre-connect cleanup"
 ```
 
 ---
