@@ -503,6 +503,42 @@ export function listOrphanedMessages(db: Database): OrphanMessage[] {
   ).all();
 }
 
+// Diagnostic view of every row in messages (acked + unacked), enriched with
+// sender/recipient names so a user can answer "did Claude's message actually
+// reach Codex's mailbox?" without guessing. Used by `cli.ts messages`.
+export interface InspectMessage {
+  id: number;
+  from_id: string;
+  from_name: string | null;
+  to_id: string;
+  to_name: string | null;
+  text: string;
+  sent_at: string;
+  acked: number;
+  has_lease: number;
+  lease_expires_at: string | null;
+}
+
+export function listAllMessages(db: Database): InspectMessage[] {
+  return db.query<InspectMessage, []>(
+    `SELECT m.id,
+            m.from_id,
+            pf.name AS from_name,
+            m.to_id,
+            pt.name AS to_name,
+            m.text,
+            m.sent_at,
+            m.acked,
+            CASE WHEN m.lease_token IS NULL THEN 0 ELSE 1 END AS has_lease,
+            m.lease_expires_at
+     FROM messages m
+     LEFT JOIN peers pf ON pf.id = m.from_id
+     LEFT JOIN peers pt ON pt.id = m.to_id
+     ORDER BY m.id DESC
+     LIMIT 100`
+  ).all();
+}
+
 // ----- HTTP -----
 
 async function readJson<T>(req: Request): Promise<T> {
@@ -546,6 +582,7 @@ export function startBroker(port: number, dbPath: string) {
           case "/rename-peer":   return json(renamePeer(db, await readJson(req)));
           case "/admin/rename-peer": return json(adminRenamePeer(db, await readJson(req)));
           case "/orphaned-messages": return json({ messages: listOrphanedMessages(db) });
+          case "/all-messages": return json({ messages: listAllMessages(db) });
           default: return json({ error: "not found" }, { status: 404 });
         }
       } catch (e) {

@@ -187,6 +187,9 @@ async function withPiggyback(
   let leased: LeasedMessage[] = [];
   try {
     leased = await client.pollMessages({ id: myId, session_token: mySession });
+    if (leased.length > 0) {
+      log(`piggyback poll leased ${leased.length} message(s): ${leased.map((m) => `#${m.id} from ${m.from_name}`).join(", ")}`);
+    }
   } catch (e) {
     log(`poll failed: ${e instanceof Error ? e.message : String(e)}`);
   }

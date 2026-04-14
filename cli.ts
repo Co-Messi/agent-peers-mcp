@@ -97,6 +97,47 @@ async function cmdRename(target: string, newName: string) {
   console.log(`renamed ${found.name} -> ${res.name}`);
 }
 
+async function cmdMessages() {
+  const res = await fetch(`${BROKER_URL}/all-messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  if (!res.ok) {
+    console.error(`request failed: ${res.status}`);
+    process.exit(1);
+  }
+  const { messages } = (await res.json()) as {
+    messages: Array<{
+      id: number;
+      from_id: string;
+      from_name: string | null;
+      to_id: string;
+      to_name: string | null;
+      text: string;
+      sent_at: string;
+      acked: number;
+      has_lease: number;
+      lease_expires_at: string | null;
+    }>;
+  };
+  if (messages.length === 0) {
+    console.log("(no messages in broker)");
+    return;
+  }
+  console.log(`Last ${messages.length} message(s) (newest first):\n`);
+  for (const m of messages) {
+    const status = m.acked ? "ACKED" : m.has_lease ? "LEASED" : "PENDING";
+    const from = m.from_name ?? `(gone: ${m.from_id.slice(0, 8)}…)`;
+    const to = m.to_name ?? `(gone: ${m.to_id.slice(0, 8)}…)`;
+    const preview = m.text.length > 80 ? m.text.slice(0, 77) + "..." : m.text;
+    console.log(`#${m.id}  ${status}  from=${from}  to=${to}  sent=${m.sent_at}`);
+    if (m.has_lease && m.lease_expires_at) console.log(`  lease_expires=${m.lease_expires_at}`);
+    console.log(`  ${preview}`);
+    console.log("");
+  }
+}
+
 async function cmdOrphans() {
   // Hit the broker's /orphaned-messages endpoint (broker reads DB directly).
   const res = await fetch(`${BROKER_URL}/orphaned-messages`, {
@@ -164,6 +205,9 @@ switch (sub) {
     }
     await cmdRename(rest[0]!, rest[1]!);
     break;
+  case "messages":
+    await cmdMessages();
+    break;
   case "orphaned-messages":
     await cmdOrphans();
     break;
@@ -176,6 +220,7 @@ switch (sub) {
   bun cli.ts peers
   bun cli.ts send <name-or-id> <message>
   bun cli.ts rename <name-or-id> <new-name>
+  bun cli.ts messages
   bun cli.ts orphaned-messages
   bun cli.ts kill-broker`);
     process.exit(sub ? 2 : 0);
