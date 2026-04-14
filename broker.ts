@@ -506,6 +506,12 @@ export function listOrphanedMessages(db: Database): OrphanMessage[] {
 // Diagnostic view of every row in messages (acked + unacked), enriched with
 // sender/recipient names so a user can answer "did Claude's message actually
 // reach Codex's mailbox?" without guessing. Used by `cli.ts messages`.
+//
+// Status semantics exposed to the CLI so operators can read them at a glance:
+//   - acked=1                      → ACKED (delivered + acknowledged)
+//   - acked=0, active lease        → LEASED (currently in a recipient's poll
+//                                    buffer, lease still valid)
+//   - acked=0, no/expired lease    → PENDING (ready to be picked up on next poll)
 export interface InspectMessage {
   id: number;
   from_id: string;
@@ -515,12 +521,19 @@ export interface InspectMessage {
   text: string;
   sent_at: string;
   acked: number;
-  has_lease: number;
+  active_lease: number;   // 1 iff lease_token present AND lease_expires_at >= now()
   lease_expires_at: string | null;
 }
 
-export function listAllMessages(db: Database): InspectMessage[] {
-  return db.query<InspectMessage, []>(
+export function listAllMessages(
+  db: Database,
+  opts: { limit?: number; order?: "DESC" | "ASC" } = {},
+): { messages: InspectMessage[]; truncated: boolean; total_rows: number } {
+  const limit = opts.limit && opts.limit > 0 ? opts.limit : 500;
+  const order = opts.order === "ASC" ? "ASC" : "DESC";
+  const nowStr = nowIso();
+  const total = db.query<{ c: number }, []>("SELECT COUNT(*) AS c FROM messages").get()?.c ?? 0;
+  const rows = db.query<InspectMessage, [string]>(
     `SELECT m.id,
             m.from_id,
             pf.name AS from_name,
@@ -529,14 +542,20 @@ export function listAllMessages(db: Database): InspectMessage[] {
             m.text,
             m.sent_at,
             m.acked,
-            CASE WHEN m.lease_token IS NULL THEN 0 ELSE 1 END AS has_lease,
+            CASE
+              WHEN m.lease_token IS NOT NULL
+                   AND m.lease_expires_at IS NOT NULL
+                   AND m.lease_expires_at >= ?
+              THEN 1 ELSE 0
+            END AS active_lease,
             m.lease_expires_at
      FROM messages m
      LEFT JOIN peers pf ON pf.id = m.from_id
      LEFT JOIN peers pt ON pt.id = m.to_id
-     ORDER BY m.id DESC
-     LIMIT 100`
-  ).all();
+     ORDER BY m.id ${order}
+     LIMIT ${limit}`
+  ).all(nowStr);
+  return { messages: rows, truncated: rows.length < total, total_rows: total };
 }
 
 // ----- HTTP -----
@@ -582,7 +601,10 @@ export function startBroker(port: number, dbPath: string) {
           case "/rename-peer":   return json(renamePeer(db, await readJson(req)));
           case "/admin/rename-peer": return json(adminRenamePeer(db, await readJson(req)));
           case "/orphaned-messages": return json({ messages: listOrphanedMessages(db) });
-          case "/all-messages": return json({ messages: listAllMessages(db) });
+          // No /all-messages endpoint — exposing full bodies over an unauthenticated
+          // HTTP socket would leak peer traffic to any local process. The cli.ts
+          // 'messages' command reads the SQLite file directly so OS file permissions
+          // remain the trust boundary.
           default: return json({ error: "not found" }, { status: 404 });
         }
       } catch (e) {

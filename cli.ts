@@ -98,17 +98,21 @@ async function cmdRename(target: string, newName: string) {
 }
 
 async function cmdMessages() {
-  const res = await fetch(`${BROKER_URL}/all-messages`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: "{}",
-  });
-  if (!res.ok) {
-    console.error(`request failed: ${res.status}`);
-    process.exit(1);
-  }
-  const { messages } = (await res.json()) as {
-    messages: Array<{
+  // Read the SQLite DB directly so OS file permissions remain the trust
+  // boundary. The broker deliberately does NOT expose message bodies over an
+  // unauthenticated HTTP endpoint (any local process can reach 127.0.0.1).
+  // Round-A security fix.
+  const { Database } = await import("bun:sqlite");
+  const { resolve } = await import("node:path");
+  const { homedir } = await import("node:os");
+  const dbPath = process.env.AGENT_PEERS_DB || resolve(homedir(), ".agent-peers.db");
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    const nowStr = new Date().toISOString();
+    const total =
+      db.query<{ c: number }, []>("SELECT COUNT(*) AS c FROM messages").get()?.c ?? 0;
+    const LIMIT = 500;
+    type Row = {
       id: number;
       from_id: string;
       from_name: string | null;
@@ -117,24 +121,45 @@ async function cmdMessages() {
       text: string;
       sent_at: string;
       acked: number;
-      has_lease: number;
+      active_lease: number;
       lease_expires_at: string | null;
-    }>;
-  };
-  if (messages.length === 0) {
-    console.log("(no messages in broker)");
-    return;
-  }
-  console.log(`Last ${messages.length} message(s) (newest first):\n`);
-  for (const m of messages) {
-    const status = m.acked ? "ACKED" : m.has_lease ? "LEASED" : "PENDING";
-    const from = m.from_name ?? `(gone: ${m.from_id.slice(0, 8)}…)`;
-    const to = m.to_name ?? `(gone: ${m.to_id.slice(0, 8)}…)`;
-    const preview = m.text.length > 80 ? m.text.slice(0, 77) + "..." : m.text;
-    console.log(`#${m.id}  ${status}  from=${from}  to=${to}  sent=${m.sent_at}`);
-    if (m.has_lease && m.lease_expires_at) console.log(`  lease_expires=${m.lease_expires_at}`);
-    console.log(`  ${preview}`);
-    console.log("");
+    };
+    const rows = db.query<Row, [string]>(
+      `SELECT m.id, m.from_id, pf.name AS from_name, m.to_id, pt.name AS to_name,
+              m.text, m.sent_at, m.acked,
+              CASE WHEN m.lease_token IS NOT NULL
+                        AND m.lease_expires_at IS NOT NULL
+                        AND m.lease_expires_at >= ?
+                   THEN 1 ELSE 0 END AS active_lease,
+              m.lease_expires_at
+       FROM messages m
+       LEFT JOIN peers pf ON pf.id = m.from_id
+       LEFT JOIN peers pt ON pt.id = m.to_id
+       ORDER BY m.id DESC
+       LIMIT ${LIMIT}`
+    ).all(nowStr);
+
+    if (rows.length === 0) {
+      console.log("(no messages in broker)");
+      return;
+    }
+    if (rows.length < total) {
+      console.log(`Showing newest ${rows.length} of ${total} message(s) (truncated — use 'sqlite3' directly for the full set):\n`);
+    } else {
+      console.log(`${rows.length} message(s) in broker (newest first):\n`);
+    }
+    for (const m of rows) {
+      const status = m.acked ? "ACKED" : m.active_lease ? "LEASED" : "PENDING";
+      const from = m.from_name ?? `(gone: ${m.from_id.slice(0, 8)}…)`;
+      const to = m.to_name ?? `(gone: ${m.to_id.slice(0, 8)}…)`;
+      const preview = m.text.length > 80 ? m.text.slice(0, 77) + "..." : m.text;
+      console.log(`#${m.id}  ${status}  from=${from}  to=${to}  sent=${m.sent_at}`);
+      if (m.active_lease && m.lease_expires_at) console.log(`  lease_expires=${m.lease_expires_at}`);
+      console.log(`  ${preview}`);
+      console.log("");
+    }
+  } finally {
+    db.close();
   }
 }
 

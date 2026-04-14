@@ -348,20 +348,24 @@ Once I confirm the path, do all of the following in order:
 3. Record the current commit SHA for rollback reference:
    `git rev-parse --short HEAD` — save the value so you can tell me later.
 
-4. Pull the latest code:
-   `git fetch origin main && git reset --hard origin/main`
-   (Hard reset is intentional — this repo is a consumable install, not a fork. If `git status` showed uncommitted changes in step 1, STOP and ask me whether to stash them first.)
+4. DIRTY WORKTREE CHECK — before any destructive git action:
+   Run `git status --porcelain`. If it produces ANY output (modified, added, or untracked files), STOP. Show me the output and ask whether I want to: (a) stash my changes and proceed, (b) abort the update, or (c) blow the changes away with a hard reset. Do NOT proceed to step 5 until I answer.
+   If `git status --porcelain` is empty, continue.
 
-5. Refresh dependencies:
+5. Pull the latest code. Prefer a fast-forward pull so accidental rebases or divergent local commits surface as an error rather than a silent clobber:
+   `git fetch origin main && git pull --ff-only origin main`
+   If that fails (e.g. because we chose "blow away changes" in step 4, or local commits diverged), fall back to `git reset --hard origin/main` — but only after explicit confirmation.
+
+6. Refresh dependencies:
    `bun install`
 
-6. Run the test suite as a sanity check:
+7. Run the test suite as a sanity check:
    `bun test`
    If any test fails, STOP and show me the failure output — do NOT tell me the update is complete.
 
-7. Print a summary: old commit SHA, new commit SHA, the short-log between them (`git log --oneline <old>..HEAD`), and what tests passed.
+8. Print a summary: old commit SHA, new commit SHA, the short-log between them (`git log --oneline <old>..HEAD`), and what tests passed.
 
-8. Tell me to close and relaunch any running `agentpeers` and `codex` sessions so the new MCP server code is loaded. Existing sessions keep running the OLD code until they restart.
+9. Tell me to close and relaunch any running `agentpeers` and `codex` sessions so the new MCP server code is loaded. Existing sessions keep running the OLD code until they restart.
 
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
@@ -389,9 +393,13 @@ Once I confirm the path, do all of the following in order:
 3. Record the current commit SHA for rollback reference:
    `git rev-parse --short HEAD` — save the value so you can tell me later.
 
-4. Pull the latest code:
-   `git fetch origin main && git reset --hard origin/main`
-   (Hard reset is intentional — this repo is a consumable install, not a fork. If `git status` showed uncommitted changes in step 1, STOP and ask me whether to stash them first.)
+4. DIRTY WORKTREE CHECK — before any destructive git action:
+   Run `git status --porcelain`. If it produces ANY output (modified, added, or untracked files), STOP. Show me the output and ask whether I want to: (a) stash my changes and proceed, (b) abort the update, or (c) blow the changes away with a hard reset. Do NOT proceed to step 5 until I answer.
+   If `git status --porcelain` is empty, continue.
+
+5. Pull the latest code. Prefer a fast-forward pull so accidental rebases or divergent local commits surface as an error rather than a silent clobber:
+   `git fetch origin main && git pull --ff-only origin main`
+   If that fails (e.g. because we chose "blow away changes" in step 4, or local commits diverged), fall back to `git reset --hard origin/main` — but only after explicit confirmation.
 
 5. Refresh dependencies:
    `bun install`
@@ -402,7 +410,7 @@ Once I confirm the path, do all of the following in order:
 
 7. Print a summary: old commit SHA, new commit SHA, the short-log between them (`git log --oneline <old>..HEAD`), and what tests passed.
 
-8. Tell me to close and relaunch any running Claude `agentpeers` and Codex sessions so the new MCP server code is loaded. Existing sessions keep running the OLD code until they restart.
+9. Tell me to close and relaunch any running Claude `agentpeers` and Codex sessions so the new MCP server code is loaded. Existing sessions keep running the OLD code until they restart.
 
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
