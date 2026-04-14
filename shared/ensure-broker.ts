@@ -1,14 +1,16 @@
 // shared/ensure-broker.ts
-// Ensures the broker daemon is running. Spawns it detached if not.
+// Ensures the broker daemon is running. Spawns it detached if not. Separate
+// from createClient() because the caller needs the shared secret from
+// ~/.agent-peers-secret AFTER the broker has provisioned it — see
+// waitForSharedSecret() in shared/shared-secret.ts.
 
 import { fileURLToPath } from "node:url";
-import type { BrokerClient } from "./broker-client.ts";
 
 export async function ensureBroker(
-  client: BrokerClient,
+  isAlive: () => Promise<boolean>,
   brokerScriptUrl: string, // pass `new URL("./broker.ts", import.meta.url).href`
 ): Promise<void> {
-  if (await client.isAlive()) return;
+  if (await isAlive()) return;
 
   // Resolve via fileURLToPath — required because the project path contains a space
   // AND an apostrophe ("Brayden's Projects"). URL.pathname returns URL-encoded
@@ -23,7 +25,7 @@ export async function ensureBroker(
 
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 200));
-    if (await client.isAlive()) return;
+    if (await isAlive()) return;
   }
   throw new Error("ensureBroker: broker did not come up within 6s");
 }

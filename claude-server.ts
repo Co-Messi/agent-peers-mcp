@@ -25,6 +25,7 @@ import {
 
 import { createClient } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
+import { waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync } from "./shared/tab-title.ts";
@@ -41,7 +42,15 @@ function log(msg: string) {
   console.error(`[agent-peers/claude] ${msg}`);
 }
 
-const client = createClient(BROKER_URL);
+// The shared secret is only known after the broker has provisioned it, so
+// we defer client construction until main() can read the secret file.
+let client: ReturnType<typeof createClient>;
+async function isBrokerAlive(): Promise<boolean> {
+  try {
+    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    return res.ok;
+  } catch { return false; }
+}
 
 let myId: PeerId | null = null;
 let myName: string | null = null;
@@ -251,7 +260,12 @@ async function main() {
   process.on("exit", clearTabTitleSync);
 
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
-  await ensureBroker(client, brokerScriptUrl);
+  await ensureBroker(isBrokerAlive, brokerScriptUrl);
+  // Now that the broker is up, read the per-user shared secret it wrote into
+  // ~/.agent-peers-secret (file mode 0600) and construct an authenticated
+  // HTTP client with it.
+  const sharedSecret = await waitForSharedSecret();
+  client = createClient(BROKER_URL, sharedSecret);
 
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);

@@ -25,11 +25,16 @@ export interface BrokerClient {
   // with it — see cli.ts cmdRename.
 }
 
-export function createClient(baseUrl: string): BrokerClient {
+export const SECRET_HEADER = "X-Agent-Peers-Secret";
+
+export function createClient(baseUrl: string, sharedSecret: string): BrokerClient {
   async function post<T>(path: string, body: unknown): Promise<T> {
     const res = await fetch(`${baseUrl}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        [SECRET_HEADER]: sharedSecret,
+      },
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`broker ${path}: ${res.status} ${await res.text()}`);

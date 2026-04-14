@@ -3,24 +3,27 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { startBroker } from "../broker.ts";
 import { createClient } from "../shared/broker-client.ts";
-import { unlinkSync, existsSync } from "node:fs";
+import { readFileSync, unlinkSync, existsSync } from "node:fs";
 
 const TEST_DB = "/tmp/agent-peers-e2e-" + Date.now() + ".db";
+const TEST_SECRET = "/tmp/agent-peers-e2e-secret-" + Date.now();
 const TEST_PORT = 7911;
 let handle: ReturnType<typeof startBroker>;
+let testSecret: string;
 
 beforeAll(() => {
-  handle = startBroker(TEST_PORT, TEST_DB);
+  handle = startBroker(TEST_PORT, TEST_DB, TEST_SECRET);
+  testSecret = readFileSync(TEST_SECRET, "utf8").trim();
 });
 afterAll(() => {
   clearInterval(handle.gcTimer);
   handle.server.stop(true);
   handle.db.close();
-  if (existsSync(TEST_DB)) unlinkSync(TEST_DB);
+  for (const p of [TEST_DB, TEST_SECRET]) if (existsSync(p)) unlinkSync(p);
 });
 
 test("broker-client end-to-end: register → send → poll → ack", async () => {
-  const client = createClient(`http://127.0.0.1:${TEST_PORT}`);
+  const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
 
   const a = await client.register({
     peer_type: "claude", pid: 10, cwd: "/a", git_root: null, tty: null, summary: "",
@@ -51,7 +54,7 @@ test("broker-client end-to-end: register → send → poll → ack", async () =>
 });
 
 test("broker-client self-rename with peer session token", async () => {
-  const client = createClient(`http://127.0.0.1:${TEST_PORT}`);
+  const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
 
   const p = await client.register({
     peer_type: "claude", pid: 20, cwd: "/r", git_root: null, tty: null, summary: "",
@@ -65,7 +68,7 @@ test("broker-client self-rename with peer session token", async () => {
 });
 
 test("broker-client rejects peer-rename with wrong token (auth)", async () => {
-  const client = createClient(`http://127.0.0.1:${TEST_PORT}`);
+  const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
 
   const p = await client.register({
     peer_type: "claude", pid: 22, cwd: "/r", git_root: null, tty: null, summary: "",
@@ -79,8 +82,21 @@ test("broker-client rejects peer-rename with wrong token (auth)", async () => {
 });
 
 test("broker-client isAlive returns true for live broker, false for wrong port", async () => {
-  const live = createClient(`http://127.0.0.1:${TEST_PORT}`);
-  const dead = createClient(`http://127.0.0.1:9999`);
+  const live = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
+  const dead = createClient(`http://127.0.0.1:9999`, testSecret);
   expect(await live.isAlive()).toBe(true);
   expect(await dead.isAlive()).toBe(false);
+});
+
+test("broker rejects HTTP requests without the shared-secret header (auth regression)", async () => {
+  // Codex round-C: mere localhost binding is NOT a trust boundary on
+  // shared/multi-user hosts. Broker must require the X-Agent-Peers-Secret
+  // header (from ~/.agent-peers-secret with mode 0600) on every non-/health
+  // request. Verify a 401-class rejection when the header is wrong.
+  const res = await fetch(`http://127.0.0.1:${TEST_PORT}/list-peers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope: "machine", cwd: "/any", git_root: null }),
+  });
+  expect(res.status).toBe(401);
 });

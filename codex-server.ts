@@ -21,6 +21,7 @@ import {
 
 import { createClient } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
+import { waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync } from "./shared/tab-title.ts";
@@ -36,7 +37,13 @@ function log(msg: string) {
   console.error(`[agent-peers/codex] ${msg}`);
 }
 
-const client = createClient(BROKER_URL);
+let client: ReturnType<typeof createClient>;
+async function isBrokerAlive(): Promise<boolean> {
+  try {
+    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    return res.ok;
+  } catch { return false; }
+}
 
 let myId: PeerId | null = null;
 let myName: string | null = null;
@@ -327,7 +334,9 @@ async function main() {
   process.on("exit", clearTabTitleSync);
 
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
-  await ensureBroker(client, brokerScriptUrl);
+  await ensureBroker(isBrokerAlive, brokerScriptUrl);
+  const sharedSecret = await waitForSharedSecret();
+  client = createClient(BROKER_URL, sharedSecret);
 
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);

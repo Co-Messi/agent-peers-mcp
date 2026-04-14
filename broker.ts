@@ -7,6 +7,7 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync, chmodSync } from "node:fs";
 import type {
   RegisterRequest, RegisterResponse, Peer,
   ListPeersRequest, SendMessageRequest, SendMessageResponse,
@@ -16,11 +17,13 @@ import type {
 import { generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
 
 export const DEFAULT_DB_PATH = resolve(homedir(), ".agent-peers.db");
+export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
 export const DEFAULT_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 export const STALE_THRESHOLD_MS = 60_000;
 export const STALE_RECLAIM_THRESHOLD_MS = 60_000;
 export const LEASE_DURATION_MS = 30_000;
 export const GC_INTERVAL_MS = 30_000;
+export const SECRET_HEADER = "x-agent-peers-secret";
 
 function nowIso(): string { return new Date().toISOString(); }
 
@@ -248,32 +251,32 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
   throw new Error("broker: unable to allocate unique peer name after exhaustive retry");
 }
 
-// Returns true if (id, session_token) matches a row. Core auth primitive.
-function authPeer(db: Database, id: string, session_token: string): boolean {
-  const row = db.query<{ c: number }, [string, string]>(
-    "SELECT COUNT(*) AS c FROM peers WHERE id = ? AND session_token = ?"
-  ).get(id, session_token);
-  return (row?.c ?? 0) > 0;
-}
+// NOTE: authPeer() was removed after Codex round-C audit. Every mutating
+// operation now binds `session_token` directly in its SQL WHERE clause so
+// auth and mutation are one atomic statement — eliminating the TOCTOU
+// window that allowed a stale session to mutate a reclaim-rotated peer.
 
-// heartbeat/unregister/setSummary are peer-authenticated. Token mismatch
-// silently no-ops (we don't leak "wrong token" vs "unknown peer"; both look
-// like a missing row to the caller).
+// heartbeat/unregister/setSummary: session_token is folded directly into
+// every mutation's WHERE clause so the auth check and the mutation are ONE
+// atomic statement. A separate authPeer() pre-check would leave a TOCTOU
+// window where a reclaim (which rotates session_token) can happen between
+// the check and the mutation, letting an old session mutate the reclaimed
+// peer's row. Binding the token in WHERE closes that race.
 
 export function heartbeatPeer(db: Database, id: string, session_token: string): void {
-  if (!authPeer(db, id, session_token)) return;
-  db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run(nowIso(), id);
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?")
+    .run(nowIso(), id, session_token);
 }
 
 export function unregisterPeer(db: Database, id: string, session_token: string): void {
-  if (!authPeer(db, id, session_token)) return;
   // Messages stay as orphans (spec §5.1).
-  db.query("DELETE FROM peers WHERE id = ?").run(id);
+  db.query("DELETE FROM peers WHERE id = ? AND session_token = ?")
+    .run(id, session_token);
 }
 
 export function setPeerSummary(db: Database, id: string, session_token: string, summary: string): void {
-  if (!authPeer(db, id, session_token)) return;
-  db.query("UPDATE peers SET summary = ?, last_seen = ? WHERE id = ?").run(summary, nowIso(), id);
+  db.query("UPDATE peers SET summary = ?, last_seen = ? WHERE id = ? AND session_token = ?")
+    .run(summary, nowIso(), id, session_token);
 }
 
 // Both getters deliberately use explicit column projection (NOT `SELECT *`)
@@ -358,12 +361,14 @@ function resolveTarget(db: Database, to_id_or_name: string): Peer | null {
 }
 
 export function sendMessage(db: Database, req: SendMessageRequest): SendMessageResponse {
-  // Sender identity validation via session_token — reject forged senders.
-  if (!authPeer(db, req.from_id, req.session_token)) {
-    return { ok: false, error: `unauthorized sender: ${req.from_id}` };
-  }
-  const sender = getPeer(db, req.from_id);
-  if (!sender) return { ok: false, error: `unknown sender: ${req.from_id}` };
+  // Atomic sender auth: do the check in a single SELECT that binds both
+  // id AND session_token so a reclaim-rotation can't slip a stale session
+  // through. Also fetch last_seen in the same round-trip for the stale
+  // check below.
+  const sender = db.query<{ name: string; last_seen: string }, [string, string]>(
+    "SELECT name, last_seen FROM peers WHERE id = ? AND session_token = ?"
+  ).get(req.from_id, req.session_token);
+  if (!sender) return { ok: false, error: `unauthorized sender: ${req.from_id}` };
   if (isStale(sender.last_seen)) return { ok: false, error: `sender stale: ${sender.name}` };
 
   const target = resolveTarget(db, req.to_id_or_name);
@@ -437,17 +442,17 @@ export function pollMessages(db: Database, id: string, session_token: string): L
 
 export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesResponse {
   if (req.lease_tokens.length === 0) return { ok: true, acked: 0 };
-  // Session-token auth — caller must prove peer ownership.
-  if (!authPeer(db, req.id, req.session_token)) return { ok: true, acked: 0 };
-
+  // Atomic auth via subquery: the UPDATE only affects messages whose to_id
+  // belongs to a peer row with the matching session_token. No separate
+  // pre-check → no TOCTOU window across reclaim-rotation.
   const placeholders = req.lease_tokens.map(() => "?").join(",");
   const sql = `UPDATE messages SET acked = 1, lease_token = NULL, lease_expires_at = NULL
                WHERE lease_token IN (${placeholders})
-                 AND to_id = ?
+                 AND to_id = (SELECT id FROM peers WHERE id = ? AND session_token = ?)
                  AND acked = 0
                  AND lease_expires_at IS NOT NULL
                  AND lease_expires_at >= ?`;
-  const info = db.query(sql).run(...req.lease_tokens, req.id, nowIso());
+  const info = db.query(sql).run(...req.lease_tokens, req.id, req.session_token, nowIso());
   return { ok: true, acked: info.changes ?? 0 };
 }
 
@@ -455,14 +460,16 @@ export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesR
 
 export function renamePeer(db: Database, req: RenamePeerRequest): RenamePeerResponse {
   if (!isValidName(req.new_name)) return { ok: false, error: "invalid name" };
-  // Session-token auth — only the peer itself can rename itself via this path.
-  if (!authPeer(db, req.id, req.session_token)) {
-    return { ok: false, error: "unauthorized rename" };
-  }
+  // Atomic auth + rename: session_token is bound in the WHERE, so a
+  // reclaim-rotated row is unchangeable by a stale session. Zero changes
+  // means either the peer_id is unknown OR the session_token is wrong;
+  // we return "unauthorized rename" in both cases (no auth-vs-enumeration
+  // leak).
   try {
-    const info = db.query("UPDATE peers SET name = ?, last_seen = ? WHERE id = ?")
-      .run(req.new_name, nowIso(), req.id);
-    if ((info.changes ?? 0) === 0) return { ok: false, error: "unknown peer" };
+    const info = db.query(
+      "UPDATE peers SET name = ?, last_seen = ? WHERE id = ? AND session_token = ?"
+    ).run(req.new_name, nowIso(), req.id, req.session_token);
+    if ((info.changes ?? 0) === 0) return { ok: false, error: "unauthorized rename" };
     return { ok: true, name: req.new_name };
   } catch (e) {
     if (isUniqueViolation(e)) return { ok: false, error: "name taken" };
@@ -573,8 +580,29 @@ function json(body: unknown, init?: ResponseInit): Response {
   });
 }
 
-export function startBroker(port: number, dbPath: string) {
+// Per-user shared secret. Generated on first broker startup, written to
+// ~/.agent-peers-secret with mode 0600 so only the owning OS user can read
+// it. Every broker HTTP request must carry the secret in the
+// X-Agent-Peers-Secret header; /health is the sole exception (liveness
+// probe). This closes the "any local process can enumerate peers / inject
+// messages" gap that mere localhost binding does not solve on shared or
+// multi-user hosts.
+export function ensureSharedSecret(path: string): string {
+  try {
+    const existing = readFileSync(path, "utf8").trim();
+    if (existing.length >= 32) return existing; // already provisioned
+  } catch {
+    /* missing or unreadable — fall through and provision */
+  }
+  const secret = randomUUID() + randomUUID().replace(/-/g, "");
+  writeFileSync(path, secret + "\n", { mode: 0o600 });
+  try { chmodSync(path, 0o600); } catch { /* best effort — filesystems without POSIX perms */ }
+  return secret;
+}
+
+export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_SECRET_PATH) {
   const db = initDb(dbPath);
+  const sharedSecret = ensureSharedSecret(secretPath);
 
   const gcTimer = setInterval(() => {
     try { gcStalePeers(db); } catch (e) { console.error("[broker] GC error:", e); }
@@ -590,6 +618,12 @@ export function startBroker(port: number, dbPath: string) {
           return json({ ok: true, pid: process.pid });
         }
         if (req.method !== "POST") return json({ error: "method not allowed" }, { status: 405 });
+
+        // Shared-secret gate for every non-/health request.
+        const presented = req.headers.get(SECRET_HEADER);
+        if (presented !== sharedSecret) {
+          return json({ error: "missing or invalid " + SECRET_HEADER }, { status: 401 });
+        }
 
         switch (url.pathname) {
           case "/register":      return json(registerPeer(db, await readJson(req)));

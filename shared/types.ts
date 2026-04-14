@@ -99,14 +99,6 @@ export interface RenamePeerRequest {
   new_name: PeerName;
 }
 
-// Admin variant — local operator action via cli.ts. No session token because
-// the broker's 127.0.0.1 binding is the trust boundary. Accepted only at
-// /admin/rename-peer, not /rename-peer.
-export interface AdminRenamePeerRequest {
-  id: PeerId;
-  new_name: PeerName;
-}
-
 export interface RenamePeerResponse {
   ok: boolean;
   error?: string;
