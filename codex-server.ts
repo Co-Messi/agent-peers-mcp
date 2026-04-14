@@ -302,6 +302,10 @@ async function main() {
     return;
   }
 
+  // Arm the sync title-clear before anything can call setTabTitle. See
+  // claude-server main() for the rationale.
+  process.on("exit", clearTabTitleSync);
+
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
   await ensureBroker(client, brokerScriptUrl);
 
@@ -366,18 +370,17 @@ async function main() {
   };
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
-  // SIGHUP fires when the parent shell exits (e.g. user closes the terminal tab).
-  // Without this handler, closed-tab sessions leave a stale `peer:<name>` title
-  // on whatever shell later inherits the tab. Also covers SIGQUIT for thoroughness.
   process.on("SIGHUP", cleanup);
   process.on("SIGQUIT", cleanup);
-  // Sync last-resort title clear on any process exit path — async cleanup above
-  // may not complete under signals like SIGKILL or abrupt parent death.
-  process.on("exit", clearTabTitleSync);
+  // process.on("exit", clearTabTitleSync) is already wired at the top of
+  // main() so it protects pre-connect startup failures too.
 }
 
 main().catch(async (e) => {
   log(`fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+  // Clear any title set before the failure so the shell that inherits the tab
+  // doesn't briefly see `peer:<name>` before the 'exit' handler fires.
+  clearTabTitleSync();
   // Same rationale as claude-server: pre-connect failure has no active session
   // to preserve, so unregister the row so it doesn't block reclaim.
   if (myId && mySession) {

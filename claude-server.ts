@@ -228,6 +228,13 @@ async function main() {
     return;
   }
 
+  // Arm the sync title-clear BEFORE any code path that could call setTabTitle.
+  // If anything between here and the full cleanup wiring throws, the 'exit'
+  // handler still clears the terminal title so a crashed startup doesn't leak
+  // `peer:<name>` onto whatever shell later inherits the tab. This is cheap:
+  // it's just a registration of a callback.
+  process.on("exit", clearTabTitleSync);
+
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
   await ensureBroker(client, brokerScriptUrl);
 
@@ -377,13 +384,16 @@ async function main() {
   // on whatever shell later inherits the tab. Also covers SIGQUIT for thoroughness.
   process.on("SIGHUP", cleanup);
   process.on("SIGQUIT", cleanup);
-  // Sync last-resort title clear on any process exit path — async cleanup above
-  // may not complete under signals like SIGKILL or abrupt parent death.
-  process.on("exit", clearTabTitleSync);
+  // Note: process.on("exit", clearTabTitleSync) was already registered at the
+  // top of main() so it survives pre-connect startup failures.
 }
 
 main().catch(async (e) => {
   log(`fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+  // Clear any title we may have set before the failure — don't wait for the
+  // 'exit' handler (which will also run) to avoid a visible flicker where the
+  // user's shell briefly inherits `peer:<name>` before reset.
+  clearTabTitleSync();
   // If we registered with the broker but failed BEFORE mcp.connect() or before
   // signal handlers were installed, no active session exists to preserve for
   // reclaim. Unregister explicitly so the row doesn't block same-name reclaim
