@@ -7,7 +7,7 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, chmodSync, openSync, closeSync, writeSync, statSync } from "node:fs";
 import type {
   RegisterRequest, RegisterResponse, Peer,
   ListPeersRequest, SendMessageRequest, SendMessageResponse,
@@ -361,25 +361,54 @@ function resolveTarget(db: Database, to_id_or_name: string): Peer | null {
 }
 
 export function sendMessage(db: Database, req: SendMessageRequest): SendMessageResponse {
-  // Atomic sender auth: do the check in a single SELECT that binds both
-  // id AND session_token so a reclaim-rotation can't slip a stale session
-  // through. Also fetch last_seen in the same round-trip for the stale
-  // check below.
-  const sender = db.query<{ name: string; last_seen: string }, [string, string]>(
-    "SELECT name, last_seen FROM peers WHERE id = ? AND session_token = ?"
-  ).get(req.from_id, req.session_token);
-  if (!sender) return { ok: false, error: `unauthorized sender: ${req.from_id}` };
-  if (isStale(sender.last_seen)) return { ok: false, error: `sender stale: ${sender.name}` };
+  // Atomic sender auth + target resolution + liveness check + insert, all in
+  // a single transaction so nothing can unregister or re-register between
+  // steps and orphan a "successful" message (Codex round-D TOCTOU fix).
+  const nowStr = nowIso();
+  const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
 
-  const target = resolveTarget(db, req.to_id_or_name);
-  if (!target) return { ok: false, error: `unknown peer: ${req.to_id_or_name}` };
-  if (isStale(target.last_seen)) return { ok: false, error: `target peer stale: ${target.name}` };
+  const tx = db.transaction((): SendMessageResponse => {
+    // 1. Sender auth (atomic: id + session_token + live)
+    const sender = db.query<{ name: string }, [string, string, string]>(
+      "SELECT name FROM peers WHERE id = ? AND session_token = ? AND last_seen >= ?"
+    ).get(req.from_id, req.session_token, staleCutoff);
+    if (!sender) {
+      // Distinguish unauthorized vs stale for a better error message.
+      const row = db.query<{ last_seen: string; name: string }, [string, string]>(
+        "SELECT last_seen, name FROM peers WHERE id = ? AND session_token = ?"
+      ).get(req.from_id, req.session_token);
+      if (!row) return { ok: false, error: `unauthorized sender: ${req.from_id}` };
+      return { ok: false, error: `sender stale: ${row.name}` };
+    }
 
-  const result = db.query<{ id: number }, [string, string, string, string]>(
-    `INSERT INTO messages (from_id, to_id, text, sent_at) VALUES (?, ?, ?, ?) RETURNING id`
-  ).get(req.from_id, target.id, req.text, nowIso());
+    // 2. Target resolution + liveness + insert in ONE statement. The insert
+    //    only succeeds if the target resolves to a LIVE peer row. If the
+    //    target is unregistered or goes stale between the sender check and
+    //    the insert, we fail closed with ok=false rather than writing an
+    //    orphan.
+    const inserted = db.query<
+      { id: number; to_id: string },
+      [string, string, string, string, string, string]
+    >(
+      `INSERT INTO messages (from_id, to_id, text, sent_at)
+       SELECT ?, p.id, ?, ?
+       FROM peers p
+       WHERE (p.id = ? OR p.name = ?)
+         AND p.last_seen >= ?
+       RETURNING id, to_id`
+    ).get(req.from_id, req.text, nowStr, req.to_id_or_name, req.to_id_or_name, staleCutoff);
 
-  return { ok: true, message_id: result?.id };
+    if (!inserted) {
+      // Either no peer matches the id-or-name, or the matched peer is stale.
+      // Distinguish for a better error.
+      const target = resolveTarget(db, req.to_id_or_name);
+      if (!target) return { ok: false, error: `unknown peer: ${req.to_id_or_name}` };
+      return { ok: false, error: `target peer stale: ${target.name}` };
+    }
+    return { ok: true, message_id: inserted.id };
+  });
+
+  return tx();
 }
 
 // ----- Poll (lease) -----
@@ -588,16 +617,38 @@ function json(body: unknown, init?: ResponseInit): Response {
 // messages" gap that mere localhost binding does not solve on shared or
 // multi-user hosts.
 export function ensureSharedSecret(path: string): string {
-  try {
-    const existing = readFileSync(path, "utf8").trim();
-    if (existing.length >= 32) return existing; // already provisioned
-  } catch {
-    /* missing or unreadable — fall through and provision */
-  }
+  // Atomic provisioning (Codex round-D fix for concurrent broker startup):
+  // attempt an exclusive create with O_CREAT|O_EXCL (flag "wx"). If we win
+  // the race, write our freshly-generated secret. If we lose (EEXIST, someone
+  // else provisioned first), fall through and read whatever they wrote.
+  // Either way, all clients converge on the same on-disk secret — no split-
+  // secret failure mode.
   const secret = randomUUID() + randomUUID().replace(/-/g, "");
-  writeFileSync(path, secret + "\n", { mode: 0o600 });
-  try { chmodSync(path, 0o600); } catch { /* best effort — filesystems without POSIX perms */ }
-  return secret;
+  try {
+    const fd = openSync(path, "wx", 0o600);
+    try {
+      writeSync(fd, secret + "\n");
+    } finally {
+      closeSync(fd);
+    }
+    try { chmodSync(path, 0o600); } catch { /* best effort */ }
+
+    // Post-write validation: re-read and confirm we wrote what we expect.
+    // On unusual filesystems an exclusive-create could silently truncate.
+    const back = readFileSync(path, "utf8").trim();
+    if (back === secret) return secret;
+    // Fall through to read whatever is actually persisted.
+  } catch (e: unknown) {
+    // EEXIST — someone else provisioned first; read their value below.
+    // Any other error is unrecoverable.
+    if (!(e instanceof Error) || !/EEXIST/.test(e.message)) throw e;
+  }
+
+  const existing = readFileSync(path, "utf8").trim();
+  if (existing.length < 32) {
+    throw new Error(`broker: existing shared-secret file at ${path} is too short (${existing.length} chars)`);
+  }
+  return existing;
 }
 
 export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_SECRET_PATH) {
