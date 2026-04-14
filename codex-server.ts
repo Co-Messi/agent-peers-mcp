@@ -40,6 +40,7 @@ const client = createClient(BROKER_URL);
 
 let myId: PeerId | null = null;
 let myName: string | null = null;
+let mySession: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
@@ -129,13 +130,29 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 // completed — see spec §5.5 "Residual limitations" for the narrow window this
 // does not fully close. On shutdown we intentionally do NOT flush pendingAcks;
 // let leases expire naturally.
+//
+// Bounded (code review round-2 fix): under repeated ack failure we'd otherwise
+// accumulate unbounded tokens. Cap keeps memory + HTTP payload sane. Oldest
+// tokens are dropped first; they'd have expired leases anyway (30s lease
+// horizon vs cap large enough to cover many minutes of new leases), so the
+// broker would have ack'd them 0 regardless.
+const MAX_PENDING_ACKS = 500;
 const pendingAcks: string[] = [];
 const seen = new Set<number>();
+
+function enqueueAck(token: string) {
+  pendingAcks.push(token);
+  if (pendingAcks.length > MAX_PENDING_ACKS) {
+    const drop = pendingAcks.length - MAX_PENDING_ACKS;
+    pendingAcks.splice(0, drop);
+    log(`pendingAcks trimmed: dropped ${drop} oldest token(s); exceeding cap ${MAX_PENDING_ACKS}`);
+  }
+}
 
 async function withPiggyback(
   handler: () => Promise<{ text: string; isError?: boolean }>,
 ): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
-  if (!myId) {
+  if (!myId || !mySession) {
     return {
       content: [{ type: "text", text: "Not registered with broker yet" }],
       isError: true,
@@ -152,7 +169,7 @@ async function withPiggyback(
   if (pendingAcks.length > 0) {
     const toFlush = pendingAcks.slice();
     try {
-      await client.ackMessages({ id: myId, lease_tokens: toFlush });
+      await client.ackMessages({ id: myId, session_token: mySession, lease_tokens: toFlush });
       // Remove only after success. Use splice by indices-of-toFlush to be
       // robust against concurrent appends (though withPiggyback is strictly
       // serialized per tool call, so this is defense in depth).
@@ -168,7 +185,7 @@ async function withPiggyback(
   // 2. Poll for new messages.
   let leased: LeasedMessage[] = [];
   try {
-    leased = await client.pollMessages(myId);
+    leased = await client.pollMessages({ id: myId, session_token: mySession });
   } catch (e) {
     log(`poll failed: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -179,11 +196,11 @@ async function withPiggyback(
     if (seen.has(m.id)) {
       // Re-delivery after lost ack. Queue lease token for next-call ack so the
       // broker can finally close the stuck lease. Do NOT re-inject.
-      pendingAcks.push(m.lease_token);
+      enqueueAck(m.lease_token);
     } else {
       fresh.push(m);
       seen.add(m.id);
-      pendingAcks.push(m.lease_token);
+      enqueueAck(m.lease_token);
     }
   }
 
@@ -237,7 +254,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "send_message": {
         const { to_id, message } = args as { to_id: string; message: string };
         const res = await client.sendMessage({
-          from_id: myId!, to_id_or_name: to_id, text: message,
+          from_id: myId!, session_token: mySession!, to_id_or_name: to_id, text: message,
         });
         if (!res.ok) return { text: `Send failed: ${res.error}`, isError: true };
         return { text: `Message sent (id=${res.message_id}).` };
@@ -245,7 +262,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       case "set_summary": {
         const { summary } = args as { summary: string };
-        await client.setSummary({ id: myId!, summary });
+        await client.setSummary({ id: myId!, session_token: mySession!, summary });
         return { text: `Summary set: "${summary}"` };
       }
 
@@ -259,7 +276,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (!isValidName(new_name)) {
           return { text: `Invalid name: must be 1-32 chars, [a-zA-Z0-9_-] only.`, isError: true };
         }
-        const res = await client.renamePeer({ id: myId!, new_name });
+        const res = await client.renamePeer({ id: myId!, session_token: mySession!, new_name });
         if (!res.ok) return { text: `Rename failed: ${res.error}`, isError: true };
         myName = res.name ?? new_name;
         setTabTitle(`peer:${myName}`);
@@ -307,13 +324,14 @@ async function main() {
   });
   myId = reg.id;
   myName = reg.name;
+  mySession = reg.session_token;
   setTabTitle(`peer:${myName}`);
   log(`Registered as ${myName} (id=${myId})`);
 
   if (!initialSummary) {
     summaryPromise.then(async () => {
-      if (initialSummary && myId) {
-        try { await client.setSummary({ id: myId, summary: initialSummary }); } catch { /* non-critical */ }
+      if (initialSummary && myId && mySession) {
+        try { await client.setSummary({ id: myId, session_token: mySession, summary: initialSummary }); } catch { /* non-critical */ }
       }
     });
   }
@@ -322,8 +340,8 @@ async function main() {
   log("MCP connected");
 
   const hb = setInterval(async () => {
-    if (myId) {
-      try { await client.heartbeat(myId); } catch { /* non-critical */ }
+    if (myId && mySession) {
+      try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
     }
   }, HEARTBEAT_INTERVAL_MS);
 
@@ -341,8 +359,8 @@ main().catch(async (e) => {
   log(`fatal: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
   // Same rationale as claude-server: pre-connect failure has no active session
   // to preserve, so unregister the row so it doesn't block reclaim.
-  if (myId) {
-    try { await client.unregister(myId); } catch { /* best effort */ }
+  if (myId && mySession) {
+    try { await client.unregister({ id: myId, session_token: mySession }); } catch { /* best effort */ }
   }
   process.exit(1);
 });

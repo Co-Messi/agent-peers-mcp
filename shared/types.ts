@@ -46,13 +46,14 @@ export interface RegisterRequest {
 export interface RegisterResponse {
   id: PeerId;
   name: PeerName;
+  session_token: string; // opaque per-session auth token; required on peer mutations
 }
 
-export interface HeartbeatRequest { id: PeerId; }
+export interface HeartbeatRequest { id: PeerId; session_token: string; }
 
-export interface UnregisterRequest { id: PeerId; }
+export interface UnregisterRequest { id: PeerId; session_token: string; }
 
-export interface SetSummaryRequest { id: PeerId; summary: string; }
+export interface SetSummaryRequest { id: PeerId; session_token: string; summary: string; }
 
 export interface ListPeersRequest {
   scope: "machine" | "directory" | "repo";
@@ -64,6 +65,7 @@ export interface ListPeersRequest {
 
 export interface SendMessageRequest {
   from_id: PeerId;
+  session_token: string;
   to_id_or_name: string;
   text: string;
 }
@@ -74,7 +76,7 @@ export interface SendMessageResponse {
   message_id?: number;
 }
 
-export interface PollMessagesRequest { id: PeerId; }
+export interface PollMessagesRequest { id: PeerId; session_token: string; }
 
 export interface PollMessagesResponse {
   messages: LeasedMessage[];
@@ -82,6 +84,7 @@ export interface PollMessagesResponse {
 
 export interface AckMessagesRequest {
   id: PeerId;
+  session_token: string;
   lease_tokens: string[];
 }
 
@@ -91,6 +94,15 @@ export interface AckMessagesResponse {
 }
 
 export interface RenamePeerRequest {
+  id: PeerId;
+  session_token: string;
+  new_name: PeerName;
+}
+
+// Admin variant — local operator action via cli.ts. No session token because
+// the broker's 127.0.0.1 binding is the trust boundary. Accepted only at
+// /admin/rename-peer, not /rename-peer.
+export interface AdminRenamePeerRequest {
   id: PeerId;
   new_name: PeerName;
 }

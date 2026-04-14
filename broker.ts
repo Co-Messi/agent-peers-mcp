@@ -45,6 +45,7 @@ export function initDb(path: string): Database {
       git_root      TEXT,
       tty           TEXT,
       summary       TEXT DEFAULT '',
+      session_token TEXT NOT NULL,
       registered_at TEXT NOT NULL,
       last_seen     TEXT NOT NULL
     );
@@ -88,31 +89,43 @@ function* nameCandidates(requested: string | undefined): Generator<string> {
 
 export function registerPeer(db: Database, req: RegisterRequest): RegisterResponse {
   const ts = nowIso();
+  // Every register (fresh or reclaim) issues a new session_token. Reclaim
+  // rotates the token so the previous session's client (if it's still alive
+  // elsewhere) can no longer act as this peer — the token is the session
+  // boundary.
+  const session_token = randomUUID();
 
   // Reclaim fast-path: stale peer with matching name → UPDATE in place, preserve UUID.
   if (req.name && isValidName(req.name)) {
     const cutoff = new Date(Date.now() - STALE_RECLAIM_THRESHOLD_MS).toISOString();
     const reclaim = db.query(
       `UPDATE peers
-         SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?, last_seen = ?
+         SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
+             session_token = ?, last_seen = ?
        WHERE name = ? AND last_seen < ?`
-    ).run(req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary, ts, req.name, cutoff);
+    ).run(
+      req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
+      session_token, ts, req.name, cutoff,
+    );
     if ((reclaim.changes ?? 0) > 0) {
       const row = db.query<{ id: string }, [string]>("SELECT id FROM peers WHERE name = ?").get(req.name);
-      if (row) return { id: row.id, name: req.name };
+      if (row) return { id: row.id, name: req.name, session_token };
     }
   }
 
   // Fresh INSERT with suffix ladder.
   const id = randomUUID();
   const insert = db.query(
-    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   for (const candidate of nameCandidates(req.name)) {
     try {
-      insert.run(id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary, ts, ts);
-      return { id, name: candidate };
+      insert.run(
+        id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
+        session_token, ts, ts,
+      );
+      return { id, name: candidate, session_token };
     } catch (e) {
       if (!isUniqueViolation(e)) throw e;
     }
@@ -120,16 +133,31 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
   throw new Error("broker: unable to allocate unique peer name after exhaustive retry");
 }
 
-export function heartbeatPeer(db: Database, id: string): void {
+// Returns true if (id, session_token) matches a row. Core auth primitive.
+function authPeer(db: Database, id: string, session_token: string): boolean {
+  const row = db.query<{ c: number }, [string, string]>(
+    "SELECT COUNT(*) AS c FROM peers WHERE id = ? AND session_token = ?"
+  ).get(id, session_token);
+  return (row?.c ?? 0) > 0;
+}
+
+// heartbeat/unregister/setSummary are peer-authenticated. Token mismatch
+// silently no-ops (we don't leak "wrong token" vs "unknown peer"; both look
+// like a missing row to the caller).
+
+export function heartbeatPeer(db: Database, id: string, session_token: string): void {
+  if (!authPeer(db, id, session_token)) return;
   db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run(nowIso(), id);
 }
 
-export function unregisterPeer(db: Database, id: string): void {
+export function unregisterPeer(db: Database, id: string, session_token: string): void {
+  if (!authPeer(db, id, session_token)) return;
   // Messages stay as orphans (spec §5.1).
   db.query("DELETE FROM peers WHERE id = ?").run(id);
 }
 
-export function setPeerSummary(db: Database, id: string, summary: string): void {
+export function setPeerSummary(db: Database, id: string, session_token: string, summary: string): void {
+  if (!authPeer(db, id, session_token)) return;
   db.query("UPDATE peers SET summary = ?, last_seen = ? WHERE id = ?").run(summary, nowIso(), id);
 }
 
@@ -189,9 +217,10 @@ function resolveTarget(db: Database, to_id_or_name: string): Peer | null {
 }
 
 export function sendMessage(db: Database, req: SendMessageRequest): SendMessageResponse {
-  // Sender identity validation — reject forged/unknown senders.
-  // (Localhost-only deployment, but queue ownership is a correctness concern:
-  // a recipient's `from_name` enrichment must not vouch for a ghost sender.)
+  // Sender identity validation via session_token — reject forged senders.
+  if (!authPeer(db, req.from_id, req.session_token)) {
+    return { ok: false, error: `unauthorized sender: ${req.from_id}` };
+  }
   const sender = getPeer(db, req.from_id);
   if (!sender) return { ok: false, error: `unknown sender: ${req.from_id}` };
   if (isStale(sender.last_seen)) return { ok: false, error: `sender stale: ${sender.name}` };
@@ -209,19 +238,21 @@ export function sendMessage(db: Database, req: SendMessageRequest): SendMessageR
 
 // ----- Poll (lease) -----
 
-export function pollMessages(db: Database, id: string): LeasedMessage[] {
+export function pollMessages(db: Database, id: string, session_token: string): LeasedMessage[] {
   const now = new Date();
   const nowStr = now.toISOString();
   const leaseUntil = new Date(now.getTime() + LEASE_DURATION_MS).toISOString();
 
   const tx = db.transaction(() => {
-    // Peer identity validation — caller must be a registered peer.
-    // Rejects drain attempts from unknown/GC'd UUIDs and prevents orphaned-message
-    // reads via stale UUIDs that shouldn't own a queue anymore.
-    const hbInfo = db.query("UPDATE peers SET last_seen = ? WHERE id = ?").run(nowStr, id);
+    // Session-token auth — caller must prove peer ownership.
+    // The UPDATE with both predicates serves as atomic auth + heartbeat:
+    // if the token doesn't match or the peer is gone, 0 rows update, and we
+    // return empty (matches "no messages" semantically, without exposing
+    // anyone's mailbox).
+    const hbInfo = db.query(
+      "UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?"
+    ).run(nowStr, id, session_token);
     if ((hbInfo.changes ?? 0) === 0) {
-      // Caller is not a registered peer — return empty inbox (no error; matches the
-      // "no messages" happy path semantically, but without exposing anyone's mailbox).
       return [] as LeasedMessage[];
     }
 
@@ -265,10 +296,8 @@ export function pollMessages(db: Database, id: string): LeasedMessage[] {
 
 export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesResponse {
   if (req.lease_tokens.length === 0) return { ok: true, acked: 0 };
-  // Peer identity validation — caller must still be a registered peer.
-  // An unregistered UUID must not be able to ack (and thereby remove) another
-  // peer's queue, even if it somehow obtained a lease_token.
-  if (!getPeer(db, req.id)) return { ok: true, acked: 0 };
+  // Session-token auth — caller must prove peer ownership.
+  if (!authPeer(db, req.id, req.session_token)) return { ok: true, acked: 0 };
 
   const placeholders = req.lease_tokens.map(() => "?").join(",");
   const sql = `UPDATE messages SET acked = 1, lease_token = NULL, lease_expires_at = NULL
@@ -284,6 +313,29 @@ export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesR
 // ----- Rename -----
 
 export function renamePeer(db: Database, req: RenamePeerRequest): RenamePeerResponse {
+  if (!isValidName(req.new_name)) return { ok: false, error: "invalid name" };
+  // Session-token auth — only the peer itself can rename itself via this path.
+  if (!authPeer(db, req.id, req.session_token)) {
+    return { ok: false, error: "unauthorized rename" };
+  }
+  try {
+    const info = db.query("UPDATE peers SET name = ?, last_seen = ? WHERE id = ?")
+      .run(req.new_name, nowIso(), req.id);
+    if ((info.changes ?? 0) === 0) return { ok: false, error: "unknown peer" };
+    return { ok: true, name: req.new_name };
+  } catch (e) {
+    if (isUniqueViolation(e)) return { ok: false, error: "name taken" };
+    throw e;
+  }
+}
+
+// Admin variant — no token check. Used by cli.ts only. The trust boundary is
+// the broker's 127.0.0.1 binding: if you can hit this endpoint, you are
+// already a local-machine operator.
+export function adminRenamePeer(
+  db: Database,
+  req: { id: string; new_name: string },
+): RenamePeerResponse {
   if (!isValidName(req.new_name)) return { ok: false, error: "invalid name" };
   try {
     const info = db.query("UPDATE peers SET name = ?, last_seen = ? WHERE id = ?")
@@ -357,14 +409,15 @@ export function startBroker(port: number, dbPath: string) {
 
         switch (url.pathname) {
           case "/register":      return json(registerPeer(db, await readJson(req)));
-          case "/heartbeat":     { const { id } = await readJson<{ id: string }>(req); heartbeatPeer(db, id); return json({ ok: true }); }
-          case "/unregister":    { const { id } = await readJson<{ id: string }>(req); unregisterPeer(db, id); return json({ ok: true }); }
-          case "/set-summary":   { const { id, summary } = await readJson<{ id: string; summary: string }>(req); setPeerSummary(db, id, summary); return json({ ok: true }); }
+          case "/heartbeat":     { const b = await readJson<{ id: string; session_token: string }>(req); heartbeatPeer(db, b.id, b.session_token); return json({ ok: true }); }
+          case "/unregister":    { const b = await readJson<{ id: string; session_token: string }>(req); unregisterPeer(db, b.id, b.session_token); return json({ ok: true }); }
+          case "/set-summary":   { const b = await readJson<{ id: string; session_token: string; summary: string }>(req); setPeerSummary(db, b.id, b.session_token, b.summary); return json({ ok: true }); }
           case "/list-peers":    return json(listPeers(db, await readJson(req)));
           case "/send-message":  return json(sendMessage(db, await readJson(req)));
-          case "/poll-messages": { const { id } = await readJson<{ id: string }>(req); return json({ messages: pollMessages(db, id) }); }
+          case "/poll-messages": { const b = await readJson<{ id: string; session_token: string }>(req); return json({ messages: pollMessages(db, b.id, b.session_token) }); }
           case "/ack-messages":  return json(ackMessages(db, await readJson(req)));
           case "/rename-peer":   return json(renamePeer(db, await readJson(req)));
+          case "/admin/rename-peer": return json(adminRenamePeer(db, await readJson(req)));
           case "/orphaned-messages": return json({ messages: listOrphanedMessages(db) });
           default: return json({ error: "not found" }, { status: 404 });
         }

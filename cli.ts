@@ -48,18 +48,34 @@ async function cmdSend(targetNameOrId: string, message: string) {
     tty: null,
     summary: "local CLI operator",
   });
+  // Code review round-2 fix: do NOT call process.exit() inside the try — that
+  // terminates the process before finally runs and leaves the operator peer
+  // registered. Capture the exit status, always unregister, then exit.
+  let exitCode = 0;
+  let sendError: string | null = null;
+  let messageId: number | undefined;
   try {
     const res = await client.sendMessage({
-      from_id: reg.id, to_id_or_name: targetNameOrId, text: message,
+      from_id: reg.id, session_token: reg.session_token, to_id_or_name: targetNameOrId, text: message,
     });
     if (!res.ok) {
-      console.error(`send failed: ${res.error}`);
-      process.exit(1);
+      sendError = res.error ?? "unknown";
+      exitCode = 1;
+    } else {
+      messageId = res.message_id;
     }
-    console.log(`sent (id=${res.message_id}, from=${reg.name})`);
   } finally {
-    try { await client.unregister(reg.id); } catch { /* best effort */ }
+    try {
+      await client.unregister({ id: reg.id, session_token: reg.session_token });
+    } catch {
+      /* best effort */
+    }
   }
+  if (exitCode !== 0) {
+    console.error(`send failed: ${sendError}`);
+    process.exit(exitCode);
+  }
+  console.log(`sent (id=${messageId}, from=${reg.name})`);
 }
 
 async function cmdRename(target: string, newName: string) {
@@ -71,7 +87,9 @@ async function cmdRename(target: string, newName: string) {
     console.error(`no peer matching '${target}'`);
     process.exit(1);
   }
-  const res = await client.renamePeer({ id: found.id, new_name: newName });
+  // Use the admin endpoint (no session_token check). The trust boundary for
+  // admin operations is the broker's 127.0.0.1 binding.
+  const res = await client.adminRenamePeer({ id: found.id, new_name: newName });
   if (!res.ok) {
     console.error(`rename failed: ${res.error}`);
     process.exit(1);

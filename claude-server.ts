@@ -45,6 +45,7 @@ const client = createClient(BROKER_URL);
 
 let myId: PeerId | null = null;
 let myName: string | null = null;
+let mySession: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
@@ -128,7 +129,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
-  if (!myId) {
+  if (!myId || !mySession) {
     return {
       content: [{ type: "text" as const, text: "Not registered with broker yet" }],
       isError: true,
@@ -163,7 +164,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "send_message": {
       const { to_id, message } = args as { to_id: string; message: string };
       const res = await client.sendMessage({
-        from_id: myId, to_id_or_name: to_id, text: message,
+        from_id: myId, session_token: mySession, to_id_or_name: to_id, text: message,
       });
       if (!res.ok) {
         return { content: [{ type: "text" as const, text: `Send failed: ${res.error}` }], isError: true };
@@ -173,7 +174,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "set_summary": {
       const { summary } = args as { summary: string };
-      await client.setSummary({ id: myId, summary });
+      await client.setSummary({ id: myId, session_token: mySession, summary });
       return { content: [{ type: "text" as const, text: `Summary set: "${summary}"` }] };
     }
 
@@ -199,7 +200,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
-      const res = await client.renamePeer({ id: myId, new_name });
+      const res = await client.renamePeer({ id: myId, session_token: mySession, new_name });
       if (!res.ok) {
         return { content: [{ type: "text" as const, text: `Rename failed: ${res.error}` }], isError: true };
       }
@@ -249,15 +250,16 @@ async function main() {
   });
   myId = reg.id;
   myName = reg.name;
+  mySession = reg.session_token;
   setTabTitle(`peer:${myName}`);
   log(`Registered as ${myName} (id=${myId})`);
 
   // Late summary upload if generation took longer than 3s.
   if (!initialSummary) {
     summaryPromise.then(async () => {
-      if (initialSummary && myId) {
+      if (initialSummary && myId && mySession) {
         try {
-          await client.setSummary({ id: myId, summary: initialSummary });
+          await client.setSummary({ id: myId, session_token: mySession, summary: initialSummary });
         } catch {
           /* non-critical */
         }
@@ -273,9 +275,9 @@ async function main() {
   const seen = new Set<number>();
 
   const pollAndPush = async () => {
-    if (!myId) return;
+    if (!myId || !mySession) return;
     try {
-      const msgs = await client.pollMessages(myId);
+      const msgs = await client.pollMessages({ id: myId, session_token: mySession });
       const toAck: string[] = [];
       for (const m of msgs) {
         if (seen.has(m.id)) {
@@ -309,9 +311,9 @@ async function main() {
           log(`push failed (lease will expire + redeliver): ${e instanceof Error ? e.message : String(e)}`);
         }
       }
-      if (toAck.length > 0) {
+      if (toAck.length > 0 && mySession) {
         try {
-          await client.ackMessages({ id: myId, lease_tokens: toAck });
+          await client.ackMessages({ id: myId, session_token: mySession, lease_tokens: toAck });
         } catch {
           /* next poll picks up remainder */
         }
@@ -338,8 +340,8 @@ async function main() {
   scheduleNextPush();
 
   const hb = setInterval(async () => {
-    if (myId) {
-      try { await client.heartbeat(myId); } catch { /* non-critical */ }
+    if (myId && mySession) {
+      try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
     }
   }, HEARTBEAT_INTERVAL_MS);
 
@@ -364,8 +366,8 @@ main().catch(async (e) => {
   // signal handlers were installed, no active session exists to preserve for
   // reclaim. Unregister explicitly so the row doesn't block same-name reclaim
   // for 60s. Post-connect failures use the signal-handler path (no unregister).
-  if (myId) {
-    try { await client.unregister(myId); } catch { /* best effort */ }
+  if (myId && mySession) {
+    try { await client.unregister({ id: myId, session_token: mySession }); } catch { /* best effort */ }
   }
   process.exit(1);
 });

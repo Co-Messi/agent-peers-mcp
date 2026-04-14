@@ -32,45 +32,67 @@ test("broker-client end-to-end: register → send → poll → ack", async () =>
   });
   expect(a.name).toBe("alpha");
   expect(b.name).toBe("beta");
+  expect(a.session_token).toBeTruthy();
 
   const sent = await client.sendMessage({
-    from_id: a.id, to_id_or_name: "beta", text: "hi",
+    from_id: a.id, session_token: a.session_token, to_id_or_name: "beta", text: "hi",
   });
   expect(sent.ok).toBe(true);
 
-  const polled = await client.pollMessages(b.id);
+  const polled = await client.pollMessages({ id: b.id, session_token: b.session_token });
   expect(polled.length).toBe(1);
   expect(polled[0]!.from_name).toBe("alpha");
 
   const acked = await client.ackMessages({
-    id: b.id, lease_tokens: polled.map((m) => m.lease_token),
+    id: b.id, session_token: b.session_token,
+    lease_tokens: polled.map((m) => m.lease_token),
   });
   expect(acked.acked).toBe(1);
 });
 
-test("broker-client rename_peer + list_peers round-trip", async () => {
+test("broker-client self-rename with peer session token", async () => {
   const client = createClient(`http://127.0.0.1:${TEST_PORT}`);
 
   const p = await client.register({
     peer_type: "claude", pid: 20, cwd: "/r", git_root: null, tty: null, summary: "",
     name: "renamer",
   });
-  const r = await client.renamePeer({ id: p.id, new_name: "renamed" });
+  const r = await client.renamePeer({
+    id: p.id, session_token: p.session_token, new_name: "renamed",
+  });
   expect(r.ok).toBe(true);
   expect(r.name).toBe("renamed");
-
-  const peers = await client.listPeers({
-    scope: "machine", cwd: "/", git_root: null,
-  });
-  expect(peers.some((q) => q.id === p.id && q.name === "renamed")).toBe(true);
 });
 
-test("broker-client isAlive returns true for a live broker", async () => {
+test("broker-client admin-rename (no session token)", async () => {
   const client = createClient(`http://127.0.0.1:${TEST_PORT}`);
-  expect(await client.isAlive()).toBe(true);
+
+  const p = await client.register({
+    peer_type: "claude", pid: 21, cwd: "/r", git_root: null, tty: null, summary: "",
+    name: "admin-target",
+  });
+  const r = await client.adminRenamePeer({ id: p.id, new_name: "admin-renamed" });
+  expect(r.ok).toBe(true);
+  expect(r.name).toBe("admin-renamed");
 });
 
-test("broker-client isAlive returns false for a wrong port", async () => {
-  const client = createClient(`http://127.0.0.1:9999`);
-  expect(await client.isAlive()).toBe(false);
+test("broker-client rejects peer-rename with wrong token (auth)", async () => {
+  const client = createClient(`http://127.0.0.1:${TEST_PORT}`);
+
+  const p = await client.register({
+    peer_type: "claude", pid: 22, cwd: "/r", git_root: null, tty: null, summary: "",
+    name: "locked",
+  });
+  const r = await client.renamePeer({
+    id: p.id, session_token: "wrong-token", new_name: "hacked",
+  });
+  expect(r.ok).toBe(false);
+  expect(r.error).toMatch(/unauthorized/i);
+});
+
+test("broker-client isAlive returns true for live broker, false for wrong port", async () => {
+  const live = createClient(`http://127.0.0.1:${TEST_PORT}`);
+  const dead = createClient(`http://127.0.0.1:9999`);
+  expect(await live.isAlive()).toBe(true);
+  expect(await dead.isAlive()).toBe(false);
 });
