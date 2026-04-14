@@ -332,26 +332,35 @@ Two uninstall prompts below — parallel to the install pair. Each is a plain-En
 Open a Claude Code session and paste this verbatim:
 
 ````
-Uninstall agent-peers-mcp for me.
+Completely uninstall agent-peers-mcp for me — I want every trace gone.
 
-First, find the install directory. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp, or elsewhere under my home directory. If you find more than one candidate, or you're uncertain, LIST the candidates and ASK me which one to remove before proceeding. Do NOT delete anything until I confirm.
+Step 1 — find the install directory. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp, or elsewhere under my home directory. If you find more than one candidate, or you're uncertain, LIST the candidates and ASK me which one to remove before proceeding. Do NOT delete anything until I confirm.
 
-Then do all of the following:
+Once I confirm the path, do a FULL wipe — do not ask per-item confirmations; just do everything:
 
-1. Unregister the MCP from Claude Code:
+1. Stop any running broker daemon:
+   - Run `lsof -t -i:7900` to find the broker PID(s).
+   - Kill each one with `kill -TERM <pid>` (or SIGKILL if SIGTERM doesn't work within 2s).
+   - Also run `bun cli.ts kill-broker` from inside the confirmed repo directory if the repo still exists at this point — it's another way to stop the broker.
+
+2. Unregister the MCP from Claude Code:
    claude mcp remove agent-peers
 
-2. Remove the launcher alias from ~/.zshrc. The line looks like:
+3. Remove the launcher alias from ~/.zshrc. The line looks like:
    alias agentpeers='AGENT_PEERS_ENABLED=1 claude --dangerously-skip-permissions --dangerously-load-development-channels server:agent-peers'
-   Delete that line (and any surrounding "# agent-peers-mcp" comment) and leave every other line in ~/.zshrc untouched.
+   Delete that line (and any surrounding "# agent-peers-mcp" comment). Leave every other line in ~/.zshrc untouched.
 
-3. Tell me to run `source ~/.zshrc` (or open a new terminal).
+4. Delete the cloned repo directory (the exact path I confirmed in Step 1) — remove recursively.
 
-4. Delete the cloned repo directory (the exact path I confirmed in the first step).
+5. Delete ALL broker state files under my home directory. Specifically any file matching `~/.agent-peers*` — this normally means:
+   - ~/.agent-peers.db
+   - ~/.agent-peers.db-shm
+   - ~/.agent-peers.db-wal
+   Use `rm -f ~/.agent-peers.db ~/.agent-peers.db-shm ~/.agent-peers.db-wal` so missing files don't error. Also run `ls -la ~/.agent-peers* 2>/dev/null` afterwards to confirm nothing is left.
 
-5. Ask me: "Do you also want to delete the SQLite broker database at ~/.agent-peers.db?" — only delete it if I say yes.
+6. Tell me to run `source ~/.zshrc` (or open a new terminal) so the alias change takes effect.
 
-6. Give me a final summary: what you removed, what you skipped, and any paths I should double-check manually.
+7. Give me a final summary listing every path and resource you removed, plus anything you couldn't remove and why. Also paste the output of `ls -la ~/.agent-peers* 2>/dev/null || echo 'clean'` so I can see it's fully gone.
 
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
@@ -363,19 +372,28 @@ Confirm each step's outcome as you go. If any step fails, stop and ask me how to
 Open a Codex session and paste this verbatim:
 
 ````
-Uninstall agent-peers-mcp for me.
+Completely uninstall agent-peers-mcp for me — I want every trace gone.
 
-First, find the install directory. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp, or elsewhere under my home directory. If you find more than one candidate, or you're uncertain, LIST the candidates and ASK me which one to remove before proceeding. Do NOT delete anything until I confirm.
+Step 1 — find the install directory. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp, or elsewhere under my home directory. If you find more than one candidate, or you're uncertain, LIST the candidates and ASK me which one to remove before proceeding. Do NOT delete anything until I confirm.
 
-Then do all of the following:
+Once I confirm the path, do a FULL wipe — do not ask per-item confirmations; just do everything:
 
-1. Remove the [mcp_servers.agent-peers] block from ~/.codex/config.toml. Keep every other mcp_servers entry and every other section intact. If you are not 100% certain you can surgically edit TOML, FIRST show me the exact block you intend to remove and ask me to confirm before writing.
+1. Stop any running broker daemon:
+   - Run `lsof -t -i:7900` to find the broker PID(s).
+   - Kill each one with `kill -TERM <pid>` (or SIGKILL if SIGTERM doesn't work within 2s).
+   - Also run `bun cli.ts kill-broker` from inside the confirmed repo directory if the repo still exists at this point — it's another way to stop the broker.
 
-2. Delete the cloned repo directory (the exact path I confirmed in the first step).
+2. Remove the [mcp_servers.agent-peers] block from ~/.codex/config.toml. Keep every other mcp_servers entry and every other section intact. If you are not 100% certain you can surgically edit TOML, FIRST show me the exact block you intend to remove and ask me to confirm before writing.
 
-3. Ask me: "Do you also want to delete the SQLite broker database at ~/.agent-peers.db?" — only delete it if I say yes.
+3. Delete the cloned repo directory (the exact path I confirmed in Step 1) — remove recursively.
 
-4. Give me a final summary: what you removed, what you skipped, and any paths I should double-check manually.
+4. Delete ALL broker state files under my home directory. Specifically any file matching `~/.agent-peers*` — this normally means:
+   - ~/.agent-peers.db
+   - ~/.agent-peers.db-shm
+   - ~/.agent-peers.db-wal
+   Use `rm -f ~/.agent-peers.db ~/.agent-peers.db-shm ~/.agent-peers.db-wal` so missing files don't error. Also run `ls -la ~/.agent-peers* 2>/dev/null` afterwards to confirm nothing is left.
+
+5. Give me a final summary listing every path and resource you removed, plus anything you couldn't remove and why. Also paste the output of `ls -la ~/.agent-peers* 2>/dev/null || echo 'clean'` so I can see it's fully gone.
 
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
