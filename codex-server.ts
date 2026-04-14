@@ -302,8 +302,25 @@ async function main() {
     return;
   }
 
-  // Arm the sync title-clear before anything can call setTabTitle. See
-  // claude-server main() for the rationale.
+  // Arm full signal-level title-clear before any setTabTitle() call.
+  // Rationale (verified by Codex adversarial review): an unhandled SIGHUP
+  // exits with status 129 and does NOT fire the 'exit' event. So we install
+  // SIGINT/SIGTERM/SIGHUP/SIGQUIT handlers immediately — not just 'exit' —
+  // that sync-clear the title, optionally run whatever deferred cleanup is
+  // wired, then exit. This closes the startup window where setTabTitle has
+  // already fired but the full lifecycle cleanup isn't wired yet.
+  let lifecycleCleanup: (() => Promise<void> | void) | null = null;
+  const earlyKillHandler = async () => {
+    try {
+      if (lifecycleCleanup) await lifecycleCleanup();
+    } catch { /* best effort during death */ }
+    clearTabTitleSync();
+    process.exit(0);
+  };
+  process.on("SIGINT", earlyKillHandler);
+  process.on("SIGTERM", earlyKillHandler);
+  process.on("SIGHUP", earlyKillHandler);
+  process.on("SIGQUIT", earlyKillHandler);
   process.on("exit", clearTabTitleSync);
 
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
@@ -361,19 +378,15 @@ async function main() {
     }
   }, HEARTBEAT_INTERVAL_MS);
 
-  const cleanup = async () => {
+  // Wire deferred lifecycle cleanup into the earlyKillHandler registered at
+  // the top of main(). Intentionally NO pendingAcks flush (spec §5.5) and NO
+  // unregister (preserves reclaim-by-name window). Timer cleanup only.
+  lifecycleCleanup = async () => {
     clearInterval(hb);
-    clearTabTitle(); // reset terminal title so `peer:<name>` doesn't persist after exit
-    // Deliberately do NOT flush pendingAcks (spec §5.5).
-    // Deliberately do NOT unregister (preserves reclaim-by-name window).
-    process.exit(0);
   };
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
-  process.on("SIGHUP", cleanup);
-  process.on("SIGQUIT", cleanup);
-  // process.on("exit", clearTabTitleSync) is already wired at the top of
-  // main() so it protects pre-connect startup failures too.
+  // Note: all signal handlers + 'exit' handler are already armed at the top
+  // of main(), before any setTabTitle() call — so a terminal close during
+  // startup also clears the title.
 }
 
 main().catch(async (e) => {

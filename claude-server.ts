@@ -228,11 +228,26 @@ async function main() {
     return;
   }
 
-  // Arm the sync title-clear BEFORE any code path that could call setTabTitle.
-  // If anything between here and the full cleanup wiring throws, the 'exit'
-  // handler still clears the terminal title so a crashed startup doesn't leak
-  // `peer:<name>` onto whatever shell later inherits the tab. This is cheap:
-  // it's just a registration of a callback.
+  // Arm the terminal-title cleanup BEFORE any code path that could call
+  // setTabTitle. The `exit` handler covers the explicit process.exit() path,
+  // but an UNHANDLED SIGHUP (e.g. the user closes the tab during startup,
+  // after setTabTitle has fired) terminates with status 129 and does NOT
+  // trigger `exit`. So we ALSO install signal handlers immediately, even
+  // before the rest of the lifecycle wiring exists. They call a
+  // lifecycle-aware cleanup that runs whatever deferred work (timers,
+  // pending acks) is ready, then sync-clears the title and exits.
+  let lifecycleCleanup: (() => Promise<void> | void) | null = null;
+  const earlyKillHandler = async () => {
+    try {
+      if (lifecycleCleanup) await lifecycleCleanup();
+    } catch { /* best effort during death */ }
+    clearTabTitleSync();
+    process.exit(0);
+  };
+  process.on("SIGINT", earlyKillHandler);
+  process.on("SIGTERM", earlyKillHandler);
+  process.on("SIGHUP", earlyKillHandler);
+  process.on("SIGQUIT", earlyKillHandler);
   process.on("exit", clearTabTitleSync);
 
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
@@ -365,27 +380,18 @@ async function main() {
     }
   }, HEARTBEAT_INTERVAL_MS);
 
-  const cleanup = async () => {
+  // Wire the deferred lifecycle cleanup into the earlyKillHandler registered
+  // at the top of main(). When any fatal signal arrives now, earlyKillHandler
+  // will call this to clean up timers + deliberately NOT unregister (to preserve
+  // reclaim-by-name), then sync-clear the title, then exit.
+  lifecycleCleanup = async () => {
     clearInterval(hb);
     pushStopped = true;
     if (pushTickTimer) clearTimeout(pushTickTimer);
-    clearTabTitle(); // reset terminal title so `peer:<name>` doesn't persist after exit
-    // Deliberately NO client.unregister(myId) here.
-    // Unregister would immediately delete the peer row and defeat the
-    // reclaim-by-name mechanism in /register that lets a restart with the same
-    // PEER_NAME preserve the UUID. The broker's 30-second GC reaps us within
-    // 60-90s of our heartbeat stopping.
-    process.exit(0);
   };
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
-  // SIGHUP fires when the parent shell exits (e.g. user closes the terminal tab).
-  // Without this handler, closed-tab sessions leave a stale `peer:<name>` title
-  // on whatever shell later inherits the tab. Also covers SIGQUIT for thoroughness.
-  process.on("SIGHUP", cleanup);
-  process.on("SIGQUIT", cleanup);
-  // Note: process.on("exit", clearTabTitleSync) was already registered at the
-  // top of main() so it survives pre-connect startup failures.
+  // Note: SIGINT / SIGTERM / SIGHUP / SIGQUIT / exit handlers are already
+  // registered earlier in main(), before any setTabTitle() call, so terminal
+  // close during startup also clears the title.
 }
 
 main().catch(async (e) => {
