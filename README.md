@@ -122,57 +122,85 @@ Confirm each step's outcome as you go. If any step fails, stop and ask me how to
 
 ---
 
-### Verify the network
-
-Open two terminals, run `agentpeers` in one and `codex` in the other. In either session, ask:
-
-> "List all peers on this machine" — you should see the other one.
-> "Send a message to peer <name>: hello" — the other receives it (instant for Claude via channel push, on next tool call for Codex).
-
 ---
 
 ## Usage
 
-### Launch peer-aware sessions
+Four steps: **launch → name → test → talk**. Pick the path for each agent you want to run — Claude, Codex, or both.
+
+### Step 1 — Launch a peer-aware session
+
+Open a new terminal and run the launcher for your agent:
+
+| Agent | Command |
+|---|---|
+| **Claude Code** | `agentpeers` |
+| **Codex** | `codex` |
+
+That's it — the MCP loads automatically, the broker auto-spawns if it's not already running, and your terminal tab renames itself to `peer:<name>`.
+
+### Step 2 — Name your session (optional but recommended)
+
+Every session gets a random friendly name on launch (like `calm-fox`, `swift-panda`). If you want a stable, human-readable name, set `PEER_NAME` **before** the launcher:
+
+| Agent | Command |
+|---|---|
+| **Claude Code** | `PEER_NAME=frontend-tab agentpeers` |
+| **Codex** | `PEER_NAME=backend-work codex` |
+
+**Name rules:** 1–32 characters, `[a-zA-Z0-9_-]` only, must be unique across currently-live peers. A name collision auto-suffixes (`frontend-tab` → `frontend-tab-2`).
+
+**Rename mid-session:** just ask the agent — for example, "rename me to architect" — and the `rename_peer` tool fires. Your tab title updates to the new name immediately.
+
+### Step 3 — Test that the network is alive
+
+Open **two** terminal tabs and launch a session in each (any combination of Claude + Codex). In either session, ask:
+
+> **"List all peers on this machine"**
+
+You should see the other session. Then, in one of them, ask:
+
+> **"Send a message to peer \<name\>: hello"**
+
+The other session receives it:
+
+| Recipient | How the message arrives |
+|---|---|
+| **Claude** | Instantly, mid-task, as a `<channel source="agent-peers">` push |
+| **Codex** | In the response of its next tool call, as a `[PEER INBOX]` block |
+
+### Step 4 — Actually use it
+
+Here are prompts that work well once the network is up:
+
+**Coordinate a task:**
+> "Send a message to peer backend-work: I'm updating the auth interface in `auth.ts` — can you update the backend to match?"
+
+**Ask for a second opinion:**
+> "Send a message to peer code-reviewer: review my last commit and tell me what's wrong"
+
+**Filter discovery:**
+> "List only the Codex peers in this repo"
+
+**Check summaries:**
+> "List all peers and tell me what each one is working on" — each peer advertises a `summary` you can read.
+
+---
+
+## Shell CLI
+
+Inspect and control the broker from a terminal (no Claude/Codex session needed):
 
 ```bash
-# Claude with a friendly name
-PEER_NAME=frontend-tab agentpeers
-
-# Claude with auto-generated name (like "calm-fox")
-agentpeers
-
-# Codex picks up the MCP automatically
-codex
-
-# Codex with a pre-assigned name
-PEER_NAME=backend-work codex
-```
-
-Each tab's title updates to `peer:<name>` so you can tell sessions apart at a glance.
-
-### Talk between sessions
-
-Inside any session, ask the agent:
-
-> "List all peers on this machine"
-
-> "Send a message to peer frontend-tab: can you handle the UI while I work on the API?"
-
-> "Rename me to architect"
-
-> "Only show me Codex peers in this repo"
-
-### Inspect from the shell
-
-```bash
-bun cli.ts status                        # Broker + full peer list
+bun cli.ts status                        # Broker health + full peer list
 bun cli.ts peers                         # Peers only
-bun cli.ts send frontend-tab "ship it"   # Send from the shell
-bun cli.ts rename calm-fox docs-writer   # Admin rename
+bun cli.ts send frontend-tab "ship it"   # Send a message from the shell
+bun cli.ts rename calm-fox docs-writer   # Admin rename (operator action)
 bun cli.ts orphaned-messages             # Messages to peers that died
 bun cli.ts kill-broker                   # Stop the broker daemon
 ```
+
+Run these from inside the cloned `agent-peers-mcp/` directory.
 
 ---
 
