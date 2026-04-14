@@ -11,6 +11,8 @@ import { homedir } from "node:os";
 
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
 
+import { lstatSync } from "node:fs";
+
 /**
  * Verify that the shared-secret file on disk is:
  *  - a regular file (not a symlink, not a device)
@@ -20,14 +22,10 @@ export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
  * If any check fails, throw a clear error. Fail-closed is intentional: a
  * mode-weakened file means another local user could have read it.
  *
- * Windows & other non-POSIX filesystems don't honor mode bits the same way,
- * so we skip the mode bit check there but still enforce regular-file + uid.
+ * Exported so the broker side can apply the identical check to an existing
+ * secret file before trusting it (Codex round-E finding).
  */
-function validateSecretFilePerms(path: string): void {
-  // Use lstatSync-equivalent behavior by statSync — it follows symlinks,
-  // but we want to reject symlinks specifically. Import lstatSync.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { lstatSync } = require("node:fs") as typeof import("node:fs");
+export function validateSecretFilePerms(path: string): void {
   const lst = lstatSync(path);
   if (lst.isSymbolicLink()) {
     throw new Error(`shared secret at ${path} is a symlink — refusing (attacker could redirect to another user's file)`);

@@ -7,7 +7,8 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, chmodSync, openSync, closeSync, writeSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, chmodSync, openSync, closeSync, writeSync, fsyncSync, linkSync, unlinkSync, existsSync } from "node:fs";
+import { validateSecretFilePerms } from "./shared/shared-secret.ts";
 import type {
   RegisterRequest, RegisterResponse, Peer,
   ListPeersRequest, SendMessageRequest, SendMessageResponse,
@@ -33,10 +34,22 @@ function isUniqueViolation(e: unknown): boolean {
 
 // ----- Schema -----
 
+function chmodIfExists(p: string, mode: number): void {
+  try { chmodSync(p, mode); } catch { /* file may not exist yet, or no POSIX perms — best effort */ }
+}
+
 export function initDb(path: string): Database {
   const db = new Database(path);
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");
+  // Harden filesystem permissions on the DB + its WAL sidecars. Codex round-E
+  // flagged that SQLite creates files with the process umask (typically 022,
+  // world-readable), which would expose session_tokens + message bodies to
+  // any local user. cli.ts 'messages' / 'rename' treat the DB's file perms
+  // as the operator trust boundary, so 0600 enforcement is required.
+  chmodIfExists(path, 0o600);
+  chmodIfExists(path + "-wal", 0o600);
+  chmodIfExists(path + "-shm", 0o600);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS peers (
@@ -617,38 +630,75 @@ function json(body: unknown, init?: ResponseInit): Response {
 // messages" gap that mere localhost binding does not solve on shared or
 // multi-user hosts.
 export function ensureSharedSecret(path: string): string {
-  // Atomic provisioning (Codex round-D fix for concurrent broker startup):
-  // attempt an exclusive create with O_CREAT|O_EXCL (flag "wx"). If we win
-  // the race, write our freshly-generated secret. If we lose (EEXIST, someone
-  // else provisioned first), fall through and read whatever they wrote.
-  // Either way, all clients converge on the same on-disk secret — no split-
-  // secret failure mode.
-  const secret = randomUUID() + randomUUID().replace(/-/g, "");
-  try {
-    const fd = openSync(path, "wx", 0o600);
-    try {
-      writeSync(fd, secret + "\n");
-    } finally {
-      closeSync(fd);
-    }
-    try { chmodSync(path, 0o600); } catch { /* best effort */ }
+  // Crash-safe atomic provisioning (Codex round-E fix for "ensureSharedSecret
+  // bricks startup after a crash between create and write"):
+  //
+  //   1. If path already exists, validate its perms (same checks as client),
+  //      then check content length. If valid and length >= 32, reuse it.
+  //      If the file exists but is short/empty (partial-write from a crashed
+  //      earlier broker), refuse to act — throw with a clear recovery
+  //      instruction. Auto-repair would race with concurrent brokers.
+  //   2. Otherwise, write the secret to a PID-suffixed temp file, fsync it,
+  //      chmod 0600, then attempt an atomic linkSync to the final path.
+  //      link() succeeds only if the final path does NOT exist — two
+  //      concurrent brokers racing here both tmpfile-write, only one wins
+  //      the link, the loser reads the winner's content.
+  //   3. After link, unlink the temp file. If link failed with EEXIST,
+  //      someone else got there — delete our temp, read whatever they wrote.
 
-    // Post-write validation: re-read and confirm we wrote what we expect.
-    // On unusual filesystems an exclusive-create could silently truncate.
+  // Fast path: validated existing file
+  if (existsSync(path)) {
+    validateSecretFilePerms(path);
+    const existing = readFileSync(path, "utf8").trim();
+    if (existing.length >= 32) return existing;
+    throw new Error(
+      `broker: shared-secret file at ${path} exists but is too short (${existing.length} chars) — likely a partial write from a crashed broker. ` +
+      `To recover: stop all brokers, delete ${path}, and restart.`
+    );
+  }
+
+  const secret = randomUUID() + randomUUID().replace(/-/g, "");
+  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
+
+  // Write secret to unique temp path, fsync, chmod 0600.
+  const fd = openSync(tmp, "wx", 0o600);
+  try {
+    writeSync(fd, secret + "\n");
+    try { fsyncSync(fd); } catch { /* best effort on fs that doesn't support fsync */ }
+  } finally {
+    closeSync(fd);
+  }
+  try { chmodSync(tmp, 0o600); } catch { /* best effort */ }
+
+  // Try atomic link: succeeds only if `path` doesn't exist yet. This gives
+  // us exclusive-create semantics without the torn-write window of O_EXCL.
+  let linked = false;
+  try {
+    linkSync(tmp, path);
+    linked = true;
+  } catch (e: unknown) {
+    if (!(e instanceof Error) || !/EEXIST/.test(e.message)) {
+      try { unlinkSync(tmp); } catch { /* best effort */ }
+      throw e;
+    }
+    // EEXIST — someone else linked first. Read their content.
+  }
+  try { unlinkSync(tmp); } catch { /* best effort */ }
+
+  if (linked) {
+    // Verify our write survived the link.
     const back = readFileSync(path, "utf8").trim();
     if (back === secret) return secret;
-    // Fall through to read whatever is actually persisted.
-  } catch (e: unknown) {
-    // EEXIST — someone else provisioned first; read their value below.
-    // Any other error is unrecoverable.
-    if (!(e instanceof Error) || !/EEXIST/.test(e.message)) throw e;
+    // If something else wrote after us (shouldn't happen with link), fall through
   }
 
-  const existing = readFileSync(path, "utf8").trim();
-  if (existing.length < 32) {
-    throw new Error(`broker: existing shared-secret file at ${path} is too short (${existing.length} chars)`);
+  // Read whoever won the link-race (or us, post-hoc).
+  validateSecretFilePerms(path);
+  const persisted = readFileSync(path, "utf8").trim();
+  if (persisted.length < 32) {
+    throw new Error(`broker: shared-secret file at ${path} is too short after link — unrecoverable`);
   }
-  return existing;
+  return persisted;
 }
 
 export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_SECRET_PATH) {
@@ -657,6 +707,10 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
 
   const gcTimer = setInterval(() => {
     try { gcStalePeers(db); } catch (e) { console.error("[broker] GC error:", e); }
+    // Re-enforce 0600 on WAL/SHM sidecars — SQLite may recreate them on
+    // checkpoint, and they'd come back with default umask-controlled perms.
+    chmodIfExists(dbPath + "-wal", 0o600);
+    chmodIfExists(dbPath + "-shm", 0o600);
   }, GC_INTERVAL_MS);
 
   const server = Bun.serve({
