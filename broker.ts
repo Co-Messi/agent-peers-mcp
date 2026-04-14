@@ -67,7 +67,43 @@ export function initDb(path: string): Database {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_to_acked ON messages(to_id, acked);`);
 
+  // ---- Migrations for upgrades against a pre-existing DB file ----
+  // Add columns that newer code requires but the old schema lacks. Use
+  // pragma_table_info to detect missing columns, then ALTER TABLE to add them
+  // and backfill sensible defaults.
+
+  migrate_peers_add_session_token(db);
+
   return db;
+}
+
+function columnExists(db: Database, table: string, column: string): boolean {
+  // pragma_table_info() doesn't accept bound parameters reliably across SQLite
+  // builds, so we inline the table name with hardening (single-quote escaping).
+  // This is only ever called with compile-time-known table names.
+  const safe = table.replace(/'/g, "''");
+  const rows = db.query<{ name: string }, []>(
+    `SELECT name FROM pragma_table_info('${safe}')`
+  ).all();
+  return rows.some((r) => r.name === column);
+}
+
+function migrate_peers_add_session_token(db: Database): void {
+  if (columnExists(db, "peers", "session_token")) return;
+
+  // Pre-session_token schema. Add the column (SQLite does not support
+  // "ADD COLUMN ... NOT NULL" on a populated table, so we add a nullable
+  // column, backfill random UUIDs for every existing row, and from then on
+  // new INSERTs carry their own tokens.
+  db.exec(`ALTER TABLE peers ADD COLUMN session_token TEXT`);
+  const rows = db.query<{ id: string }, []>(
+    "SELECT id FROM peers WHERE session_token IS NULL"
+  ).all();
+  const update = db.query("UPDATE peers SET session_token = ? WHERE id = ?");
+  for (const row of rows) {
+    update.run(randomUUID(), row.id);
+  }
+  console.error(`[broker] migrated peers schema: added session_token, backfilled ${rows.length} row(s)`);
 }
 
 // ----- Peer CRUD -----
