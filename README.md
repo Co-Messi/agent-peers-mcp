@@ -56,89 +56,78 @@ You're done.
 
 ## Install
 
-You don't install this manually. You paste a prompt into your AI agent and it installs itself. Two prompts below — one for Claude Code, one for Codex CLI. You can run either or both.
+Two install prompts below — one for Claude Code, one for Codex. Each is a plain-English prompt you paste into the agent, and the agent installs everything itself. Pick either or do both.
 
 ---
 
-### 🧠 For Claude Code — paste this into a Claude Code session
+### 🧠 For Claude Code
 
-Open a Claude Code session anywhere on your machine and paste the following prompt verbatim. Claude will clone the repo, install dependencies, register the MCP, add the launcher alias, and tell you how to test it.
+Open a Claude Code session and paste this verbatim:
 
 ````
-Please install agent-peers-mcp for me.
+Install https://github.com/Co-Messi/agent-peers-mcp for me.
 
-**What it is:** a Model Context Protocol (MCP) server that lets multiple Claude Code and Codex CLI sessions on this machine discover each other and exchange messages in real time. It's hosted at https://github.com/Co-Messi/agent-peers-mcp.
+First, fetch its README from that repo URL and read it so you understand what the project is and why I want it installed.
 
-**Do all of the following:**
+Then do all of the following:
 
-1. Clone the repo into a sensible location on my machine (pick one under `~/Github Repos/` if that exists, otherwise `~/agent-peers-mcp`). After cloning, remember the absolute path as `$AGENT_PEERS_DIR`.
+1. Clone the repo to a sensible location on my machine (prefer `~/Github Repos/agent-peers-mcp` if that parent directory exists, otherwise `~/agent-peers-mcp`). Remember the absolute path as $AGENT_PEERS_DIR.
 
-2. `cd` into that directory and run `bun install`.
+2. cd into $AGENT_PEERS_DIR and run `bun install`.
 
-3. Register the MCP globally for Claude Code:
-   ```
+3. Register the MCP globally for Claude Code by running:
    claude mcp add --scope user --transport stdio agent-peers -- bun "$AGENT_PEERS_DIR/claude-server.ts"
-   ```
 
-4. Append the launcher alias to `~/.zshrc` (check it's not already there first — don't duplicate):
-   ```
+4. Append the launcher alias to ~/.zshrc (skip if it's already there — don't duplicate):
    alias agentpeers='claude --dangerously-skip-permissions --dangerously-load-development-channels server:agent-peers'
-   ```
 
-5. After everything is done, tell me to:
-   - Run `source ~/.zshrc` in any open terminal (or open a new terminal)
-   - Launch with `PEER_NAME=my-name agentpeers` to test
-   - Open a second terminal, launch another session, and ask it to "list all peers on this machine"
+5. Tell me the install is done and I should:
+   - `source ~/.zshrc` (or open a new terminal)
+   - Launch another tab with `PEER_NAME=my-name agentpeers`
+   - Ask the new session to "list all peers on this machine"
 
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
 
 ---
 
-### 🤖 For Codex CLI — paste this into a Codex session
+### 🤖 For Codex
 
-Open a Codex CLI session and paste this prompt. Codex will clone the repo, install dependencies, and wire up its own `~/.codex/config.toml`.
+Open a Codex session and paste this verbatim:
 
 ````
-Please install agent-peers-mcp for me.
+Install https://github.com/Co-Messi/agent-peers-mcp for me.
 
-**What it is:** a Model Context Protocol (MCP) server that lets multiple Codex CLI and Claude Code sessions on this machine discover each other and exchange messages. Hosted at https://github.com/Co-Messi/agent-peers-mcp.
+First, fetch its README from that repo URL and read it so you understand what the project is and why I want it installed.
 
-**Do all of the following:**
+Then do all of the following:
 
-1. Clone the repo into a sensible location on my machine (pick one under `~/Github Repos/` if that exists, otherwise `~/agent-peers-mcp`). After cloning, remember the absolute path as `$AGENT_PEERS_DIR`.
+1. Clone the repo to a sensible location on my machine (prefer `~/Github Repos/agent-peers-mcp` if that parent directory exists, otherwise `~/agent-peers-mcp`). Remember the absolute path as $AGENT_PEERS_DIR.
 
-2. `cd` into that directory and run `bun install`.
+2. cd into $AGENT_PEERS_DIR and run `bun install`.
 
-3. Append this block to `~/.codex/config.toml` (create the file if it doesn't exist; do not duplicate if the `[mcp_servers.agent-peers]` section already exists):
-   ```
+3. Append this block to ~/.codex/config.toml (create the file if it doesn't exist; skip if the [mcp_servers.agent-peers] section already exists):
    [mcp_servers.agent-peers]
    command = "bun"
    args = ["$AGENT_PEERS_DIR/codex-server.ts"]
-   ```
-   Substitute `$AGENT_PEERS_DIR` with the actual absolute path before writing.
+   Substitute $AGENT_PEERS_DIR with the real absolute path before writing.
 
-4. After everything is done, tell me to:
+4. Tell me the install is done and I should:
    - Open a new terminal and run `codex` — the MCP will load automatically
-   - Optionally set `PEER_NAME=my-name` before launching so my session has a stable name
-   - Ask Codex to "list all peers on this machine" to confirm the network is working
+   - Optionally set `PEER_NAME=my-name` before launching for a stable name
+   - Ask the new session to "list all peers on this machine"
 
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
 
 ---
 
-### Verify both are talking
+### Verify the network
 
-Open two terminals: one running `agentpeers` (Claude), one running `codex`. In either, ask:
+Open two terminals, run `agentpeers` in one and `codex` in the other. In either session, ask:
 
-> "List all peers on this machine"
-
-You should see the other session. Then:
-
-> "Send a message to peer <name>: hello"
-
-The other session receives it — instant for Claude via channel push, on its next tool call for Codex.
+> "List all peers on this machine" — you should see the other one.
+> "Send a message to peer <name>: hello" — the other receives it (instant for Claude via channel push, on next tool call for Codex).
 
 ---
 
