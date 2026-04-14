@@ -78,8 +78,8 @@ Then do all of the following:
 3. Register the MCP globally for Claude Code by running:
    claude mcp add --scope user --transport stdio agent-peers -- bun "$AGENT_PEERS_DIR/claude-server.ts"
 
-4. Append the launcher alias to ~/.zshrc (skip if it's already there — don't duplicate):
-   alias agentpeers='claude --dangerously-skip-permissions --dangerously-load-development-channels server:agent-peers'
+4. Append the launcher alias to ~/.zshrc (skip if it's already there — don't duplicate). IMPORTANT: the alias must set AGENT_PEERS_ENABLED=1 so the peer network only activates when the user explicitly launches via `agentpeers` (plain `claude` stays unaffected):
+   alias agentpeers='AGENT_PEERS_ENABLED=1 claude --dangerously-skip-permissions --dangerously-load-development-channels server:agent-peers'
 
 5. Tell me the install is done and I should:
    - `source ~/.zshrc` (or open a new terminal)
@@ -110,6 +110,7 @@ Then do all of the following:
    [mcp_servers.agent-peers]
    command = "bun"
    args = ["$AGENT_PEERS_DIR/codex-server.ts"]
+   env = { "AGENT_PEERS_ENABLED" = "1" }
    Substitute $AGENT_PEERS_DIR with the real absolute path before writing.
 
 4. Tell me the install is done and I should:
@@ -225,6 +226,21 @@ Read the full technical spec at [`docs/superpowers/specs/2026-04-13-agent-peers-
 | `PEER_NAME` | auto-generated | Human-readable peer name at launch (1-32 chars, `[a-zA-Z0-9_-]`) |
 | `OPENAI_API_KEY` | — | Enables `gpt-5.4-nano` auto-summary of what each session is working on |
 | `AGENT_PEERS_DISABLE_TAB_TITLE` | — | Set to `1` to skip terminal tab title writing |
+
+---
+
+## Known behaviors
+
+**Claude sessions only activate peers when you launch via `agentpeers`.**
+The `agentpeers` alias sets `AGENT_PEERS_ENABLED=1`. Plain `claude` does not, so the MCP loads in idle/no-op mode — no peer registration, no tab title change, no broker connection. This is intentional: the MCP is registered globally in `~/.claude.json`, so every `claude` session spawns it, and we don't want the peer network showing up in unrelated sessions.
+
+**Codex always has peers active** (as long as you included `env = { "AGENT_PEERS_ENABLED" = "1" }` in your `config.toml` entry). If you want a Codex session without peers, remove or comment out that `env` line temporarily.
+
+**Codex only picks up peer messages on its next agent-peers tool call.**
+There is no push channel for Codex; messages surface in the response of the NEXT call to an agent-peers tool (`list_peers`, `send_message`, `set_summary`, `check_messages`, or `rename_peer`). If Codex is busy with other work and doesn't touch agent-peers, incoming messages wait at the broker. Ask Codex "check messages" to force a poll.
+
+**Closed tabs disappear from discovery within ~60 seconds.**
+When you close a tab, the shell kills the session without graceful cleanup. The peer row stays in the broker until its heartbeat goes stale (~60s). `list_peers` filters stale peers out of results immediately — you won't see ghost peers there even in that window. If you restart with the same `PEER_NAME` within 60-90s, the broker reclaims the same UUID and any undelivered messages route correctly.
 
 ---
 

@@ -289,8 +289,20 @@ export function getPeerByName(db: Database, name: string): Peer | null {
 // ----- Listing -----
 
 export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
+  // Opportunistic cleanup — run GC before listing so a user who just closed a
+  // session tab doesn't see their own ghost peer. Complements the 30s timer GC.
+  gcStalePeers(db);
+
   const clauses: string[] = [];
   const params: (string | null)[] = [];
+
+  // Always hide stale peers from discovery. Even if timer/opportunistic GC
+  // hasn't removed the row yet (it happens <= 30s after heartbeat stops),
+  // the `last_seen >= cutoff` predicate filters them out of visible results.
+  // This is what closes the "closed the tab but peer still shows up" gap.
+  const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+  clauses.push("last_seen >= ?");
+  params.push(cutoff);
 
   if (req.scope === "directory") {
     clauses.push("cwd = ?");
@@ -313,7 +325,7 @@ export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
     params.push(req.peer_type);
   }
 
-  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const where = `WHERE ${clauses.join(" AND ")}`;
   const sql = `SELECT * FROM peers ${where} ORDER BY last_seen DESC`;
   return db.query<Peer, typeof params>(sql).all(...params);
 }

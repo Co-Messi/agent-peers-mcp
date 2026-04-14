@@ -195,6 +195,18 @@ test("listPeers scope=repo filters by git_root", () => {
   expect(peers.map((p) => p.id)).toEqual([a.id]);
 });
 
+test("listPeers filters out stale peers (closed-tab ghosts disappear immediately)", () => {
+  const a = reg({ name: "alive" });
+  const b = reg({ name: "ghost" });
+  // Backdate ghost to simulate a session whose tab was closed
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+    .run("1970-01-01T00:00:00.000Z", b.id);
+  const peers = listPeers(db, { scope: "machine", cwd: "/any", git_root: null });
+  // Stale ghost is filtered; only live peer shows up.
+  expect(peers.map((p) => p.name)).toEqual(["alive"]);
+  expect(peers.map((p) => p.id)).not.toContain(b.id);
+});
+
 test("listPeers peer_type filter", () => {
   reg({});
   const c = reg({ peer_type: "codex" });

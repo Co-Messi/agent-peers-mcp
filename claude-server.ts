@@ -27,7 +27,7 @@ import { createClient } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
-import { setTabTitle } from "./shared/tab-title.ts";
+import { setTabTitle, clearTabTitle } from "./shared/tab-title.ts";
 import { isValidName } from "./shared/names.ts";
 import type { PeerId } from "./shared/types.ts";
 
@@ -215,6 +215,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 
 async function main() {
+  // Activation gate — the MCP is globally registered in ~/.claude.json so every
+  // `claude` session spawns this process. If AGENT_PEERS_ENABLED is not "1",
+  // we run as a no-op MCP: connect, expose zero tools, don't touch the broker,
+  // don't set the terminal title. The `agentpeers` alias sets the env var;
+  // plain `claude` doesn't. This prevents the peer network from activating
+  // (and renaming your tab) in every unrelated Claude session.
+  if (process.env.AGENT_PEERS_ENABLED !== "1") {
+    mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+    await mcp.connect(new StdioServerTransport());
+    log("agent-peers disabled (set AGENT_PEERS_ENABLED=1 to activate); idle");
+    return;
+  }
+
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
   await ensureBroker(client, brokerScriptUrl);
 
@@ -349,6 +362,7 @@ async function main() {
     clearInterval(hb);
     pushStopped = true;
     if (pushTickTimer) clearTimeout(pushTickTimer);
+    clearTabTitle(); // reset terminal title so `peer:<name>` doesn't persist after exit
     // Deliberately NO client.unregister(myId) here.
     // Unregister would immediately delete the peer row and defeat the
     // reclaim-by-name mechanism in /register that lets a restart with the same

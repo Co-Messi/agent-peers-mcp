@@ -23,7 +23,7 @@ import { createClient } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
-import { setTabTitle } from "./shared/tab-title.ts";
+import { setTabTitle, clearTabTitle } from "./shared/tab-title.ts";
 import { formatInboxBlock } from "./shared/piggyback.ts";
 import { isValidName } from "./shared/names.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
@@ -48,11 +48,12 @@ const mcp = new Server(
   { name: "agent-peers", version: "0.1.0" },
   {
     capabilities: { tools: {} },
-    instructions: `You are connected to the agent-peers network — other AI agents on this machine (Claude Code or Codex CLI sessions) can discover you and send you messages.
+    instructions: `You are connected to the agent-peers network — other AI agents on this machine (Claude Code or Codex) can discover you and send you messages.
 
-INBOX HANDLING:
-- Any tool call on this MCP automatically surfaces pending peer messages: if there are any, the response text starts with a [PEER INBOX] block listing them with inline reply hints. You do NOT need to call anything special — list_peers, set_summary, even a send_message will all pick up your inbox.
-- check_messages is a passive convenience trigger; it has the same effect as any other tool call with no extra logic.
+INBOX HANDLING — IMPORTANT:
+- This MCP does NOT push messages to you. You receive messages ONLY when you call a tool on this server; the response is prepended with a [PEER INBOX] block listing pending peer messages.
+- When the user says things like "wait for a reply", "did I get a message", or is in a collaborative flow with other peers, you MUST call check_messages (or any agent-peers tool) regularly — otherwise peer messages pile up at the broker unseen.
+- Default cadence: after completing every major step of a multi-peer task, call check_messages before moving on. When idle waiting for a reply, call check_messages every few user turns.
 - When you see a [PEER INBOX] block, treat each message like a coworker's Slack message: finish your current step, then respond via send_message(to_id=<from_name>, message="..."). The from_name and message_id are inside the block.
 
 ON STARTUP:
@@ -63,11 +64,11 @@ PEER DISCOVERY:
 - Each peer has a human-readable "name" (e.g. "frontend-tab") and an immutable UUID "id". peer_type is "claude" or "codex".
 
 TOOLS:
-- list_peers(scope, peer_type?)
-- send_message(to_id, message)   // to_id accepts UUID or name
-- set_summary(summary)
-- check_messages
-- rename_peer(new_name)          // YOURSELF only; 1-32 chars, [a-zA-Z0-9_-]`,
+- list_peers(scope, peer_type?)       — also surfaces any pending inbox
+- send_message(to_id, message)        — to_id accepts UUID or name; also surfaces inbox
+- set_summary(summary)                — also surfaces inbox
+- check_messages                      — explicit inbox poll, call this when waiting for replies
+- rename_peer(new_name)               — YOURSELF only; 1-32 chars, [a-zA-Z0-9_-]`,
   },
 );
 
@@ -290,6 +291,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 
 async function main() {
+  // Activation gate — matches claude-server. If AGENT_PEERS_ENABLED is not "1",
+  // run as a no-op MCP (no broker connection, no tab title). Codex sessions
+  // set this via the `env = { "AGENT_PEERS_ENABLED" = "1" }` block in
+  // ~/.codex/config.toml.
+  if (process.env.AGENT_PEERS_ENABLED !== "1") {
+    mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+    await mcp.connect(new StdioServerTransport());
+    log("agent-peers disabled (set AGENT_PEERS_ENABLED=1 to activate); idle");
+    return;
+  }
+
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
   await ensureBroker(client, brokerScriptUrl);
 
@@ -347,6 +359,7 @@ async function main() {
 
   const cleanup = async () => {
     clearInterval(hb);
+    clearTabTitle(); // reset terminal title so `peer:<name>` doesn't persist after exit
     // Deliberately do NOT flush pendingAcks (spec §5.5).
     // Deliberately do NOT unregister (preserves reclaim-by-name window).
     process.exit(0);

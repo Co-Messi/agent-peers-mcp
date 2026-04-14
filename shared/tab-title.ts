@@ -24,3 +24,9 @@ export function setTabTitle(title: string): void {
     );
   }
 }
+
+// Clear the terminal title back to the shell's default. Called on MCP cleanup
+// so a lingering `peer:calm-fox` title doesn't outlive the session.
+export function clearTabTitle(): void {
+  setTabTitle("");
+}
