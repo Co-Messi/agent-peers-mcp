@@ -321,6 +321,67 @@ Both can run simultaneously. They do not talk to each other — you'd run `claud
 
 ---
 
+## Uninstall
+
+Two uninstall prompts below — parallel to the install pair. Each is a plain-English prompt you paste into the agent, and the agent removes everything it installed. Each prompt first asks you to confirm the clone path (in case the agent is in a fresh session and doesn't remember where it was cloned to).
+
+---
+
+### 🧠 For Claude Code — paste this to uninstall
+
+Open a Claude Code session and paste this verbatim:
+
+````
+Uninstall agent-peers-mcp for me.
+
+First, find the install directory. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp, or elsewhere under my home directory. If you find more than one candidate, or you're uncertain, LIST the candidates and ASK me which one to remove before proceeding. Do NOT delete anything until I confirm.
+
+Then do all of the following:
+
+1. Unregister the MCP from Claude Code:
+   claude mcp remove agent-peers
+
+2. Remove the launcher alias from ~/.zshrc. The line looks like:
+   alias agentpeers='AGENT_PEERS_ENABLED=1 claude --dangerously-skip-permissions --dangerously-load-development-channels server:agent-peers'
+   Delete that line (and any surrounding "# agent-peers-mcp" comment) and leave every other line in ~/.zshrc untouched.
+
+3. Tell me to run `source ~/.zshrc` (or open a new terminal).
+
+4. Delete the cloned repo directory (the exact path I confirmed in the first step).
+
+5. Ask me: "Do you also want to delete the SQLite broker database at ~/.agent-peers.db?" — only delete it if I say yes.
+
+6. Give me a final summary: what you removed, what you skipped, and any paths I should double-check manually.
+
+Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
+````
+
+---
+
+### 🤖 For Codex — paste this to uninstall
+
+Open a Codex session and paste this verbatim:
+
+````
+Uninstall agent-peers-mcp for me.
+
+First, find the install directory. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp, or elsewhere under my home directory. If you find more than one candidate, or you're uncertain, LIST the candidates and ASK me which one to remove before proceeding. Do NOT delete anything until I confirm.
+
+Then do all of the following:
+
+1. Remove the [mcp_servers.agent-peers] block from ~/.codex/config.toml. Keep every other mcp_servers entry and every other section intact. If you are not 100% certain you can surgically edit TOML, FIRST show me the exact block you intend to remove and ask me to confirm before writing.
+
+2. Delete the cloned repo directory (the exact path I confirmed in the first step).
+
+3. Ask me: "Do you also want to delete the SQLite broker database at ~/.agent-peers.db?" — only delete it if I say yes.
+
+4. Give me a final summary: what you removed, what you skipped, and any paths I should double-check manually.
+
+Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
+````
+
+---
+
 ## Requirements
 
 - [Bun](https://bun.sh) ≥ 1.3
