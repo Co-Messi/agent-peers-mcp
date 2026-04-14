@@ -90,6 +90,16 @@ export function initDb(path: string): Database {
 
   migrate_peers_add_session_token(db);
 
+  // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
+  // chmod before schema setup may have no-op'd on nonexistent sidecars, so
+  // we harden again here once SQLite has definitely materialized the WAL/
+  // SHM files at least once. Closes the Codex round-F "world-readable
+  // sidecars during startup" window (previously waited up to 30s for the
+  // GC tick to re-apply).
+  chmodIfExists(path, 0o600);
+  chmodIfExists(path + "-wal", 0o600);
+  chmodIfExists(path + "-shm", 0o600);
+
   return db;
 }
 
@@ -672,16 +682,44 @@ export function ensureSharedSecret(path: string): string {
 
   // Try atomic link: succeeds only if `path` doesn't exist yet. This gives
   // us exclusive-create semantics without the torn-write window of O_EXCL.
+  // On filesystems without hard-link support (FAT/exFAT/some network fs)
+  // linkSync fails with ENOTSUP/EPERM — fall back to openSync('wx') on the
+  // target path (Codex round-F fix). That's still race-safe because O_EXCL
+  // is atomic; the only property we lose is crash-resilience against torn
+  // writes. Rare + non-fatal.
   let linked = false;
   try {
     linkSync(tmp, path);
     linked = true;
   } catch (e: unknown) {
-    if (!(e instanceof Error) || !/EEXIST/.test(e.message)) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/EEXIST/.test(msg)) {
+      // Someone else linked first. Fall through to read their content.
+    } else if (/ENOTSUP|EPERM|EOPNOTSUPP/i.test(msg)) {
+      // Hard links not supported on this filesystem — fall back to an
+      // exclusive-create open on the target path itself.
+      try {
+        const fd2 = openSync(path, "wx", 0o600);
+        try {
+          writeSync(fd2, secret + "\n");
+          try { fsyncSync(fd2); } catch { /* best effort */ }
+        } finally {
+          closeSync(fd2);
+        }
+        try { chmodSync(path, 0o600); } catch { /* best effort */ }
+        linked = true;
+      } catch (e2: unknown) {
+        const msg2 = e2 instanceof Error ? e2.message : String(e2);
+        if (!/EEXIST/.test(msg2)) {
+          try { unlinkSync(tmp); } catch { /* best effort */ }
+          throw e2;
+        }
+        // EEXIST on fallback too — someone else got there.
+      }
+    } else {
       try { unlinkSync(tmp); } catch { /* best effort */ }
       throw e;
     }
-    // EEXIST — someone else linked first. Read their content.
   }
   try { unlinkSync(tmp); } catch { /* best effort */ }
 
