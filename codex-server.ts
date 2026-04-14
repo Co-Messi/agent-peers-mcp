@@ -23,7 +23,7 @@ import { createClient } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
-import { setTabTitle, clearTabTitle } from "./shared/tab-title.ts";
+import { setTabTitle, clearTabTitle, clearTabTitleSync } from "./shared/tab-title.ts";
 import { formatInboxBlock } from "./shared/piggyback.ts";
 import { isValidName } from "./shared/names.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
@@ -366,6 +366,14 @@ async function main() {
   };
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
+  // SIGHUP fires when the parent shell exits (e.g. user closes the terminal tab).
+  // Without this handler, closed-tab sessions leave a stale `peer:<name>` title
+  // on whatever shell later inherits the tab. Also covers SIGQUIT for thoroughness.
+  process.on("SIGHUP", cleanup);
+  process.on("SIGQUIT", cleanup);
+  // Sync last-resort title clear on any process exit path — async cleanup above
+  // may not complete under signals like SIGKILL or abrupt parent death.
+  process.on("exit", clearTabTitleSync);
 }
 
 main().catch(async (e) => {

@@ -30,3 +30,20 @@ export function setTabTitle(title: string): void {
 export function clearTabTitle(): void {
   setTabTitle("");
 }
+
+// Synchronous variant safe to call from process.on("exit", ...). Writes directly
+// without spawning async work. Used as a last-resort fallback when SIGHUP or
+// unexpected termination paths prevent the normal async cleanup from running.
+export function clearTabTitleSync(): void {
+  if (process.env.AGENT_PEERS_DISABLE_TAB_TITLE === "1") return;
+  try {
+    const fd = openSync("/dev/tty", "w");
+    try {
+      writeSync(fd, `\x1b]0;\x07`);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    // swallow — we're already exiting
+  }
+}

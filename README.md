@@ -78,7 +78,9 @@ Then do all of the following:
 3. Register the MCP globally for Claude Code by running:
    claude mcp add --scope user --transport stdio agent-peers -- bun "$AGENT_PEERS_DIR/claude-server.ts"
 
-4. Append the launcher alias to ~/.zshrc (skip if it's already there — don't duplicate). IMPORTANT: the alias must set AGENT_PEERS_ENABLED=1 so the peer network only activates when the user explicitly launches via `agentpeers` (plain `claude` stays unaffected):
+4. Append the launcher alias to ~/.zshrc (skip if it's already there — don't duplicate).
+
+   CRITICAL — the alias MUST start with `AGENT_PEERS_ENABLED=1`. Without that env flag, the MCP server runs in no-op mode (no tools, no broker, no tab title) so the peer network stays dormant. The whole point of the alias is to set this flag only when launching `agentpeers`, leaving plain `claude` untouched:
    alias agentpeers='AGENT_PEERS_ENABLED=1 claude --dangerously-skip-permissions --dangerously-load-development-channels server:agent-peers'
 
 5. Tell me the install is done and I should:
@@ -112,6 +114,8 @@ Then do all of the following:
    args = ["$AGENT_PEERS_DIR/codex-server.ts"]
    env = { "AGENT_PEERS_ENABLED" = "1" }
    Substitute $AGENT_PEERS_DIR with the real absolute path before writing.
+
+   CRITICAL — do NOT omit the `env = { "AGENT_PEERS_ENABLED" = "1" }` line. Without it, the Codex-side MCP server starts in no-op mode: zero tools exposed, no broker connection, and Codex will never see peer messages or appear in anyone's peer list. Setting this env flag to "1" is what activates the peer network.
 
 4. Tell me the install is done and I should:
    - Open a new terminal and run `codex` — the MCP will load automatically
