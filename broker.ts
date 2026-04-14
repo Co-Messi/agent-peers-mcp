@@ -89,21 +89,48 @@ function columnExists(db: Database, table: string, column: string): boolean {
 }
 
 function migrate_peers_add_session_token(db: Database): void {
-  if (columnExists(db, "peers", "session_token")) return;
-
-  // Pre-session_token schema. Add the column (SQLite does not support
-  // "ADD COLUMN ... NOT NULL" on a populated table, so we add a nullable
-  // column, backfill random UUIDs for every existing row, and from then on
-  // new INSERTs carry their own tokens.
-  db.exec(`ALTER TABLE peers ADD COLUMN session_token TEXT`);
-  const rows = db.query<{ id: string }, []>(
-    "SELECT id FROM peers WHERE session_token IS NULL"
-  ).all();
-  const update = db.query("UPDATE peers SET session_token = ? WHERE id = ?");
-  for (const row of rows) {
-    update.run(randomUUID(), row.id);
+  // Wrapped in BEGIN IMMEDIATE so concurrent broker startups serialize the
+  // schema check + mutation (code review round-4 fix). Without this, process A
+  // can run ALTER TABLE while process B races past the columnExists check and
+  // proceeds against a half-migrated DB.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (!columnExists(db, "peers", "session_token")) {
+      // First-time upgrade from a pre-session_token schema.
+      db.exec(`ALTER TABLE peers ADD COLUMN session_token TEXT`);
+      // Drop all pre-upgrade peer rows (round-4 fix for "migrated legacy peers
+      // can silently receive undeliverable messages"). Pre-upgrade clients
+      // don't know the new session_token scheme, so they cannot authenticate.
+      // Leaving their rows in place would make them addressable via
+      // sendMessage but unpollable — messages would orphan silently. Deleting
+      // forces a clean reconnect: clients get "unknown peer" on their next
+      // heartbeat/send and re-register. Any in-flight messages for these
+      // peers become orphans, observable via cli.ts orphaned-messages.
+      const dropped = db.query("DELETE FROM peers").run();
+      if ((dropped.changes ?? 0) > 0) {
+        console.error(
+          `[broker] migration: dropped ${dropped.changes} pre-upgrade peer(s); ` +
+          `they will re-register on reconnect. In-flight messages to them are visible ` +
+          `via 'bun cli.ts orphaned-messages'.`
+        );
+      }
+    }
+    // Self-heal: any row with NULL session_token (e.g. from a crashed partial
+    // migration before this transactional logic existed) gets a freshly
+    // generated UUID. Always runs, regardless of column-newness.
+    const nulls = db.query<{ id: string }, []>(
+      "SELECT id FROM peers WHERE session_token IS NULL"
+    ).all();
+    if (nulls.length > 0) {
+      const update = db.query("UPDATE peers SET session_token = ? WHERE id = ?");
+      for (const row of nulls) update.run(randomUUID(), row.id);
+      console.error(`[broker] migration: self-healed ${nulls.length} NULL session_token(s)`);
+    }
+    db.exec("COMMIT");
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* best effort */ }
+    throw e;
   }
-  console.error(`[broker] migrated peers schema: added session_token, backfilled ${rows.length} row(s)`);
 }
 
 // ----- Peer CRUD -----

@@ -1,6 +1,7 @@
 // Regression: opening a DB file created by the PRE-session_token schema must
-// transparently migrate + backfill, then serve register/send/poll/ack normally.
-// Code review round-3 finding.
+// transparently migrate, drop pre-upgrade peers, then serve register/send/poll
+// normally for freshly-registered peers. Self-heal on NULL tokens.
+// Code review round-3/round-4 findings.
 
 import { test, expect, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
@@ -10,8 +11,6 @@ import {
   sendMessage,
   pollMessages,
   ackMessages,
-  heartbeatPeer,
-  getPeer,
 } from "../broker.ts";
 import { unlinkSync, existsSync } from "node:fs";
 
@@ -21,8 +20,6 @@ afterEach(() => {
 });
 
 function createLegacyDb(path: string) {
-  // Replicates the broker's CREATE TABLE schema from BEFORE the session_token
-  // column was added. Represents a pre-existing deployment.
   const db = new Database(path);
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec(`
@@ -51,7 +48,6 @@ function createLegacyDb(path: string) {
       lease_expires_at  TEXT
     );
   `);
-  // Seed some rows representing the pre-upgrade state
   const ts = new Date().toISOString();
   db.query(
     `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, registered_at, last_seen)
@@ -64,9 +60,17 @@ function createLegacyDb(path: string) {
   db.close();
 }
 
-test("initDb migrates a pre-session_token DB: adds column, backfills tokens, keeps UUIDs", () => {
-  TEST_DB = `/tmp/agent-peers-migration-${Date.now()}.db`;
+test("initDb migrates pre-session_token DB: adds column, DROPS legacy peers, messages table intact", () => {
+  TEST_DB = `/tmp/agent-peers-migration-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
   createLegacyDb(TEST_DB);
+
+  // Seed a pre-existing message (pretend in-flight) so we can check it survives
+  // as an orphan after peer deletion.
+  const seed = new Database(TEST_DB);
+  seed.query(
+    `INSERT INTO messages (from_id, to_id, text, sent_at) VALUES (?, ?, ?, ?)`
+  ).run("legacy-uuid-1", "legacy-uuid-2", "pre-upgrade in-flight", new Date().toISOString());
+  seed.close();
 
   const db = initDb(TEST_DB);
   try {
@@ -76,59 +80,45 @@ test("initDb migrates a pre-session_token DB: adds column, backfills tokens, kee
     ).all().map((r) => r.name);
     expect(cols).toContain("session_token");
 
-    // Both legacy rows got backfilled with a valid UUID-shaped token
-    const rows = db.query<{ id: string; session_token: string }, []>(
-      "SELECT id, session_token FROM peers ORDER BY id"
-    ).all();
-    expect(rows.length).toBe(2);
-    for (const r of rows) {
-      expect(r.session_token).toMatch(/^[a-f0-9-]{36}$/);
-    }
-    // UUIDs preserved
-    expect(rows.map((r) => r.id)).toEqual(["legacy-uuid-1", "legacy-uuid-2"]);
+    // Legacy peer rows are gone (migration drops them)
+    const peerCount = db.query<{ c: number }, []>(
+      "SELECT COUNT(*) AS c FROM peers"
+    ).get()!.c;
+    expect(peerCount).toBe(0);
+
+    // Pre-upgrade message survives (now visible as orphan via the LEFT JOIN)
+    const msgCount = db.query<{ c: number }, []>(
+      "SELECT COUNT(*) AS c FROM messages WHERE acked = 0"
+    ).get()!.c;
+    expect(msgCount).toBe(1);
   } finally {
     db.close();
   }
 });
 
-test("after migration, register/send/poll/ack all work normally", () => {
-  TEST_DB = `/tmp/agent-peers-migration2-${Date.now()}.db`;
+test("after migration, fresh register + send + poll + ack works normally", () => {
+  TEST_DB = `/tmp/agent-peers-migration2-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
   createLegacyDb(TEST_DB);
   const db = initDb(TEST_DB);
 
   try {
-    // The legacy peers don't have client-known session tokens — their
-    // heartbeat would silently no-op. That's acceptable: they'll expire via
-    // GC in 60s. Now test that a new register alongside them works:
-    const fresh = registerPeer(db, {
-      peer_type: "claude", pid: 9, cwd: "/new", git_root: null, tty: null, summary: "", name: "fresh",
+    const a = registerPeer(db, {
+      peer_type: "claude", pid: 1, cwd: "/new", git_root: null, tty: null, summary: "", name: "fresh-a",
     });
-    expect(fresh.session_token).toMatch(/^[a-f0-9-]{36}$/);
-
-    // Look up a legacy peer's backfilled token and confirm heartbeat works with it
-    const legacyToken = db.query<{ session_token: string }, [string]>(
-      "SELECT session_token FROM peers WHERE id = ?"
-    ).get("legacy-uuid-1")!.session_token;
-
-    // First refresh legacy-uuid-1's last_seen so sendMessage target-liveness passes
-    heartbeatPeer(db, "legacy-uuid-1", legacyToken);
-    const refreshed = getPeer(db, "legacy-uuid-1");
-    expect(refreshed).not.toBeNull();
-
-    // Send from fresh peer to legacy peer by name
+    const b = registerPeer(db, {
+      peer_type: "claude", pid: 2, cwd: "/new", git_root: null, tty: null, summary: "", name: "fresh-b",
+    });
     const sent = sendMessage(db, {
-      from_id: fresh.id, session_token: fresh.session_token,
-      to_id_or_name: "legacy-alpha", text: "hello legacy",
+      from_id: a.id, session_token: a.session_token, to_id_or_name: "fresh-b", text: "post-upgrade hello",
     });
     expect(sent.ok).toBe(true);
 
-    // Legacy peer polls using backfilled token
-    const leased = pollMessages(db, "legacy-uuid-1", legacyToken);
+    const leased = pollMessages(db, b.id, b.session_token);
     expect(leased.length).toBe(1);
-    expect(leased[0]!.text).toBe("hello legacy");
+    expect(leased[0]!.text).toBe("post-upgrade hello");
 
     const acked = ackMessages(db, {
-      id: "legacy-uuid-1", session_token: legacyToken,
+      id: b.id, session_token: b.session_token,
       lease_tokens: leased.map((m) => m.lease_token),
     });
     expect(acked.acked).toBe(1);
@@ -137,20 +127,73 @@ test("after migration, register/send/poll/ack all work normally", () => {
   }
 });
 
-test("initDb is idempotent on an already-migrated DB (second call is a no-op)", () => {
-  TEST_DB = `/tmp/agent-peers-migration3-${Date.now()}.db`;
+test("initDb is idempotent on an already-migrated DB", () => {
+  TEST_DB = `/tmp/agent-peers-migration3-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
   createLegacyDb(TEST_DB);
 
   const db1 = initDb(TEST_DB);
   db1.close();
-  // Second open should not throw and should not alter anything
+  // Second open should do nothing destructive
   const db2 = initDb(TEST_DB);
   try {
-    const rows = db2.query<{ session_token: string }, []>(
-      "SELECT session_token FROM peers"
-    ).all();
-    expect(rows.every((r) => /^[a-f0-9-]{36}$/.test(r.session_token))).toBe(true);
+    const cols = db2.query<{ name: string }, []>(
+      `SELECT name FROM pragma_table_info('peers')`
+    ).all().map((r) => r.name);
+    expect(cols).toContain("session_token");
   } finally {
     db2.close();
+  }
+});
+
+test("initDb self-heals NULL session_token rows from a crashed partial migration", () => {
+  TEST_DB = `/tmp/agent-peers-migration4-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  // Start with a post-migration schema (column exists) but a row with NULL token,
+  // simulating a crash after ALTER TABLE but before backfill.
+  const setup = new Database(TEST_DB);
+  setup.exec("PRAGMA journal_mode = WAL;");
+  setup.exec(`
+    CREATE TABLE peers (
+      id            TEXT PRIMARY KEY,
+      name          TEXT NOT NULL UNIQUE,
+      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex')),
+      pid           INTEGER,
+      cwd           TEXT,
+      git_root      TEXT,
+      tty           TEXT,
+      summary       TEXT DEFAULT '',
+      session_token TEXT,
+      registered_at TEXT NOT NULL,
+      last_seen     TEXT NOT NULL
+    );
+  `);
+  setup.exec(`
+    CREATE TABLE messages (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_id           TEXT NOT NULL,
+      to_id             TEXT NOT NULL,
+      text              TEXT NOT NULL,
+      sent_at           TEXT NOT NULL,
+      acked             INTEGER NOT NULL DEFAULT 0,
+      lease_token       TEXT,
+      lease_expires_at  TEXT
+    );
+  `);
+  const ts = new Date().toISOString();
+  // Insert row with NULL session_token
+  setup.query(
+    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+  ).run("half-migrated-1", "half", "claude", 1, "/half", null, null, "", ts, ts);
+  setup.close();
+
+  // initDb should self-heal the NULL token
+  const db = initDb(TEST_DB);
+  try {
+    const row = db.query<{ session_token: string }, []>(
+      "SELECT session_token FROM peers WHERE id = 'half-migrated-1'"
+    ).get();
+    expect(row?.session_token).toMatch(/^[a-f0-9-]{36}$/);
+  } finally {
+    db.close();
   }
 });
