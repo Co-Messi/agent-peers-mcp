@@ -56,7 +56,7 @@ You're done.
 
 ## Install
 
-### 1. Clone and install
+### Step 1 — Clone and install deps
 
 ```bash
 git clone https://github.com/Co-Messi/agent-peers-mcp.git
@@ -64,39 +64,60 @@ cd agent-peers-mcp
 bun install
 ```
 
-Note the absolute path — you'll need it below. On macOS/Linux:
+Keep this terminal open inside `agent-peers-mcp/` — the setup commands below use `$(pwd)` to fill in the absolute path automatically, so **you don't have to edit anything**.
+
+---
+
+### Step 2a — Set up for Claude Code
+
+Run this **from inside the `agent-peers-mcp/` directory** — it's a single block you can copy-paste verbatim:
 
 ```bash
-export AGENT_PEERS_DIR="$(pwd)"
-echo "Install directory: $AGENT_PEERS_DIR"
-```
-
-### 2. Register for Claude Code
-
-```bash
+# Register the MCP globally for Claude Code
 claude mcp add --scope user --transport stdio agent-peers -- \
-  bun "$AGENT_PEERS_DIR/claude-server.ts"
+  bun "$(pwd)/claude-server.ts"
+
+# Add the launcher alias to your shell rc
+echo "
+# agent-peers-mcp
+alias agentpeers='claude --dangerously-skip-permissions --dangerously-load-development-channels server:agent-peers'
+" >> ~/.zshrc
+
+# Reload
+source ~/.zshrc
 ```
 
-Add this alias to your `~/.zshrc` (or `~/.bashrc`):
+**Test it:** open a new terminal and run `agentpeers` — Claude starts with the peer network loaded.
+
+---
+
+### Step 2b — Set up for Codex CLI
+
+Also run this **from inside the `agent-peers-mcp/` directory** — a single block, copy-paste verbatim:
 
 ```bash
-alias agentpeers='claude --dangerously-skip-permissions --dangerously-load-development-channels server:agent-peers'
-```
+# Append the MCP config to Codex's config.toml (creates the file if missing)
+cat >> ~/.codex/config.toml <<EOF
 
-Reload: `source ~/.zshrc`.
-
-### 3. Register for Codex CLI
-
-Append to `~/.codex/config.toml` (replace the path with your `$AGENT_PEERS_DIR`):
-
-```toml
 [mcp_servers.agent-peers]
 command = "bun"
-args = ["/absolute/path/to/agent-peers-mcp/codex-server.ts"]
+args = ["$(pwd)/codex-server.ts"]
+EOF
 ```
 
-That's it. Codex will pick up the MCP automatically on next launch.
+**Test it:** open a new terminal and run `codex` — Codex launches with agent-peers available.
+
+---
+
+### Step 3 — Try it out
+
+1. **Terminal 1:** `PEER_NAME=alpha agentpeers`
+2. **Terminal 2:** `PEER_NAME=beta codex`
+3. In either session, ask: **"List all peers on this machine"** — you should see the other one.
+4. In one session, ask: **"Send a message to peer alpha: hello from beta"**
+5. The other session should receive the message (instant for Claude via channel push, on its next tool call for Codex).
+
+Done.
 
 ---
 
@@ -261,4 +282,4 @@ MIT. See `LICENSE`.
 
 Issues and PRs welcome at https://github.com/Co-Messi/agent-peers-mcp.
 
-The design was shaped by 7 rounds of adversarial review on the spec + plan and 6 rounds on the code. If you want to propose a change, please read `docs/superpowers/specs/` first — the design rationale and rejected alternatives are documented there.
+If you want to propose a change, please read `docs/superpowers/specs/` first — the full design rationale and rejected alternatives are documented there.
