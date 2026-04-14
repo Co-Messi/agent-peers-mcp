@@ -145,6 +145,30 @@ test("initDb is idempotent on an already-migrated DB", () => {
   }
 });
 
+test("migrated DB has session_token as NOT NULL, matching fresh install invariant", () => {
+  TEST_DB = `/tmp/agent-peers-migration-notnull-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
+  createLegacyDb(TEST_DB);
+
+  const db = initDb(TEST_DB);
+  try {
+    const info = db.query<{ name: string; nn: number }, []>(
+      `SELECT name, "notnull" AS nn FROM pragma_table_info('peers')`
+    ).all();
+    const sessionCol = info.find((c) => c.name === "session_token");
+    expect(sessionCol).toBeDefined();
+    expect(sessionCol!.nn).toBe(1);
+
+    // And the peers indices still exist after the rebuild
+    const indices = db.query<{ name: string }, []>(
+      `SELECT name FROM sqlite_master WHERE type='index'`
+    ).all().map((r) => r.name);
+    expect(indices).toContain("idx_peers_last_seen");
+    expect(indices).toContain("idx_peers_name");
+  } finally {
+    db.close();
+  }
+});
+
 test("initDb self-heals NULL session_token rows from a crashed partial migration", () => {
   TEST_DB = `/tmp/agent-peers-migration4-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
   // Start with a post-migration schema (column exists) but a row with NULL token,

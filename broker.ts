@@ -126,11 +126,63 @@ function migrate_peers_add_session_token(db: Database): void {
       for (const row of nulls) update.run(randomUUID(), row.id);
       console.error(`[broker] migration: self-healed ${nulls.length} NULL session_token(s)`);
     }
+    // Normalize schema (code review round-5 fix): ALTER TABLE ADD COLUMN
+    // leaves session_token nullable on upgraded DBs even though fresh installs
+    // declare it NOT NULL. A future writer that inserts a NULL (e.g. a bug, a
+    // manual edit) would re-introduce the silent-orphan class. Rebuild the
+    // table to enforce NOT NULL, matching the fresh-install invariant.
+    if (isSessionTokenNullable(db)) {
+      rebuildPeersTableWithNotNullSessionToken(db);
+      console.error(`[broker] migration: rebuilt peers table with NOT NULL session_token`);
+    }
     db.exec("COMMIT");
   } catch (e) {
     try { db.exec("ROLLBACK"); } catch { /* best effort */ }
     throw e;
   }
+}
+
+function isSessionTokenNullable(db: Database): boolean {
+  // pragma_table_info.notnull is 0 when the column is nullable, 1 when NOT NULL.
+  // Alias to a non-reserved name for portability.
+  const row = db.query<{ not_null_flag: number }, []>(
+    `SELECT "notnull" AS not_null_flag FROM pragma_table_info('peers') WHERE name = 'session_token'`
+  ).get();
+  return row ? row.not_null_flag === 0 : false;
+}
+
+function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
+  // Create a shadow table with the desired strict schema, copy only rows that
+  // have a non-NULL session_token (defense — callers above already self-healed),
+  // drop the old table, rename. All inside the outer BEGIN IMMEDIATE tx, so
+  // readers/writers see either the old table or the renamed new table, never
+  // an in-between state.
+  db.exec(`
+    CREATE TABLE peers_new (
+      id            TEXT PRIMARY KEY,
+      name          TEXT NOT NULL UNIQUE,
+      peer_type     TEXT NOT NULL CHECK(peer_type IN ('claude', 'codex')),
+      pid           INTEGER,
+      cwd           TEXT,
+      git_root      TEXT,
+      tty           TEXT,
+      summary       TEXT DEFAULT '',
+      session_token TEXT NOT NULL,
+      registered_at TEXT NOT NULL,
+      last_seen     TEXT NOT NULL
+    );
+  `);
+  db.exec(`
+    INSERT INTO peers_new (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
+    SELECT id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen
+    FROM peers
+    WHERE session_token IS NOT NULL;
+  `);
+  db.exec(`DROP TABLE peers;`);
+  db.exec(`ALTER TABLE peers_new RENAME TO peers;`);
+  // Rebuild the indices that lived on the old table.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_name ON peers(name);`);
 }
 
 // ----- Peer CRUD -----
