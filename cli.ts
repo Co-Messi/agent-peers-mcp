@@ -8,9 +8,9 @@ import { readSharedSecret } from "./shared/shared-secret.ts";
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 
-// Read the shared secret. For commands that need to call the broker's HTTP
-// API, the secret is required. `kill-broker` and direct-SQLite commands
-// (peers, rename, messages, orphaned-messages) don't need it — those are
+// Read the shared secret. Commands that hit the broker's HTTP API (status,
+// peers, send, set-summary) require the secret. Direct-SQLite commands
+// (rename, messages, orphaned-messages) and `kill-broker` don't — those are
 // gated by OS file permissions on the DB + secret files.
 const sharedSecret = readSharedSecret();
 const client = createClient(BROKER_URL, sharedSecret ?? "");

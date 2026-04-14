@@ -67,6 +67,14 @@ function enforceDbFilePerms(path: string, required: string[]): void {
 }
 
 export function initDb(path: string): Database {
+  // Tighten umask BEFORE opening SQLite (Codex round-I). SQLite and any
+  // checkpoint-driven re-creation of the -wal / -shm sidecars uses the
+  // process umask. 0o077 forces every file SQLite touches to default to
+  // 0600, which closes the window between runtime WAL recreation and the
+  // next 30s chmod-sweep GC tick. The explicit chmod calls below remain
+  // as a fail-closed backstop in case a non-default umask was set earlier.
+  try { process.umask(0o077); } catch { /* not all runtimes expose umask */ }
+
   const db = new Database(path);
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");
@@ -786,8 +794,19 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
     try { gcStalePeers(db); } catch (e) { console.error("[broker] GC error:", e); }
     // Re-enforce 0600 on WAL/SHM sidecars — SQLite may recreate them on
     // checkpoint, and they'd come back with default umask-controlled perms.
+    // We also set umask(0o077) at startup so freshly created sidecars start
+    // at 0600, but the chmod sweep is a belt-and-suspenders backstop.
     chmodIfExists(dbPath + "-wal", 0o600);
     chmodIfExists(dbPath + "-shm", 0o600);
+    // Fail-closed verification on every tick (Codex round-I): if any sidecar
+    // has drifted off 0600 or off the correct owner, crash the broker with
+    // a clear error rather than keep serving with readable session tokens.
+    try {
+      enforceDbFilePerms(dbPath, [dbPath, dbPath + "-wal", dbPath + "-shm"]);
+    } catch (e) {
+      console.error("[broker] FATAL: DB file permissions drifted during runtime:", e);
+      process.exit(1);
+    }
   }, GC_INTERVAL_MS);
 
   const server = Bun.serve({
