@@ -7,7 +7,7 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, chmodSync, openSync, closeSync, writeSync, fsyncSync, linkSync, unlinkSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, chmodSync, openSync, closeSync, writeSync, fsyncSync, linkSync, unlinkSync, existsSync, renameSync, statSync } from "node:fs";
 import { validateSecretFilePerms } from "./shared/shared-secret.ts";
 import type {
   RegisterRequest, RegisterResponse, Peer,
@@ -36,6 +36,34 @@ function isUniqueViolation(e: unknown): boolean {
 
 function chmodIfExists(p: string, mode: number): void {
   try { chmodSync(p, mode); } catch { /* file may not exist yet, or no POSIX perms — best effort */ }
+}
+
+// Fail-closed permission check (Codex round-G): after every chmod pass on
+// the DB + WAL/SHM sidecars, re-stat and verify owner + mode match what we
+// expect. If anything is wrong — wrong uid, world/group readable, not a
+// regular file — abort broker startup rather than silently serving with a
+// weakened trust boundary. Only runs on POSIX systems; Windows has no mode
+// bits to enforce.
+function enforceDbFilePerms(path: string, required: string[]): void {
+  const hasPosix = typeof (process as unknown as { getuid?: () => number }).getuid === "function";
+  if (!hasPosix) return;
+  const mine = (process as unknown as { getuid: () => number }).getuid();
+  for (const p of required) {
+    if (!existsSync(p)) continue; // sidecars may legitimately not exist yet
+    const st = statSync(p);
+    if (!st.isFile()) {
+      throw new Error(`broker: ${p} is not a regular file — refusing to start`);
+    }
+    if (st.uid !== mine) {
+      throw new Error(`broker: ${p} owned by uid ${st.uid}, not current user (${mine}) — refusing to start`);
+    }
+    const mode = st.mode & 0o777;
+    if (mode !== 0o600) {
+      throw new Error(
+        `broker: ${p} has mode ${mode.toString(8)}, expected 0600 (other users can read session tokens or message bodies) — refusing to start`
+      );
+    }
+  }
 }
 
 export function initDb(path: string): Database {
@@ -93,12 +121,16 @@ export function initDb(path: string): Database {
   // Re-enforce 0600 AFTER migration + any CREATE TABLE writes — the initial
   // chmod before schema setup may have no-op'd on nonexistent sidecars, so
   // we harden again here once SQLite has definitely materialized the WAL/
-  // SHM files at least once. Closes the Codex round-F "world-readable
-  // sidecars during startup" window (previously waited up to 30s for the
-  // GC tick to re-apply).
+  // SHM files at least once.
   chmodIfExists(path, 0o600);
   chmodIfExists(path + "-wal", 0o600);
   chmodIfExists(path + "-shm", 0o600);
+
+  // Fail-closed validation (Codex round-G): stat and verify every file
+  // matches the trust-boundary invariant. A broken chmod, alien owner, or
+  // unusual filesystem that ignores mode bits now aborts startup with a
+  // clear error instead of quietly serving readable session tokens.
+  enforceDbFilePerms(path, [path, path + "-wal", path + "-shm"]);
 
   return db;
 }
@@ -697,25 +729,32 @@ export function ensureSharedSecret(path: string): string {
       // Someone else linked first. Fall through to read their content.
     } else if (/ENOTSUP|EPERM|EOPNOTSUPP/i.test(msg)) {
       // Hard links not supported on this filesystem — fall back to an
-      // exclusive-create open on the target path itself.
-      try {
-        const fd2 = openSync(path, "wx", 0o600);
+      // atomic rename publish. The tmp file already has fully-written,
+      // fsync'd content. renameSync atomically replaces the target (or
+      // creates it if absent); the target is never visible in a partial
+      // state, so a crash in the middle of this fallback cannot leave a
+      // short/empty file at `path` (Codex round-G fix).
+      //
+      // Check existsSync(path) first to avoid clobbering a concurrent
+      // broker's already-published secret. Race remains possible (exists
+      // → rename is not atomic), but that race is exceedingly narrow on
+      // the already-rare class of filesystems this fallback targets.
+      if (!existsSync(path)) {
         try {
-          writeSync(fd2, secret + "\n");
-          try { fsyncSync(fd2); } catch { /* best effort */ }
-        } finally {
-          closeSync(fd2);
+          renameSync(tmp, path);
+          linked = true;
+        } catch (e2: unknown) {
+          const msg2 = e2 instanceof Error ? e2.message : String(e2);
+          // If rename failed because path appeared in the race window,
+          // treat as EEXIST and fall through to read.
+          if (!/EEXIST|ENOTEMPTY/.test(msg2)) {
+            try { unlinkSync(tmp); } catch { /* best effort */ }
+            throw e2;
+          }
         }
-        try { chmodSync(path, 0o600); } catch { /* best effort */ }
-        linked = true;
-      } catch (e2: unknown) {
-        const msg2 = e2 instanceof Error ? e2.message : String(e2);
-        if (!/EEXIST/.test(msg2)) {
-          try { unlinkSync(tmp); } catch { /* best effort */ }
-          throw e2;
-        }
-        // EEXIST on fallback too — someone else got there.
       }
+      // else: someone else already published. Fall through to read their
+      // content and unlink our tmp below.
     } else {
       try { unlinkSync(tmp); } catch { /* best effort */ }
       throw e;
