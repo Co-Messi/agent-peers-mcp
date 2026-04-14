@@ -321,6 +321,94 @@ Both can run simultaneously. They do not talk to each other — you'd run `claud
 
 ---
 
+## Update (pull latest version)
+
+Two upgrade prompts below — parallel to Install / Uninstall. Each is a plain-English prompt you paste into your agent, and the agent performs a safe in-place upgrade: stops the broker, pulls the latest code from this repo, reinstalls dependencies, runs the test suite as a sanity check, and tells you to restart your sessions so the new code is loaded.
+
+---
+
+### 🧠 For Claude Code — paste this to update
+
+Open a Claude Code session and paste this verbatim:
+
+````
+Update agent-peers-mcp to the latest version on my machine.
+
+Step 1 — find the install directory. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp, or elsewhere under my home directory. If you find more than one candidate, or you're uncertain, LIST the candidates and ASK me which one to update before proceeding. Do NOT modify anything until I confirm.
+
+Once I confirm the path, do all of the following in order:
+
+1. cd into the confirmed install directory.
+
+2. Stop any running broker daemon so the upgrade can replace files cleanly:
+   - Run `lsof -t -i:7900` to find broker PIDs.
+   - Kill each with `kill -TERM <pid>` (SIGKILL after 2s if needed).
+   - Also try `bun cli.ts kill-broker` as a fallback.
+
+3. Record the current commit SHA for rollback reference:
+   `git rev-parse --short HEAD` — save the value so you can tell me later.
+
+4. Pull the latest code:
+   `git fetch origin main && git reset --hard origin/main`
+   (Hard reset is intentional — this repo is a consumable install, not a fork. If `git status` showed uncommitted changes in step 1, STOP and ask me whether to stash them first.)
+
+5. Refresh dependencies:
+   `bun install`
+
+6. Run the test suite as a sanity check:
+   `bun test`
+   If any test fails, STOP and show me the failure output — do NOT tell me the update is complete.
+
+7. Print a summary: old commit SHA, new commit SHA, the short-log between them (`git log --oneline <old>..HEAD`), and what tests passed.
+
+8. Tell me to close and relaunch any running `agentpeers` and `codex` sessions so the new MCP server code is loaded. Existing sessions keep running the OLD code until they restart.
+
+Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
+````
+
+---
+
+### 🤖 For Codex — paste this to update
+
+Open a Codex session and paste this verbatim:
+
+````
+Update agent-peers-mcp to the latest version on my machine.
+
+Step 1 — find the install directory. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp, or elsewhere under my home directory. If you find more than one candidate, or you're uncertain, LIST the candidates and ASK me which one to update before proceeding. Do NOT modify anything until I confirm.
+
+Once I confirm the path, do all of the following in order:
+
+1. cd into the confirmed install directory.
+
+2. Stop any running broker daemon so the upgrade can replace files cleanly:
+   - Run `lsof -t -i:7900` to find broker PIDs.
+   - Kill each with `kill -TERM <pid>` (SIGKILL after 2s if needed).
+   - Also try `bun cli.ts kill-broker` as a fallback.
+
+3. Record the current commit SHA for rollback reference:
+   `git rev-parse --short HEAD` — save the value so you can tell me later.
+
+4. Pull the latest code:
+   `git fetch origin main && git reset --hard origin/main`
+   (Hard reset is intentional — this repo is a consumable install, not a fork. If `git status` showed uncommitted changes in step 1, STOP and ask me whether to stash them first.)
+
+5. Refresh dependencies:
+   `bun install`
+
+6. Run the test suite as a sanity check:
+   `bun test`
+   If any test fails, STOP and show me the failure output — do NOT tell me the update is complete.
+
+7. Print a summary: old commit SHA, new commit SHA, the short-log between them (`git log --oneline <old>..HEAD`), and what tests passed.
+
+8. Tell me to close and relaunch any running Claude `agentpeers` and Codex sessions so the new MCP server code is loaded. Existing sessions keep running the OLD code until they restart.
+
+Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
+````
+
+---
+
 ## Uninstall
 
 Two uninstall prompts below — parallel to the install pair. Each is a plain-English prompt you paste into the agent, and the agent removes everything it installed. Each prompt first asks you to confirm the clone path (in case the agent is in a fresh session and doesn't remember where it was cloned to).
