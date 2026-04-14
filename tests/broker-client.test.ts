@@ -64,18 +64,6 @@ test("broker-client self-rename with peer session token", async () => {
   expect(r.name).toBe("renamed");
 });
 
-test("broker-client admin-rename (no session token)", async () => {
-  const client = createClient(`http://127.0.0.1:${TEST_PORT}`);
-
-  const p = await client.register({
-    peer_type: "claude", pid: 21, cwd: "/r", git_root: null, tty: null, summary: "",
-    name: "admin-target",
-  });
-  const r = await client.adminRenamePeer({ id: p.id, new_name: "admin-renamed" });
-  expect(r.ok).toBe(true);
-  expect(r.name).toBe("admin-renamed");
-});
-
 test("broker-client rejects peer-rename with wrong token (auth)", async () => {
   const client = createClient(`http://127.0.0.1:${TEST_PORT}`);
 

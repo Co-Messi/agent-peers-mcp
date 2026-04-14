@@ -276,13 +276,20 @@ export function setPeerSummary(db: Database, id: string, session_token: string, 
   db.query("UPDATE peers SET summary = ?, last_seen = ? WHERE id = ?").run(summary, nowIso(), id);
 }
 
+// Both getters deliberately use explicit column projection (NOT `SELECT *`)
+// so `session_token` never leaks into a Peer object that could be serialized
+// back to a client. authPeer() is the only code path that touches
+// session_token, and it does its own narrow query.
+const PEER_COLS =
+  "id, name, peer_type, pid, cwd, git_root, tty, summary, registered_at, last_seen";
+
 export function getPeer(db: Database, id: string): Peer | null {
-  const row = db.query<Peer, [string]>("SELECT * FROM peers WHERE id = ?").get(id);
+  const row = db.query<Peer, [string]>(`SELECT ${PEER_COLS} FROM peers WHERE id = ?`).get(id);
   return row ?? null;
 }
 
 export function getPeerByName(db: Database, name: string): Peer | null {
-  const row = db.query<Peer, [string]>("SELECT * FROM peers WHERE name = ?").get(name);
+  const row = db.query<Peer, [string]>(`SELECT ${PEER_COLS} FROM peers WHERE name = ?`).get(name);
   return row ?? null;
 }
 
@@ -325,8 +332,15 @@ export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
     params.push(req.peer_type);
   }
 
+  // CRITICAL: explicit column projection — NEVER `SELECT *`. A prior version
+  // used `SELECT *` which leaked `session_token` into the public discovery
+  // response, collapsing the entire auth model (anyone who could list peers
+  // could impersonate them). Whitelist the safe columns here and keep
+  // `session_token` out of every client-facing payload.
   const where = `WHERE ${clauses.join(" AND ")}`;
-  const sql = `SELECT * FROM peers ${where} ORDER BY last_seen DESC`;
+  const sql = `SELECT id, name, peer_type, pid, cwd, git_root, tty, summary,
+                      registered_at, last_seen
+               FROM peers ${where} ORDER BY last_seen DESC`;
   return db.query<Peer, typeof params>(sql).all(...params);
 }
 
@@ -456,24 +470,12 @@ export function renamePeer(db: Database, req: RenamePeerRequest): RenamePeerResp
   }
 }
 
-// Admin variant — no token check. Used by cli.ts only. The trust boundary is
-// the broker's 127.0.0.1 binding: if you can hit this endpoint, you are
-// already a local-machine operator.
-export function adminRenamePeer(
-  db: Database,
-  req: { id: string; new_name: string },
-): RenamePeerResponse {
-  if (!isValidName(req.new_name)) return { ok: false, error: "invalid name" };
-  try {
-    const info = db.query("UPDATE peers SET name = ?, last_seen = ? WHERE id = ?")
-      .run(req.new_name, nowIso(), req.id);
-    if ((info.changes ?? 0) === 0) return { ok: false, error: "unknown peer" };
-    return { ok: true, name: req.new_name };
-  } catch (e) {
-    if (isUniqueViolation(e)) return { ok: false, error: "name taken" };
-    throw e;
-  }
-}
+// NOTE: there is no broker-side "admin rename" function. cli.ts 'rename'
+// reads the target peer's session_token directly from the SQLite file
+// (SELECT id, session_token FROM peers WHERE id=? OR name=?) and then calls
+// the regular session-authenticated /rename-peer. The OS file permissions on
+// ~/.agent-peers.db are the operator trust boundary — only the user who owns
+// the file can run the CLI's admin rename.
 
 // ----- GC -----
 
@@ -599,12 +601,13 @@ export function startBroker(port: number, dbPath: string) {
           case "/poll-messages": { const b = await readJson<{ id: string; session_token: string }>(req); return json({ messages: pollMessages(db, b.id, b.session_token) }); }
           case "/ack-messages":  return json(ackMessages(db, await readJson(req)));
           case "/rename-peer":   return json(renamePeer(db, await readJson(req)));
-          case "/admin/rename-peer": return json(adminRenamePeer(db, await readJson(req)));
-          case "/orphaned-messages": return json({ messages: listOrphanedMessages(db) });
-          // No /all-messages endpoint — exposing full bodies over an unauthenticated
-          // HTTP socket would leak peer traffic to any local process. The cli.ts
-          // 'messages' command reads the SQLite file directly so OS file permissions
-          // remain the trust boundary.
+          // No /admin/rename-peer over HTTP — arbitrary local processes could
+          // hijack any peer's name. cli.ts 'rename' reads the target peer's
+          // session_token from SQLite directly (file perms = trust boundary)
+          // and then calls the normal session-authenticated /rename-peer.
+          // No /orphaned-messages over HTTP — exposing bodies over localhost
+          // leaks peer traffic. cli.ts 'orphaned-messages' opens SQLite readonly.
+          // No /all-messages endpoint — same reasoning.
           default: return json({ error: "not found" }, { status: 404 });
         }
       } catch (e) {

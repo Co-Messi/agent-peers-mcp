@@ -14,7 +14,6 @@ import {
   pollMessages,
   ackMessages,
   renamePeer,
-  adminRenamePeer,
   gcStalePeers,
   listOrphanedMessages,
 } from "../broker.ts";
@@ -205,6 +204,32 @@ test("listPeers filters out stale peers (closed-tab ghosts disappear immediately
   // Stale ghost is filtered; only live peer shows up.
   expect(peers.map((p) => p.name)).toEqual(["alive"]);
   expect(peers.map((p) => p.id)).not.toContain(b.id);
+});
+
+test("listPeers NEVER returns session_token (critical auth regression)", () => {
+  // Codex adversarial review caught this: a prior SELECT * leaked every
+  // peer's session_token into the discovery response, letting any caller
+  // impersonate/rename/unregister others. The fix is explicit column
+  // projection. This test is a hard gate against regression.
+  const a = reg({ name: "alpha" });
+  reg({ name: "beta" });
+  const peers = listPeers(db, { scope: "machine", cwd: "/any", git_root: null });
+  expect(peers.length).toBe(2);
+  for (const p of peers) {
+    // TypeScript already says Peer has no session_token, but the runtime row
+    // could still carry it if we regressed to SELECT *. Explicit runtime check.
+    expect(Object.prototype.hasOwnProperty.call(p, "session_token")).toBe(false);
+    // Spot-check: fields we DO expect are present.
+    expect(p.id).toBeTruthy();
+    expect(p.name).toBeTruthy();
+  }
+  // Also verify getPeer / getPeerByName never include session_token.
+  const byId = getPeer(db, a.id);
+  expect(byId).not.toBeNull();
+  expect(Object.prototype.hasOwnProperty.call(byId, "session_token")).toBe(false);
+  const byName = getPeerByName(db, "alpha");
+  expect(byName).not.toBeNull();
+  expect(Object.prototype.hasOwnProperty.call(byName, "session_token")).toBe(false);
 });
 
 test("listPeers peer_type filter", () => {
@@ -444,13 +469,6 @@ test("renamePeer rejects invalid name", () => {
   const bad = renamePeer(db, { id: a.id, session_token: a.session_token, new_name: "has space" });
   expect(bad.ok).toBe(false);
   expect(bad.error).toMatch(/invalid/i);
-});
-
-test("adminRenamePeer renames without session token (localhost operator action)", () => {
-  const a = reg({ name: "alpha" });
-  const res = adminRenamePeer(db, { id: a.id, new_name: "renamed" });
-  expect(res.ok).toBe(true);
-  expect(getPeerByName(db, "renamed")?.id).toBe(a.id);
 });
 
 // ---------- gcStalePeers ----------

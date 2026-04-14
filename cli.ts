@@ -79,22 +79,38 @@ async function cmdSend(targetNameOrId: string, message: string) {
 }
 
 async function cmdRename(target: string, newName: string) {
-  const peers = await client.listPeers({
-    scope: "machine", cwd: process.cwd(), git_root: null,
-  });
-  const found = peers.find((p) => p.id === target || p.name === target);
-  if (!found) {
+  // Read the target peer's session_token from the SQLite file directly — the
+  // operator trust boundary is OS file permissions on ~/.agent-peers.db,
+  // NOT an unauthenticated HTTP admin endpoint. Round-B audit removed the
+  // /admin/rename-peer HTTP endpoint because any local process could have
+  // hijacked peer identities.
+  const { Database } = await import("bun:sqlite");
+  const { resolve } = await import("node:path");
+  const { homedir } = await import("node:os");
+  const dbPath = process.env.AGENT_PEERS_DB || resolve(homedir(), ".agent-peers.db");
+  const db = new Database(dbPath, { readonly: true });
+  let row: { id: string; session_token: string; name: string } | null;
+  try {
+    row = db.query<{ id: string; session_token: string; name: string }, [string, string]>(
+      "SELECT id, session_token, name FROM peers WHERE id = ? OR name = ?"
+    ).get(target, target);
+  } finally {
+    db.close();
+  }
+  if (!row) {
     console.error(`no peer matching '${target}'`);
     process.exit(1);
   }
-  // Use the admin endpoint (no session_token check). The trust boundary for
-  // admin operations is the broker's 127.0.0.1 binding.
-  const res = await client.adminRenamePeer({ id: found.id, new_name: newName });
+  // Call the regular session-authenticated /rename-peer, impersonating the
+  // peer with its own token that we just read from the DB.
+  const res = await client.renamePeer({
+    id: row.id, session_token: row.session_token, new_name: newName,
+  });
   if (!res.ok) {
     console.error(`rename failed: ${res.error}`);
     process.exit(1);
   }
-  console.log(`renamed ${found.name} -> ${res.name}`);
+  console.log(`renamed ${row.name} -> ${res.name}`);
 }
 
 async function cmdMessages() {
@@ -164,27 +180,34 @@ async function cmdMessages() {
 }
 
 async function cmdOrphans() {
-  // Hit the broker's /orphaned-messages endpoint (broker reads DB directly).
-  const res = await fetch(`${BROKER_URL}/orphaned-messages`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: "{}",
-  });
-  if (!res.ok) {
-    console.error(`request failed: ${res.status}`);
-    process.exit(1);
-  }
-  const { messages } = (await res.json()) as {
-    messages: Array<{ id: number; from_id: string; to_id: string; text: string; sent_at: string }>;
-  };
-  if (messages.length === 0) {
-    console.log("(no orphaned messages)");
-    return;
-  }
-  for (const m of messages) {
-    const preview = m.text.length > 80 ? m.text.slice(0, 77) + "..." : m.text;
-    console.log(`#${m.id}  from=${m.from_id}  to=${m.to_id}  sent=${m.sent_at}`);
-    console.log(`  ${preview}`);
+  // Read the SQLite DB directly — OS file permissions are the trust boundary.
+  // Round-B fix: removed the /orphaned-messages HTTP endpoint because it
+  // leaked message bodies to any local process on 127.0.0.1.
+  const { Database } = await import("bun:sqlite");
+  const { resolve } = await import("node:path");
+  const { homedir } = await import("node:os");
+  const dbPath = process.env.AGENT_PEERS_DB || resolve(homedir(), ".agent-peers.db");
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    type Row = { id: number; from_id: string; to_id: string; text: string; sent_at: string };
+    const rows = db.query<Row, []>(
+      `SELECT m.id, m.from_id, m.to_id, m.text, m.sent_at
+       FROM messages m
+       LEFT JOIN peers p ON p.id = m.to_id
+       WHERE p.id IS NULL AND m.acked = 0
+       ORDER BY m.id ASC`
+    ).all();
+    if (rows.length === 0) {
+      console.log("(no orphaned messages)");
+      return;
+    }
+    for (const m of rows) {
+      const preview = m.text.length > 80 ? m.text.slice(0, 77) + "..." : m.text;
+      console.log(`#${m.id}  from=${m.from_id}  to=${m.to_id}  sent=${m.sent_at}`);
+      console.log(`  ${preview}`);
+    }
+  } finally {
+    db.close();
   }
 }
 
