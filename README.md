@@ -1,8 +1,8 @@
 # agent-peers-mcp
 
-**Let your Claude Code and Codex CLI sessions talk to each other.**
+### Your Claude Code and Codex CLI sessions, working as colleagues.
 
-Run multiple AI coding agents in parallel (Claude in one tab, Codex in another, a second Claude in a third) and any of them can discover the others, send messages, and coordinate work — all on localhost, no cloud.
+Run Claude in one terminal and Codex in another — two AI coding agents, each in their own project — and they **discover each other**, **message each other**, and **take initiative**. Codex finds something Claude should know → it pings Claude. Claude changes an interface Codex depends on → it pings Codex before the build breaks. No cloud. No API keys between them. Just localhost + a tiny SQLite broker.
 
 ```
   Terminal 1 (Claude)           Terminal 2 (Codex)           Terminal 3 (Claude)
@@ -18,41 +18,41 @@ Run multiple AI coding agents in parallel (Claude in one tab, Codex in another, 
                               (SQLite + HTTP daemon)
 ```
 
-Built as a hardened, security-reviewed successor to [louislva/claude-peers-mcp](https://github.com/louislva/claude-peers-mcp) with Codex CLI support added.
+> Hardened, security-reviewed successor to [louislva/claude-peers-mcp](https://github.com/louislva/claude-peers-mcp) with Codex CLI support + a full colleague-behavior protocol added.
 
 ---
 
-## Quickstart
+## What collaboration actually looks like
 
-```bash
-git clone https://github.com/Co-Messi/agent-peers-mcp.git
-cd agent-peers-mcp
-bun install
-```
+Imagine you're merging two projects each AI has been working on alone. With this installed, the flow looks like this:
 
-Then register the MCP in both Claude Code and Codex CLI (see [Install](#install) below), open two terminal tabs, and ask one session:
+> **You (to Claude):** "Start merging Project A into the monorepo. Ask `codex-backend` anything you need."
+>
+> **Claude** reads A's auth module, notices it uses `bcrypt@4`, wants to know what B is on. Sends:
+> > `to codex-backend:` "A's on bcrypt 4. What version is B on?"
+>
+> **Codex** receives it mid-task. Doesn't auto-reply "got it" (it's trained not to). Goes quiet, looks at B's `package.json`. Sees `bcrypt@5`. *Also* notices B bakes `tenant_id` into JWTs — remembers Claude will break multi-tenancy if those get dropped. Sends back:
+> > `to claude-frontend:` "B is on bcrypt 5, and we bake `tenant_id` into the JWT — if the merged project drops that claim, multi-tenancy in B breaks. Want me to extract the claims schema to a shared module?"
+>
+> **Claude** now has a real answer + a surfaced risk + a concrete next step. Replies:
+> > `to codex-backend:` "Yes please. Use `shared/auth/claims.ts`. I'll rewire A once you push."
 
-> "List all peers on this machine, then send a message to the first one."
-
-You're done.
+Brief. Substantive. Initiative on both sides. No spam. That's the whole pitch.
 
 ---
 
-## What this gives you
+## What you get
 
-| Feature | Description |
+| | |
 |---|---|
-| **Instant Claude ↔ Claude** | Messages arrive mid-task via Claude Code's `claude/channel` push protocol. |
-| **Near-instant Codex ↔ Codex / Claude ↔ Codex** | Codex runs a 1s background broker poll, persists unread messages to a durable local inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600 perms, survives MCP process restart), and emits an MCP `notifications/message` "new message from X waiting" preview on each tick. Full content + reply instructions arrive as a `[PEER INBOX]` block on the next agent-peers tool response. |
-| **Colleague-level behavior protocol** | Both servers share a single `COLLEAGUE_PROTOCOL` prompt so Claude and Codex can't drift: acknowledge internally (not externally), investigate before replying, push back on disagreement, never leave a loop open, and ping proactively when you change something a peer depends on or finish a joint task. Explicit anti-patterns on "got it" / "on it" chatter. |
-| **Human-readable names** | Each peer gets a friendly name like `calm-fox`, or set your own via `PEER_NAME=frontend-tab`. Terminal tab titles update automatically so you can tell sessions apart. |
-| **Self-rename** | Any peer can rename itself via the `rename_peer` tool. |
-| **Scoped discovery** | Filter peers by machine, working directory, or git repo. |
-| **Session-token auth** | Each peer gets an unforgeable session token. One peer can't impersonate, drain, or rename another. |
-| **Lease + ack delivery with confirm-on-next-call** | Messages are leased for 30s. Codex only acks after the *next* tool call proves the previous response reached the model — a dropped MCP response leaves the message on disk + leased at the broker, re-surfacing reliably. At-least-once across restart per spec §5.4. |
-| **Orphan observability** | If a recipient dies before reading, the message surfaces via `cli.ts orphaned-messages` — never silently lost. |
-| **Reclaim-safe backlog** | Restarting with the same `PEER_NAME` within the 60s window reclaims the UUID *and* clears stale leases for that peer — the new session sees undelivered messages on its first poll instead of waiting up to 30s. |
-| **Schema migrations** | Upgrading the broker auto-migrates old databases transactionally. |
+| 🧠 → 🧠 **Claude ↔ Claude** | Messages arrive mid-task via Claude's native `claude/channel` push. Instant. |
+| 🤖 → 🤖 / 🧠 → 🤖 **Claude ↔ Codex** | Codex polls the broker every 1s and persists unread messages to a durable local inbox. Full content surfaces as a `[PEER INBOX]` block in the next agent-peers tool response. A signal-only MCP log preview also fires mid-task on Codex builds that surface them. |
+| 👥 **Colleague behavior protocol** | Shared prompt imported by both servers: don't auto-reply "got it", investigate before answering, push back on disagreement, ping proactively when you find something the other peer cares about, close every loop. |
+| 🏷️ **Friendly names** | Random `calm-fox` by default, or `PEER_NAME=frontend-tab` for a stable one. Your terminal tab renames itself so you can tell sessions apart at a glance. Peers can rename themselves mid-session. |
+| 🔍 **Scoped discovery** | `list_peers` with scope `machine` / `directory` / `repo`. Agents find relevant peers without a global cloud directory. |
+| 🔐 **Per-user auth** | Session token per peer, per-user shared secret, DB + WAL sidecars + secret file all at 0o600 with a fail-closed startup check. Another local user can't eavesdrop on your peer traffic. |
+| 📬 **At-least-once delivery** | 30s lease → confirm-on-next-call ack. A dropped MCP response leaves the message on disk + leased at the broker and re-surfaces. Never silently lost. Unreachable recipient → message becomes an orphan, visible via `cli.ts orphaned-messages`. |
+| ♻️ **Reclaim-safe restart** | Kill a session and relaunch with the same `PEER_NAME` within 60s → broker reclaims the UUID *and* clears stale leases. Backlog lands on the new session's first poll. |
 
 ---
 
@@ -75,7 +75,8 @@ Pick your path:
 
 ---
 
-### 🧠 For Claude Code — primary install (clones repo, installs deps, wires Claude)
+<details>
+<summary><b>🧠 For Claude Code — primary install</b> (clones repo, installs deps, wires Claude) — <i>click to expand</i></summary>
 
 Open a Claude Code session and paste this verbatim:
 
@@ -107,9 +108,10 @@ Then do all of the following:
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
 
----
+</details>
 
-### 🤖 For Codex — wire-only install (assumes the shared repo is already cloned)
+<details>
+<summary><b>🤖 For Codex — wire-only install</b> (assumes the shared repo is already cloned) — <i>click to expand</i></summary>
 
 Open a Codex session and paste this verbatim:
 
@@ -151,15 +153,17 @@ Do the following:
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
 
----
+</details>
 
 ---
 
 ## Usage
 
-Four steps: **launch → name → test → talk**. Pick the path for each agent you want to run — Claude, Codex, or both.
+**Shortest possible path to seeing it work:** open two terminals, launch `agentpeers` in one and `codex` in the other, then ask one of them to `"list all peers on this machine"`. You're off.
 
-### Step 1 — Launch a peer-aware session
+If you want more than that, here's the full flow:
+
+### Step 1 — Launch
 
 Open a new terminal and run the launcher for your agent:
 
@@ -170,51 +174,49 @@ Open a new terminal and run the launcher for your agent:
 
 That's it — the MCP loads automatically, the broker auto-spawns if it's not already running, and your terminal tab renames itself to `peer:<name>`.
 
-### Step 2 — Name your session (optional but recommended)
+### Step 2 — Name it (optional but useful)
 
-Every session gets a random friendly name on launch (like `calm-fox`, `swift-panda`). If you want a stable, human-readable name, set `PEER_NAME` **before** the launcher:
+Every session gets a random friendly name at launch (`calm-fox`, `swift-panda`). For a stable one, set `PEER_NAME` **before** launching:
 
-| Agent | Command |
-|---|---|
-| **Claude Code** | `PEER_NAME=frontend-tab agentpeers` |
-| **Codex** | `PEER_NAME=backend-work codex` |
+```bash
+PEER_NAME=frontend-tab agentpeers   # Claude
+PEER_NAME=backend-work codex        # Codex
+```
 
-**Name rules:** 1–32 characters, `[a-zA-Z0-9_-]` only, must be unique across currently-live peers. A name collision auto-suffixes (`frontend-tab` → `frontend-tab-2`).
+Rules: 1–32 chars, `[a-zA-Z0-9_-]`, unique among live peers. Name collision auto-suffixes (`frontend-tab` → `frontend-tab-2`). Mid-session rename: just say "rename me to architect" — the tab title updates immediately.
 
-**Rename mid-session:** just ask the agent — for example, "rename me to architect" — and the `rename_peer` tool fires. Your tab title updates to the new name immediately.
+### Step 3 — Sanity check
 
-### Step 3 — Test that the network is alive
+With two sessions running, ask either of them:
 
-Open **two** terminal tabs and launch a session in each (any combination of Claude + Codex). In either session, ask:
+> "List all peers on this machine"
 
-> **"List all peers on this machine"**
+You should see the other. Then:
 
-You should see the other session. Then, in one of them, ask:
+> "Send a message to peer \<name\>: hello"
 
-> **"Send a message to peer \<name\>: hello"**
+What happens on the receiving side:
 
-The other session receives it:
+- **Claude** sees it **instantly**, mid-task, via a `<channel source="agent-peers">` push.
+- **Codex** persists it to its local inbox within 1 second and fires a `notifications/message` preview. The full `[PEER INBOX]` block lands on Codex's next agent-peers tool response (call `check_messages` if you want it surfaced right now).
 
-| Recipient | How the message arrives |
-|---|---|
-| **Claude** | Instantly, mid-task, as a `<channel source="agent-peers">` push |
-| **Codex** | Background poll (every 1s) persists it to `~/.agent-peers-codex/<peer-id>.json` and fires an MCP `notifications/message` preview ("new message from X waiting"). Full content + reply instructions arrive as a `[PEER INBOX]` block on the next agent-peers tool response. Whether the preview surfaces in Codex's live transcript depends on your Codex CLI build; the `[PEER INBOX]` path is the authoritative delivery and always works. |
+### Step 4 — Real use
 
-### Step 4 — Actually use it
+A few prompts that showcase what this is actually for:
 
-Here are prompts that work well once the network is up:
+**Hand off a specific task** →
+> "Send to backend-work: I'm changing the auth interface in `auth.ts` — here's the new shape: `…`. Can you update the backend to match?"
 
-**Coordinate a task:**
-> "Send a message to peer backend-work: I'm updating the auth interface in `auth.ts` — can you update the backend to match?"
+**Ask a peer to review your work** →
+> "Send to code-reviewer: review my last commit and tell me what's wrong. Be blunt."
 
-**Ask for a second opinion:**
-> "Send a message to peer code-reviewer: review my last commit and tell me what's wrong"
+**Find the right peer first** →
+> "List all peers in this repo and tell me what each one is working on" — each peer keeps a 1-2 sentence `summary` up to date.
 
-**Filter discovery:**
-> "List only the Codex peers in this repo"
+**Unblock on a cross-project question** →
+> "Send to data-pipeline: what schema does `events` use for the `metadata` column — JSON or text? I need to know before I pick a migration strategy."
 
-**Check summaries:**
-> "List all peers and tell me what each one is working on" — each peer advertises a `summary` you can read.
+The colleague protocol handles the rest: the receiving peer investigates before replying, doesn't spam "got it," pushes back if you're proposing something that'll break their work, and pings you back when they have a real answer (or a real blocker).
 
 ---
 
@@ -370,7 +372,8 @@ Both can run simultaneously. They do not talk to each other — you'd run `claud
 
 ---
 
-### 🧠 For Claude Code — paste this to update (the ONLY update prompt if you have both agents installed)
+<details>
+<summary><b>🧠 For Claude Code — update prompt</b> (the ONLY update prompt if you have both agents installed) — <i>click to expand</i></summary>
 
 Open a Claude Code session and paste this verbatim:
 
@@ -413,9 +416,10 @@ Once I confirm the path, do all of the following in order:
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
 
----
+</details>
 
-### 🤖 For Codex — update (Codex-only installs ONLY — do NOT run this if Claude Code is also wired up)
+<details>
+<summary><b>🤖 For Codex — update prompt</b> (Codex-only installs only — DO NOT run this if Claude Code is also wired up) — <i>click to expand</i></summary>
 
 Open a Codex session and paste this verbatim. **Skip this entire section** if you have Claude Code installed — the Claude update prompt above already handles the shared repo for both agents.
 
@@ -462,6 +466,8 @@ Once I confirm the path, do all of the following in order:
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
 
+</details>
+
 ---
 
 ## Uninstall
@@ -474,7 +480,8 @@ Confirm each step's outcome as you go. If any step fails, stop and ask me how to
 
 ---
 
-### 🤖 For Codex — paste this FIRST if you have both agents installed (config-only teardown)
+<details>
+<summary><b>🤖 For Codex — uninstall prompt</b> (run this FIRST if you have both agents installed) — <i>click to expand</i></summary>
 
 Open a Codex session and paste this verbatim:
 
@@ -510,9 +517,10 @@ STEP 7 (CASE B only) — Summarize: list every path/resource you removed and pas
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
 
----
+</details>
 
-### 🧠 For Claude Code — paste this to uninstall (tears down the shared repo + broker + DB)
+<details>
+<summary><b>🧠 For Claude Code — uninstall prompt</b> (tears down the shared repo + broker + DB) — <i>click to expand</i></summary>
 
 Open a Claude Code session and paste this verbatim. **If you also had Codex wired up**, run the Codex uninstall prompt above first so Codex stops trying to launch the server.
 
@@ -553,6 +561,8 @@ Once I confirm the path (and any warnings), do a FULL wipe — do not ask per-it
 
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
+
+</details>
 
 ---
 
