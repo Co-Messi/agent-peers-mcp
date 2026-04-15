@@ -1,10 +1,12 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, platform } from "node:os";
 
 import { CodexInboxStore } from "../shared/codex-inbox.ts";
 import type { LeasedMessage } from "../shared/types.ts";
+
+const IS_POSIX = platform() !== "win32";
 
 const tempDirs: string[] = [];
 
@@ -80,6 +82,40 @@ test("CodexInboxStore reset clears persisted unread messages", async () => {
   await store.reset();
 
   expect(await store.getUnreadMessages()).toHaveLength(0);
+});
+
+test.if(IS_POSIX)("CodexInboxStore writes inbox file at 0o600 and directory at 0o700", async () => {
+  const store = await makeStore();
+  await store.queueLeasedMessages([message(1)]);
+
+  // Walk from the inbox file back up to the tempdir looking at the immediate parent dir.
+  const filePath = (store as unknown as { filePath: string }).filePath;
+  const fileStat = await stat(filePath);
+  expect(fileStat.mode & 0o777).toBe(0o600);
+
+  const dirPath = filePath.substring(0, filePath.lastIndexOf("/"));
+  const dirStat = await stat(dirPath);
+  expect(dirStat.mode & 0o777).toBe(0o700);
+});
+
+test.if(IS_POSIX)("CodexInboxStore refuses to load an inbox file with too-wide perms", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+
+  // Pre-seed an inbox file with world-readable perms (what a default umask
+  // would produce). A malicious local user could have planted spoofed
+  // messages there; we must refuse to load instead of reading them.
+  const peerId = "peer-insecure";
+  const filePath = join(dir, `${encodeURIComponent(peerId)}.json`);
+  await writeFile(filePath, JSON.stringify({ unread: [message(99, { text: "spoofed" })] }), "utf8");
+  await chmod(filePath, 0o644); // too wide
+
+  const store = new CodexInboxStore({ peerId, rootDir: dir });
+  await store.init();
+  const unread = await store.getUnreadMessages();
+
+  // Fail-closed: we got an empty inbox instead of the attacker-controlled payload.
+  expect(unread).toEqual([]);
 });
 
 test("CodexInboxStore keeps unread messages in memory when consume persistence fails", async () => {

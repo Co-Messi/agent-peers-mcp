@@ -54,6 +54,7 @@ import { setTabTitle, clearTabTitle, clearTabTitleSync } from "./shared/tab-titl
 import { formatInboxBlock } from "./shared/piggyback.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
+import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
@@ -90,26 +91,20 @@ const mcp = new Server(
     // tool call has fired yet. Authoritative delivery still runs through
     // the durable inbox queue + tool-response [PEER INBOX] block.
     capabilities: { logging: {}, tools: {} },
-    instructions: `You are connected to the agent-peers network — other AI agents on this machine (Claude Code or Codex) can discover you and send you messages.
+    instructions: `${COLLEAGUE_PROTOCOL}
 
-INBOX HANDLING — IMPORTANT:
-- This server keeps a local peer inbox refreshed in the background. Pending messages are surfaced as a [PEER INBOX] block on the next response from this server.
-- When the user says things like "wait for a reply", "did I get a message", or is in a collaborative flow with other peers, call check_messages (or any other agent-peers tool) to surface anything waiting in the local inbox right away.
-- When you see a [PEER INBOX] block, treat each message like a coworker's Slack message. Stay silent while you investigate, and only reply via send_message when you have a substantive update, a blocker, or a clarifying question.
+DELIVERY ON THIS SIDE (Codex): this server keeps a local durable inbox
+refreshed every second from the broker. Peer messages reach you via:
 
-ON STARTUP:
-- Call set_summary once with a 1-2 sentence description of what you are working on.
+  1. A best-effort MCP \`notifications/message\` log push on each poll tick
+     (recent Codex CLI versions surface this into the live transcript).
+  2. A \`[PEER INBOX]\` block prepended to ANY agent-peers tool response —
+     this is the authoritative delivery. When you see the block, apply
+     the REACTIVE rules above.
 
-PEER DISCOVERY:
-- Use list_peers with scope="machine" to see all agents, "directory" for same cwd, "repo" for same git repo.
-- Each peer has a human-readable "name" (e.g. "frontend-tab") and an immutable UUID "id". peer_type is "claude" or "codex".
-
-TOOLS:
-- list_peers(scope, peer_type?)       — also surfaces any pending inbox
-- send_message(to_id, message)        — to_id accepts UUID or name; also surfaces inbox
-- set_summary(summary)                — also surfaces inbox
-- check_messages                      — explicit inbox poll, call this when waiting for replies
-- rename_peer(new_name)               — YOURSELF only; 1-32 chars, [a-zA-Z0-9_-]`,
+Because path (1) is best-effort, whenever you're in a collaborative flow
+or expecting a reply, call \`check_messages\` every 2-3 of your own turns —
+it's free and it flushes the local inbox.`,
   },
 );
 
