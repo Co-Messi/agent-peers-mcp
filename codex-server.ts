@@ -316,61 +316,54 @@ async function withPiggyback(
   }
 
   // ------------------------------------------------------------------------
-  // STEP 1 — "Previous response cycle completed" confirm-flush.
+  // STEP 1a — Unconditional ack flush.
   //
-  // Codex calling us again is the evidence that any [PEER INBOX] block we
-  // sent last time actually reached the model. For each message in
-  // presentedPendingConfirm we now:
-  //   (a) ack the broker lease(s) — pendingAcks holds both the original
-  //       lease_token(s) drawn last call AND any re-lease tokens
-  //       pollBrokerIntoQueue stashed while waiting;
-  //   (b) prune it from the durable queue so we don't re-surface it;
-  //   (c) promote it into `seen` so any future re-delivery from the
-  //       broker short-circuits in pollBrokerIntoQueue.
+  // We always attempt to ack every token in pendingAcks, even when
+  // presentedPendingConfirm is empty. pollBrokerIntoQueue's seen-branch
+  // stashes re-lease tokens for messages we already confirmed delivered
+  // — those must be flushed even in tool calls that don't draw any new
+  // inbox items, otherwise the broker re-leases the row forever and it
+  // never transitions to acked=1 (perpetually-unacked zombie row per
+  // codex review PR #2 round 2).
   //
-  // If ANY of those steps fails (HTTP error, disk error), we keep the
-  // message in presentedPendingConfirm and retry next call. Doing partial
-  // state changes would open the exact silent-loss race this file is
-  // designed to close.
+  // Tokens are removed from pendingAcks only on HTTP success; an
+  // exception leaves them for the next call to retry. HTTP success with
+  // `acked: 0` at the broker (stale tokens) still counts — the next
+  // re-lease will land new tokens in pendingAcks via the seen-branch,
+  // and this flush will eventually succeed against the current lease.
+  if (pendingAcks.length > 0) {
+    const toFlush = pendingAcks.slice();
+    try {
+      await client.ackMessages({
+        id: myId, session_token: mySession, lease_tokens: toFlush,
+      });
+      for (const tok of toFlush) {
+        const idx = pendingAcks.indexOf(tok);
+        if (idx !== -1) pendingAcks.splice(idx, 1);
+      }
+    } catch (e) {
+      log(`ack flush failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // STEP 1b — Confirm-promote: items drawn into the PREVIOUS response
+  // are now (with Codex calling us again as evidence) known to have
+  // reached the model. Prune them from the durable queue and move their
+  // ids into `seen`. Pruning can fail independently of the ack above
+  // (disk I/O vs broker HTTP); if it does we keep the items in
+  // presentedPendingConfirm and retry next call. Partial promotion is
+  // not allowed — would re-open the silent-loss window.
   if (presentedPendingConfirm.size > 0) {
     const confirming = [...presentedPendingConfirm];
-    const tokensToFlush = pendingAcks.slice();
-
-    let ackOk = false;
-    if (tokensToFlush.length > 0) {
-      try {
-        await client.ackMessages({
-          id: myId, session_token: mySession, lease_tokens: tokensToFlush,
-        });
-        ackOk = true;
-      } catch (e) {
-        log(`confirm-flush ack failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
+    try {
+      if (inboxStore) await inboxStore.removeByIds(confirming);
+      for (const id of confirming) {
+        seen.add(id);
+        presentedPendingConfirm.delete(id);
       }
-    } else {
-      ackOk = true; // nothing to ack
-    }
-
-    if (ackOk) {
-      let pruneOk = false;
-      try {
-        if (inboxStore) await inboxStore.removeByIds(confirming);
-        pruneOk = true;
-      } catch (e) {
-        log(`confirm-flush queue-prune failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
-      }
-
-      if (pruneOk) {
-        // All three steps landed — promote to seen + drop the
-        // now-worthless lease tokens + clear presentedPendingConfirm.
-        for (const id of confirming) {
-          seen.add(id);
-          presentedPendingConfirm.delete(id);
-        }
-        for (const tok of tokensToFlush) {
-          const idx = pendingAcks.indexOf(tok);
-          if (idx !== -1) pendingAcks.splice(idx, 1);
-        }
-      }
+    } catch (e) {
+      log(`confirm-flush queue-prune failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
