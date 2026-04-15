@@ -1,16 +1,37 @@
 #!/usr/bin/env bun
 // codex-server.ts
-// MCP stdio server for Codex CLI. Registers as peer_type="codex". Uses piggyback
-// delivery: every tool handler polls the broker at entry, prepends any pending
-// peer messages as a [PEER INBOX] block in the response text, and defers the ack
-// to the NEXT tool call (ack-on-next-call pattern, spec §5.5).
+// MCP stdio server for Codex CLI. Registers as peer_type="codex".
+//
+// DELIVERY PIPELINE — two cooperating paths so Codex behaves like Claude's
+// "colleague I can Slack anytime", even though Codex has no claude/channel
+// push equivalent:
+//
+//   1. Background push (every POLL_INTERVAL_MS). Mirrors claude-server's
+//      pollAndPush loop. Polls the broker, and for each new message:
+//        - Emits an MCP `notifications/message` (standard MCP log notification
+//          — recent Codex CLI versions surface these into the live transcript
+//          the model sees). Declared via `capabilities.logging` so the
+//          notification is schema-valid.
+//        - Writes a loud stderr line so older Codex versions / debug sessions
+//          see the message even if the MCP log surface isn't plumbed through.
+//      On successful push we mark the message seen and immediately ack the
+//      lease — no 30s-lease gap waiting for the next tool call. This is the
+//      primary delivery path when Codex is idle or busy with non-agent-peers
+//      tools (git, apply_patch, shell, etc.).
+//
+//   2. Piggyback (tool-call entry). Every agent-peers tool call still runs
+//      through withPiggyback, which polls + prepends any still-pending
+//      messages as a [PEER INBOX] block. This is the fallback for the case
+//      where (a) Codex CLI doesn't plumb notifications/message to the model,
+//      or (b) the model ignored the log surface. Shared `seen` set prevents
+//      double-injection of messages the background loop already pushed.
 //
 // Shutdown: clear timers and exit. Deliberately do NOT flush pendingAcks
 // (those messages may not have reached Codex yet — flushing on exit would be
 // silent loss). Deliberately do NOT unregister (preserves reclaim-by-name).
 //
-// Dedupe: in-memory seen-set keyed by message_id. Session-local only;
-// at-least-once across restart per spec §5.4.
+// Dedupe: in-memory seen-set keyed by message_id, shared across both paths.
+// Session-local only; at-least-once across restart per spec §5.4.
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -32,6 +53,7 @@ import type { PeerId, LeasedMessage } from "./shared/types.ts";
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const HEARTBEAT_INTERVAL_MS = 15_000;
+const POLL_INTERVAL_MS = 1000;
 
 function log(msg: string) {
   console.error(`[agent-peers/codex] ${msg}`);
@@ -54,14 +76,31 @@ let myGitRoot: string | null = null;
 const mcp = new Server(
   { name: "agent-peers", version: "0.1.0" },
   {
-    capabilities: { tools: {} },
+    // `logging: {}` enables MCP `notifications/message` — the background
+    // push loop uses this to surface peer messages even when Codex is not
+    // actively calling an agent-peers tool (mirrors Claude's channel push).
+    capabilities: { logging: {}, tools: {} },
     instructions: `You are connected to the agent-peers network — other AI agents on this machine (Claude Code or Codex) can discover you and send you messages.
 
 INBOX HANDLING — IMPORTANT:
-- This MCP does NOT push messages to you. You receive messages ONLY when you call a tool on this server; the response is prepended with a [PEER INBOX] block listing pending peer messages.
-- When the user says things like "wait for a reply", "did I get a message", or is in a collaborative flow with other peers, you MUST call check_messages (or any agent-peers tool) regularly — otherwise peer messages pile up at the broker unseen.
-- Default cadence: after completing every major step of a multi-peer task, call check_messages before moving on. When idle waiting for a reply, call check_messages every few user turns.
-- When you see a [PEER INBOX] block, treat each message like a coworker's Slack message: finish your current step, then respond via send_message(to_id=<from_name>, message="..."). The from_name and message_id are inside the block.
+- Peer messages reach you via TWO paths. You must be prepared for EITHER:
+    1. An MCP "notifications/message" log notification tagged logger="agent-peers".
+       If your surface shows those, treat them as an incoming Slack DM — reply
+       immediately via send_message(to_id="<from_name>", ...).
+    2. A [PEER INBOX] block prepended to ANY agent-peers tool response. This
+       fires on every tool call (list_peers, send_message, set_summary,
+       check_messages, rename_peer).
+- Because path (1) is best-effort (some Codex versions do not surface log
+  notifications to the model), you MUST still poll via check_messages when
+  you are in a collaborative flow. Cadence:
+    * Immediately after finishing any user-requested step that could take
+      > a few seconds (a shell call, a file write, a long read).
+    * Every 2–3 turns while idle waiting on a peer reply.
+    * Before telling the user "I'm done" on a multi-peer task.
+- When you see a [PEER INBOX] block or a log-notification peer message,
+  treat each one like a coworker's Slack message: finish your current step,
+  then respond via send_message(to_id="<from_name>", message="..."). The
+  from_name and message_id are inside the block.
 
 ON STARTUP:
 - Call set_summary once with a 1-2 sentence description of what you are working on.
@@ -132,18 +171,23 @@ const TOOLS = [
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-// Module-level ack-on-next-call state (spec §5.5).
-// pendingAcks holds lease tokens from the PREVIOUS tool call. A subsequent
-// request is a strong heuristic (not proof) that the previous response cycle
-// completed — see spec §5.5 "Residual limitations" for the narrow window this
-// does not fully close. On shutdown we intentionally do NOT flush pendingAcks;
-// let leases expire naturally.
+// Module-level ack-on-next-call state (spec §5.5). Shared across both delivery
+// paths (background push + withPiggyback).
+//
+// - `seen` is the session-wide dedupe set. A message_id enters this set the
+//   moment EITHER path successfully surfaces the message (push notification
+//   delivered, or [PEER INBOX] block emitted in a tool response). Prevents
+//   the two paths from double-injecting the same message.
+// - `pendingAcks` holds lease tokens accumulated by the piggyback path; they
+//   are flushed at the start of the NEXT tool call (ack-on-next-call). The
+//   background push path acks immediately after a successful push, so it
+//   does NOT use pendingAcks.
+//
+// On shutdown we intentionally do NOT flush pendingAcks (those messages may
+// not have reached Codex's model yet — flushing on exit would be silent loss).
 //
 // Bounded (code review round-2 fix): under repeated ack failure we'd otherwise
-// accumulate unbounded tokens. Cap keeps memory + HTTP payload sane. Oldest
-// tokens are dropped first; they'd have expired leases anyway (30s lease
-// horizon vs cap large enough to cover many minutes of new leases), so the
-// broker would have ack'd them 0 regardless.
+// accumulate unbounded tokens. Cap keeps memory + HTTP payload sane.
 const MAX_PENDING_ACKS = 500;
 const pendingAcks: string[] = [];
 const seen = new Set<number>();
@@ -154,6 +198,94 @@ function enqueueAck(token: string) {
     const drop = pendingAcks.length - MAX_PENDING_ACKS;
     pendingAcks.splice(0, drop);
     log(`pendingAcks trimmed: dropped ${drop} oldest token(s); exceeding cap ${MAX_PENDING_ACKS}`);
+  }
+}
+
+// --- Background push (claude-style) -----------------------------------------
+//
+// Polls the broker every POLL_INTERVAL_MS and pushes each new message via
+// MCP `notifications/message` + a loud stderr line. On successful push we
+// mark the message seen and immediately ack the lease (no ack-on-next-call
+// deferral — we already know the notification left the transport).
+//
+// If the push fails mid-way, we leave the message UNMARKED in `seen` and
+// leave the lease un-acked. The broker's lease will expire naturally and the
+// message will be retried on the next tick (background loop) or the next
+// tool call (piggyback).
+async function pushInboxViaNotification(m: LeasedMessage): Promise<void> {
+  // Use the standard MCP log notification. `data` carries the same
+  // human-readable block the piggyback path uses, so a Codex version that
+  // renders notifications/message into the transcript gets the exact same
+  // framing the model is trained to recognise. `meta` carries structured
+  // fields for any surface that wants to reason about the message.
+  await mcp.notification({
+    method: "notifications/message",
+    params: {
+      level: "info",
+      logger: "agent-peers",
+      data: formatInboxBlock([m]),
+      _meta: {
+        source: "agent-peers",
+        message_id: m.id,
+        from_id: m.from_id,
+        from_name: m.from_name,
+        from_peer_type: m.from_peer_type,
+        from_summary: m.from_summary,
+        from_cwd: m.from_cwd,
+        sent_at: m.sent_at,
+      },
+    },
+  });
+}
+
+async function backgroundPollAndPush(): Promise<void> {
+  if (!myId || !mySession) return;
+
+  let leased: LeasedMessage[] = [];
+  try {
+    leased = await client.pollMessages({ id: myId, session_token: mySession });
+  } catch (e) {
+    // Transient broker error — next tick retries.
+    log(`background poll error: ${e instanceof Error ? e.message : String(e)}`);
+    return;
+  }
+  if (leased.length === 0) return;
+
+  const toAck: string[] = [];
+  for (const m of leased) {
+    if (seen.has(m.id)) {
+      // Already surfaced (either by an earlier background tick or by a
+      // piggyback call). Close the re-lease so the broker stops holding it.
+      toAck.push(m.lease_token);
+      continue;
+    }
+
+    // Loud stderr for debug surfaces + versions that pipe MCP stderr.
+    log(`📬 PEER INBOX #${m.id} from ${m.from_name} (${m.from_peer_type}): ${m.text}`);
+
+    let pushed = false;
+    try {
+      await pushInboxViaNotification(m);
+      pushed = true;
+    } catch (e) {
+      // Notification failed (transport error / client disconnected). Do NOT
+      // mark seen and do NOT ack — let the lease expire and retry next tick.
+      log(`background push failed for msg #${m.id} (will retry): ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    if (pushed) {
+      seen.add(m.id);
+      toAck.push(m.lease_token);
+    }
+  }
+
+  if (toAck.length > 0 && myId && mySession) {
+    try {
+      await client.ackMessages({ id: myId, session_token: mySession, lease_tokens: toAck });
+    } catch (e) {
+      // Broker will re-lease, `seen` prevents re-injection.
+      log(`background ack error: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 }
 
@@ -384,6 +516,21 @@ async function main() {
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
+  // Background push loop — self-scheduling with re-entrancy guard (same
+  // pattern as claude-server). One in-flight cycle at a time so overlapping
+  // slow I/O can't cause duplicate pushes against the shared `seen` set.
+  let pushStopped = false;
+  let pushTickTimer: ReturnType<typeof setTimeout> | null = null;
+  const scheduleNextPush = () => {
+    if (pushStopped) return;
+    pushTickTimer = setTimeout(async () => {
+      try { await backgroundPollAndPush(); }
+      catch (e) { log(`background loop crashed (continuing): ${e instanceof Error ? e.message : String(e)}`); }
+      finally { scheduleNextPush(); }
+    }, POLL_INTERVAL_MS);
+  };
+  scheduleNextPush();
+
   const hb = setInterval(async () => {
     if (myId && mySession) {
       try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
@@ -395,6 +542,8 @@ async function main() {
   // unregister (preserves reclaim-by-name window). Timer cleanup only.
   lifecycleCleanup = async () => {
     clearInterval(hb);
+    pushStopped = true;
+    if (pushTickTimer) clearTimeout(pushTickTimer);
   };
   // Note: all signal handlers + 'exit' handler are already armed at the top
   // of main(), before any setTabTitle() call — so a terminal close during
