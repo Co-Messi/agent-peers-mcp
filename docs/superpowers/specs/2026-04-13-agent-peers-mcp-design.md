@@ -1,8 +1,73 @@
 # agent-peers-mcp — Design Spec
 
 **Date:** 2026-04-13
-**Status:** Phase 1 MVP design, approved
+**Status:** Phase 1 MVP design, approved; amended 2026-04-15 (see below)
 **Goal:** Unified peer-discovery + messaging MCP supporting Claude Code AND Codex CLI sessions on the same broker, fully isolated from the existing stable `claude-peers-mcp` install.
+
+---
+
+## 2026-04-15 AMENDMENTS (PR #2 — "fix message delivery")
+
+The body of this spec remains the original Phase 1 design. Four deltas landed via PR #2 after adversarial review from `chatgpt-codex-connector[bot]` and a competing `feat/codex-conversation-flow` branch. Treat the bullets below as overriding any earlier text they contradict.
+
+### A. Codex delivery: two-layer pipeline with confirm-on-next-call dedupe
+
+The original §5.5 piggyback design gated delivery on an in-memory `seen` set populated at the moment a message was drawn into a tool response. Adversarial review showed this could silently lose messages when the MCP stdio response was dropped or aborted before reaching Codex's model. The amended design:
+
+1. **Layer 1 — Durable on-disk inbox** at `~/.agent-peers-codex/<peer-id>.json`.
+   - File perms 0o600, directory perms 0o700, fail-closed perm check on read (mirrors `broker.ts enforceDbFilePerms`, matches the security boundary established by rounds A–I).
+   - Survives MCP process restart within the 60s reclaim window.
+   - Module: `shared/codex-inbox.ts` (`CodexInboxStore`).
+   - Background poll loop writes new leased messages here FIRST, before any model-visible delivery.
+
+2. **Layer 2 — Signal-only preview push** via MCP `notifications/message` on each poll tick.
+   - Carries ONLY `from_name` + `from_peer_type` + a pointer to where the authoritative delivery lands.
+   - **No message body, no reply_action.** Prevents the double-reply risk where a Codex build that surfaces log notifications could reply from the preview, then reply again when the `[PEER INBOX]` block arrives.
+   - Formatter: `shared/piggyback.ts → formatInboxPreview()`. Three regression tests guard this as a security-sensitive function.
+   - Declared via `capabilities.logging: {}` on the codex-server.
+
+3. **Layer 3 — Authoritative `[PEER INBOX]` block** on every agent-peers tool response.
+   - Single source of truth: full body, sender metadata, sender summary, reply_action hint.
+   - Drawn from the durable queue via `getUnreadMessages()` (NOT `consumeUnreadMessages()`) — items stay on disk until the NEXT call confirms delivery.
+
+4. **Confirm-on-next-call state machine** splits the single `seen` set from the original design into two sets:
+   - `presentedPendingConfirm: Set<number>` — messages drawn into the CURRENT response's `[PEER INBOX]`. Populated just before return.
+   - `seen: Set<number>` — messages known to have reached the model. Only populated at the START of the NEXT tool call (Codex calling us again is the evidence the previous response cycle landed), and only after (a) broker ack succeeded and (b) durable-queue prune succeeded. Partial failures leave items in `presentedPendingConfirm` for retry.
+   - `pollBrokerIntoQueue` has a three-branch triage: `seen.has` → close stuck lease; `presentedPendingConfirm.has` → stash new lease token but do NOT re-queue; else → write to durable queue.
+   - Unconditional `pendingAcks` flush at call entry (NOT gated on `presentedPendingConfirm` being non-empty) so seen-branch re-lease tokens can never accumulate into perpetually-unacked zombie rows at the broker.
+
+### B. Broker: clear stale leases on reclaim
+
+`registerPeer` now clears `lease_token` / `lease_expires_at` on unacked messages for the reclaimed peer. Previously, a Codex that died mid-delivery and was reclaimed by name would have its backlog held in "leased + not acked" state for up to `LEASE_DURATION_MS` (30s) before the broker re-offered it. The reclaim-time clear surfaces the backlog on the new session's first poll.
+
+### C. Colleague behavior protocol
+
+The original `claude-server` prompt said "RESPOND IMMEDIATELY" (§7.1) — wrong for the "colleagues coordinating across projects" use case, which rewards investigation + substantive replies over reflexive acknowledgement. Replaced with a shared behavioral protocol imported verbatim by both servers:
+
+- **Module:** `shared/colleague-prompt.ts` (`COLLEAGUE_PROTOCOL` string).
+- **Reactive rules:** acknowledge internally (not externally), investigate before responding, push back on disagreement, never leave a loop open, no auto-"got it" / "on it" chatter.
+- **Proactive rules:** ping when you change something a peer's `summary` depends on, when you find an invariant relevant to their work, when blocked on them, when you finish a joint task, when you find something genuinely surprising. Explicit anti-patterns on progress chatter.
+- **Maintenance rules:** keep `set_summary` current, update when focus shifts (especially redirected by peer), read peer summaries before pinging, use their naming.
+- Worked example of the cross-project "merge two projects" flow so the model has a template for good collaboration.
+- Each server's own `instructions` then adds a single paragraph about its specific delivery mechanism (channel push vs two-layer Codex pipeline) and composes it with the shared protocol.
+- **`[PEER INBOX]` block framing softened** in `shared/piggyback.ts → formatInboxBlock()`: dropped the 🚨🚨🚨 "RESPOND BEFORE ANYTHING ELSE" banner, replaced with a four-path rubric (answer now / investigate / FYI / disagree) plus explicit forbidding of auto-acknowledgement. Includes sender's current summary when present.
+
+### D. Test coverage
+
+Test suite grew from 59 → 84. New coverage:
+- `tests/broker.test.ts` — reclaim clears stale leases (round-trip: send → lease → crash → reclaim → verify backlog visible on first poll).
+- `tests/codex-inbox-store.test.ts` — file perms 0o600 / dir 0o700, fail-closed load on wider perms, `removeByIds` + restart persistence + no-op-when-empty.
+- `tests/piggyback.test.ts` — preview format carries sender identity + pointer, preview format does NOT leak body, preview format does NOT carry reply_action cues, inbox block includes sender summary when present.
+
+### E. Superseded text in this document
+
+- §5.4 "in-memory seen-set" — Codex path now uses two sets (`presentedPendingConfirm` + `seen`). Claude path is unchanged.
+- §5.5 "piggyback" — replaced by the three-layer pipeline above.
+- §7.1 "RESPOND IMMEDIATELY" Claude prompt — replaced by `COLLEAGUE_PROTOCOL`.
+- §7.2 Codex prompt — replaced by `COLLEAGUE_PROTOCOL` + delivery note.
+- §9.1 "claude-server with channel push" / §9.2 "codex-server with piggyback" — still correct in broad shape but miss the durable-queue + preview-push layering.
+
+Nothing else in the original spec is superseded — the broker protocol, security invariants, lease/ack primitive, orphan observability, reclaim semantics, self-rename tool, scope filters, and CLI admin actions are all unchanged.
 
 ---
 
