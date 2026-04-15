@@ -2,41 +2,63 @@
 // codex-server.ts
 // MCP stdio server for Codex CLI. Registers as peer_type="codex".
 //
-// DELIVERY PIPELINE (three layers, all feeding the same dedupe set):
+// DELIVERY PIPELINE — two layers with a strict division of labor, driven
+// by one invariant: no message is acked to the broker (nor pruned from
+// the durable queue) until we have evidence the previous tool-response
+// cycle actually completed. That evidence is "Codex called us again."
 //
-//   1. Background poll (POLL_INTERVAL_MS) → durable on-disk inbox queue at
-//      ~/.agent-peers-codex/<peer-id>.json. This is the authoritative
-//      persistence layer: messages survive MCP process restarts and never
-//      get lost on the path between "broker lease" and "model actually saw
-//      them". File perms hardened to 0o600 (dir 0o700) to match the
-//      broker's DB trust boundary (see broker.ts enforceDbFilePerms).
+//   Layer 1 — Durable on-disk inbox at ~/.agent-peers-codex/<peer-id>.json
+//   ------------------------------------------------------------------
+//   Background poll (POLL_INTERVAL_MS) writes newly-leased messages here.
+//   This is the authoritative persistence layer: messages survive MCP
+//   restart within the 60s reclaim window, and nothing gets pruned until
+//   we're sure the model actually saw it. File perms hardened to 0o600
+//   (dir 0o700) to match the broker's DB trust boundary (see
+//   broker.ts enforceDbFilePerms).
 //
-//   2. Best-effort MCP `notifications/message` push on each poll tick.
-//      Recent Codex CLI versions surface MCP log notifications into the
-//      live transcript, giving Codex a Claude-style mid-task delivery
-//      channel. If the client doesn't plumb log notifications, the push is
-//      a no-op — layer 3 still delivers the message reliably. This path
-//      intentionally does NOT mark seen or ack; those stay gated on the
-//      authoritative drain (layer 3).
+//   Layer 2 — Authoritative piggyback [PEER INBOX] on tool call
+//   ------------------------------------------------------------------
+//   withPiggyback is the ONLY path that surfaces message CONTENT + reply
+//   cues to the model. It reads (not consumes) from the durable queue,
+//   filters out messages already confirmed delivered, and prepends what's
+//   left as a [PEER INBOX] block in the tool response.
 //
-//   3. Piggyback drain on every agent-peers tool call. withPiggyback
-//      consumes unread messages from the durable queue, prepends them as
-//      a [PEER INBOX] block, marks them seen, and queues ack-on-next-call.
-//      This is the path that actually guarantees the model saw the bytes.
+//   Signal-only preview push (notifications/message)
+//   ------------------------------------------------------------------
+//   A best-effort MCP log notification fires after each background poll
+//   that landed new messages in the queue. It carries ONLY the sender's
+//   name + peer_type and a pointer to the next tool call — no body, no
+//   reply_action. This gives recent Codex CLI versions a "new message
+//   from X arrived, look at your inbox" signal in the live transcript
+//   without duplicating the authoritative delivery. It does NOT update
+//   any dedupe state — the [PEER INBOX] block (Layer 2) is the one and
+//   only "this was shown to the model" trigger.
 //
-// Shared `seen` set across all three layers prevents the same message
-// being injected twice — layer 2's push is a "preview," layer 3 is
-// authoritative, layer 1 dedupes by message_id.
+// DEDUPE STATE MACHINE (two sets, confirm-on-next-call):
+//
+//   - `presentedPendingConfirm` — message_ids included in the CURRENT
+//     tool response's [PEER INBOX] block but not yet known-delivered.
+//     Populated inside withPiggyback just before return.
+//
+//   - `seen` — message_ids we're SURE reached the model. Populated at
+//     the START of the NEXT tool call (Codex calling us again is the
+//     evidence that the previous response cycle landed). Once a message
+//     is `seen`, we ack its lease, prune it from the durable queue, and
+//     ignore any future re-delivery of the same id.
+//
+// This splits what was previously a single `seen` set that conflated
+// "about to be shown" with "known shown." The earlier code could ack +
+// prune a message whose response was aborted before reaching Codex —
+// silent loss. The split closes that race: a dropped response leaves the
+// message in the durable queue AND outside the `seen` set, so on the
+// next tool call (or the next session after a restart) it re-surfaces.
+// At-least-once per spec §5.4.
 //
 // Shutdown: clear timers and exit. Deliberately do NOT flush pendingAcks
 // (those messages may not have reached Codex yet — flushing on exit would
 // be silent loss). Deliberately do NOT unregister (preserves
-// reclaim-by-name). Durable queue is left in place so a restart within the
+// reclaim-by-name). Durable queue stays on disk so a restart within the
 // 60s reclaim window picks up exactly where this session left off.
-//
-// Dedupe scope: session-local in-memory seen-set keyed by message_id, plus
-// durable dedupe-by-message_id in CodexInboxStore. At-least-once across
-// restart per spec §5.4.
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -51,7 +73,7 @@ import { waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync } from "./shared/tab-title.ts";
-import { formatInboxBlock } from "./shared/piggyback.ts";
+import { formatInboxBlock, formatInboxPreview } from "./shared/piggyback.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
@@ -163,6 +185,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 const MAX_PENDING_ACKS = 500;
 const pendingAcks: string[] = [];
+
+// Dedupe state (see top-of-file state-machine comment):
+//   - `presentedPendingConfirm`: messages in the CURRENT response's
+//     [PEER INBOX] block. Promoted to `seen` at the START of the NEXT call.
+//   - `seen`: messages we are SURE reached the model. Only these get their
+//     lease acked + are pruned from the durable queue.
+const presentedPendingConfirm = new Set<number>();
 const seen = new Set<number>();
 
 function enqueueAck(token: string) {
@@ -192,47 +221,73 @@ async function pollBrokerIntoQueue(): Promise<void> {
 
     if (leased.length === 0) return;
 
-    const unread: LeasedMessage[] = [];
+    // Triage leased messages by dedupe state.
+    const freshlyUnread: LeasedMessage[] = [];
     for (const message of leased) {
       if (seen.has(message.id)) {
+        // We're certain the model saw this one already (previous tool
+        // call's piggyback, confirmed by the call after). The lease just
+        // got re-offered because our earlier ack was lost or the lease
+        // expired before ack. Close it now — this is safe because the
+        // model-delivery evidence is already in hand.
+        enqueueAck(message.lease_token);
+      } else if (presentedPendingConfirm.has(message.id)) {
+        // We drew this into the CURRENT response's [PEER INBOX] block but
+        // haven't yet seen the next tool call that would confirm
+        // delivery. DO NOT ack (would silently drop if the response was
+        // lost). DO NOT re-queue in the durable inbox (would make the
+        // piggyback double-surface it within the same call). Just stash
+        // the new lease token so next-call confirm-flush closes both old
+        // + new leases atomically.
         enqueueAck(message.lease_token);
       } else {
-        unread.push(message);
+        freshlyUnread.push(message);
       }
     }
 
-    if (unread.length === 0) return;
+    if (freshlyUnread.length === 0) return;
 
-    // Authoritative persistence FIRST — if this fails, we neither push nor
-    // ack; next poll tick will retry because lease will expire at broker.
+    // Authoritative persistence FIRST — if this fails, we do not push and
+    // do not ack; next poll tick retries because the lease will expire at
+    // the broker and the message will be re-leased.
     try {
-      await inboxStore.queueLeasedMessages(unread);
-      log(`queued ${unread.length} unread peer message(s): ${unread.map((msg) => `#${msg.id} from ${msg.from_name}`).join(", ")}`);
+      await inboxStore.queueLeasedMessages(freshlyUnread);
+      log(`queued ${freshlyUnread.length} unread peer message(s): ${freshlyUnread.map((msg) => `#${msg.id} from ${msg.from_name}`).join(", ")}`);
     } catch (e) {
       log(`failed to persist unread peer messages: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
 
-    // Best-effort preview push via MCP log notifications. Fires AFTER the
-    // durable write so a push-then-crash still leaves the messages
-    // recoverable on next start. Failures are non-fatal — the authoritative
-    // [PEER INBOX] block on the next tool call will still deliver.
-    for (const m of unread) {
+    // Best-effort signal-only preview push. Recent Codex CLI versions
+    // surface MCP log notifications into the live transcript — this
+    // fires a "heads up, message waiting" nudge so the model can decide
+    // whether to interrupt current work or finish first. It carries NO
+    // body and NO reply cues; full content + reply_action live in the
+    // authoritative [PEER INBOX] block in the next tool response. This
+    // split avoids the double-reply risk where the model would see the
+    // same message twice (once via log, once via piggyback) and send two
+    // replies. Failures are non-fatal — the authoritative path still
+    // delivers on the next tool call.
+    for (const m of freshlyUnread) {
       try {
         await mcp.notification({
           method: "notifications/message",
           params: {
             level: "info",
             logger: "agent-peers",
-            data: formatInboxBlock([m]),
+            // Intentionally body-free: just the sender's identity + a
+            // pointer to where the actual message will appear. No
+            // message text. No reply_action. See formatInboxPreview for
+            // the rationale and the tests in piggyback.test.ts that
+            // guarantee this property.
+            data: formatInboxPreview(m),
             _meta: {
               source: "agent-peers",
+              signal_only: true,
               message_id: m.id,
               from_id: m.from_id,
               from_name: m.from_name,
               from_peer_type: m.from_peer_type,
-              from_summary: m.from_summary,
-              from_cwd: m.from_cwd,
               sent_at: m.sent_at,
             },
           },
@@ -260,47 +315,119 @@ async function withPiggyback(
     };
   }
 
-  // 1. Flush previous-call acks. Only now do we know the previous response
-  //    cycle completed (Codex is calling us again).
+  // ------------------------------------------------------------------------
+  // STEP 1 — "Previous response cycle completed" confirm-flush.
   //
-  // Code review round-1 fix: only remove tokens from pendingAcks on SUCCESSFUL
-  // ack. If the HTTP call throws, keep them so the next call retries instead
-  // of silently waiting for lease expiry (which would cause a guaranteed
-  // duplicate when the message is re-leased + re-injected).
-  if (pendingAcks.length > 0) {
-    const toFlush = pendingAcks.slice();
-    try {
-      await client.ackMessages({ id: myId, session_token: mySession, lease_tokens: toFlush });
-      // Remove only after success. Use splice by indices-of-toFlush to be
-      // robust against concurrent appends (though withPiggyback is strictly
-      // serialized per tool call, so this is defense in depth).
-      for (const tok of toFlush) {
-        const idx = pendingAcks.indexOf(tok);
-        if (idx !== -1) pendingAcks.splice(idx, 1);
+  // Codex calling us again is the evidence that any [PEER INBOX] block we
+  // sent last time actually reached the model. For each message in
+  // presentedPendingConfirm we now:
+  //   (a) ack the broker lease(s) — pendingAcks holds both the original
+  //       lease_token(s) drawn last call AND any re-lease tokens
+  //       pollBrokerIntoQueue stashed while waiting;
+  //   (b) prune it from the durable queue so we don't re-surface it;
+  //   (c) promote it into `seen` so any future re-delivery from the
+  //       broker short-circuits in pollBrokerIntoQueue.
+  //
+  // If ANY of those steps fails (HTTP error, disk error), we keep the
+  // message in presentedPendingConfirm and retry next call. Doing partial
+  // state changes would open the exact silent-loss race this file is
+  // designed to close.
+  if (presentedPendingConfirm.size > 0) {
+    const confirming = [...presentedPendingConfirm];
+    const tokensToFlush = pendingAcks.slice();
+
+    let ackOk = false;
+    if (tokensToFlush.length > 0) {
+      try {
+        await client.ackMessages({
+          id: myId, session_token: mySession, lease_tokens: tokensToFlush,
+        });
+        ackOk = true;
+      } catch (e) {
+        log(`confirm-flush ack failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
       }
-    } catch (e) {
-      log(`pending ack flush failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
+    } else {
+      ackOk = true; // nothing to ack
+    }
+
+    if (ackOk) {
+      let pruneOk = false;
+      try {
+        if (inboxStore) await inboxStore.removeByIds(confirming);
+        pruneOk = true;
+      } catch (e) {
+        log(`confirm-flush queue-prune failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
+      }
+
+      if (pruneOk) {
+        // All three steps landed — promote to seen + drop the
+        // now-worthless lease tokens + clear presentedPendingConfirm.
+        for (const id of confirming) {
+          seen.add(id);
+          presentedPendingConfirm.delete(id);
+        }
+        for (const tok of tokensToFlush) {
+          const idx = pendingAcks.indexOf(tok);
+          if (idx !== -1) pendingAcks.splice(idx, 1);
+        }
+      }
     }
   }
 
+  // ------------------------------------------------------------------------
+  // STEP 2 — Inline poll so we pick up anything that arrived in the last
+  // POLL_INTERVAL_MS window. Background loop does the same thing on a
+  // timer; calling it here collapses the worst-case "message landed 0.99s
+  // before this tool call" tail.
   try {
     await pollBrokerIntoQueue();
   } catch (e) {
     log(`inline poll failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  let fresh: LeasedMessage[] = [];
+  // ------------------------------------------------------------------------
+  // STEP 3 — Read (do NOT consume) the durable queue. Items stay on disk
+  // until the NEXT call's confirm-flush promotes them to `seen` and
+  // removes them. A dropped response thus leaves the message in place
+  // for re-delivery, fixing the silent-loss race the codex-reviewer bot
+  // flagged on PR #2 round 1.
+  let queued: LeasedMessage[] = [];
   try {
-    fresh = inboxStore ? await inboxStore.consumeUnreadMessages() : [];
+    queued = inboxStore ? await inboxStore.getUnreadMessages() : [];
   } catch (e) {
     log(`failed to read unread peer messages: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  for (const message of fresh) {
-    seen.add(message.id);
-    enqueueAck(message.lease_token);
+  // Filter out anything already confirmed delivered (defensive — the
+  // durable queue shouldn't contain `seen` ids, but pollBrokerIntoQueue's
+  // seen-branch guarantees it) and anything we already drew into an
+  // earlier-but-unconfirmed response (presentedPendingConfirm). The
+  // latter can happen if the previous call's confirm-flush partially
+  // failed above; we want to keep showing the same items until flush
+  // succeeds, not start dealing duplicates.
+  const fresh: LeasedMessage[] = [];
+  for (const m of queued) {
+    if (seen.has(m.id)) continue;
+    if (presentedPendingConfirm.has(m.id)) {
+      // Already showed this in an earlier response whose confirm-flush
+      // hasn't completed yet. Skip re-drawing — the earlier presentation
+      // is still the one we're waiting to confirm.
+      continue;
+    }
+    fresh.push(m);
   }
 
+  // Mark fresh items as "presented this call, awaiting confirm" and
+  // stash their lease tokens for the NEXT call's confirm-flush. This is
+  // the single write point where a message transitions from "sitting in
+  // queue" to "shown to the model."
+  for (const m of fresh) {
+    presentedPendingConfirm.add(m.id);
+    enqueueAck(m.lease_token);
+  }
+
+  // ------------------------------------------------------------------------
+  // STEP 4 — Run the tool handler + build the response.
   let toolText = "";
   let toolError: boolean | undefined;
   try {

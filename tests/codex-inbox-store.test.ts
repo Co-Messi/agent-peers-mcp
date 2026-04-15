@@ -84,6 +84,41 @@ test("CodexInboxStore reset clears persisted unread messages", async () => {
   expect(await store.getUnreadMessages()).toHaveLength(0);
 });
 
+test("CodexInboxStore.removeByIds drops only the specified messages, keeping later arrivals", async () => {
+  const store = await makeStore();
+  await store.queueLeasedMessages([message(1), message(2), message(3)]);
+
+  await store.removeByIds([1, 3]);
+
+  const remaining = await store.getUnreadMessages();
+  expect(remaining.map((m) => m.id)).toEqual([2]);
+});
+
+test("CodexInboxStore.removeByIds is a no-op when ids are already gone", async () => {
+  const store = await makeStore();
+  await store.queueLeasedMessages([message(5)]);
+
+  // Remove an id that isn't in the queue — should not throw, should not
+  // disturb existing state.
+  await store.removeByIds([999]);
+
+  expect((await store.getUnreadMessages()).map((m) => m.id)).toEqual([5]);
+});
+
+test("CodexInboxStore.removeByIds persists across restart", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+
+  const first = new CodexInboxStore({ peerId: "peer-123", rootDir: dir });
+  await first.init();
+  await first.queueLeasedMessages([message(1), message(2), message(3)]);
+  await first.removeByIds([2]);
+
+  const second = new CodexInboxStore({ peerId: "peer-123", rootDir: dir });
+  await second.init();
+  expect((await second.getUnreadMessages()).map((m) => m.id)).toEqual([1, 3]);
+});
+
 test.if(IS_POSIX)("CodexInboxStore writes inbox file at 0o600 and directory at 0o700", async () => {
   const store = await makeStore();
   await store.queueLeasedMessages([message(1)]);

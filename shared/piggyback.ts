@@ -13,6 +13,25 @@
 
 import type { LeasedMessage } from "./types.ts";
 
+// formatInboxPreview — signal-only text used by codex-server's background
+// poll loop when it pushes an MCP `notifications/message` log entry.
+//
+// Why signal-only: the preview path can only be a nudge, not a delivery.
+// We don't know whether the client surfaced the log notification to the
+// model, so we cannot update dedupe state based on it. If the preview
+// text included the full message body + a reply_action cue, a Codex that
+// DID render the log would see both the preview AND the authoritative
+// [PEER INBOX] block on the next tool call — and could reply twice. This
+// string therefore carries sender identity + a pointer to where the real
+// payload will appear, and nothing else.
+export function formatInboxPreview(m: LeasedMessage): string {
+  return (
+    `📬 agent-peers: new message from ${m.from_name} (${m.from_peer_type}). ` +
+    `Full content + reply instructions will appear as [PEER INBOX] in your next ` +
+    `agent-peers tool response. To see it immediately, call check_messages.`
+  );
+}
+
 export function formatInboxBlock(messages: LeasedMessage[]): string {
   if (messages.length === 0) return "";
 

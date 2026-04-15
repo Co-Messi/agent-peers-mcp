@@ -109,6 +109,28 @@ export class CodexInboxStore {
     });
   }
 
+  // Remove specific messages by id, atomically. Used by the "confirm on
+  // next tool call" flow in codex-server.ts: when the NEXT call fires we
+  // know the PREVIOUS response cycle completed, so messages drawn into
+  // that response can finally be pruned from the durable queue. A plain
+  // consumeUnreadMessages() would drop EVERYTHING including messages that
+  // arrived between the last draw and this call — which must stay queued.
+  async removeByIds(ids: number[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.withLock(async () => {
+      const drop = new Set(ids);
+      const nextState = {
+        unread: this.state.unread.filter((m) => !drop.has(m.id)),
+      };
+      // Only write if something actually changed — avoids a write storm
+      // when removeByIds is called with ids that are no longer in the
+      // queue (harmless but noisy in tests).
+      if (nextState.unread.length === this.state.unread.length) return;
+      await this.persistState(this.filePath, nextState);
+      this.state = nextState;
+    });
+  }
+
   async reset(): Promise<void> {
     await this.withLock(async () => {
       const nextState = { unread: [] };

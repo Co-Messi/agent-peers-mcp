@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { formatInboxBlock } from "../shared/piggyback.ts";
+import { formatInboxBlock, formatInboxPreview } from "../shared/piggyback.ts";
 import type { LeasedMessage } from "../shared/types.ts";
 
 const m = (id: number, text: string, from_name = "alpha", from_summary = ""): LeasedMessage => ({
@@ -50,6 +50,71 @@ test("formatInboxBlock includes sender summary when provided", () => {
 test("formatInboxBlock omits summary line when sender has no summary", () => {
   const out = formatInboxBlock([m(1, "hi", "backend-codex", "")]);
   expect(out).not.toContain("their current work:");
+});
+
+// formatInboxPreview is a security-sensitive function: it must NOT leak
+// message content or reply cues into the preview notification channel,
+// because the preview path can't update dedupe state and a Codex that
+// surfaces both paths would otherwise reply twice. These tests are the
+// guard-rail against that regression.
+
+test("formatInboxPreview carries sender identity and pointer to next tool call", () => {
+  const msg: LeasedMessage = {
+    id: 99,
+    from_id: "id-99",
+    from_name: "claude-frontend",
+    from_peer_type: "claude",
+    from_cwd: "/x",
+    from_summary: "",
+    to_id: "me",
+    text: "SECRET BODY THAT MUST NOT LEAK INTO PREVIEW",
+    sent_at: "2026-04-15T00:00:00.000Z",
+    lease_token: "tok-99",
+  };
+  const out = formatInboxPreview(msg);
+
+  // Sender identity present.
+  expect(out).toContain("claude-frontend");
+  expect(out).toContain("claude");
+  // Pointer to authoritative delivery path present.
+  expect(out).toMatch(/\[PEER INBOX\]|check_messages/);
+});
+
+test("formatInboxPreview does NOT include message body (no double-reply risk)", () => {
+  const msg: LeasedMessage = {
+    id: 1,
+    from_id: "id-1",
+    from_name: "alpha",
+    from_peer_type: "claude",
+    from_cwd: "/x",
+    from_summary: "",
+    to_id: "me",
+    text: "UNIQUE_BODY_TOKEN_12345",
+    sent_at: "2026-04-15T00:00:00.000Z",
+    lease_token: "tok-1",
+  };
+  expect(formatInboxPreview(msg)).not.toContain("UNIQUE_BODY_TOKEN_12345");
+});
+
+test("formatInboxPreview does NOT include reply_action / send_message cues", () => {
+  const msg: LeasedMessage = {
+    id: 1,
+    from_id: "id-1",
+    from_name: "alpha",
+    from_peer_type: "claude",
+    from_cwd: "/x",
+    from_summary: "",
+    to_id: "me",
+    text: "hi",
+    sent_at: "2026-04-15T00:00:00.000Z",
+    lease_token: "tok-1",
+  };
+  const out = formatInboxPreview(msg);
+  // If these cues appeared in the preview, a Codex that surfaces the log
+  // notification could reply immediately — then see the same message
+  // again in the [PEER INBOX] block and reply a second time.
+  expect(out).not.toContain("reply_action");
+  expect(out).not.toContain("send_message(to_id");
 });
 
 test("formatInboxBlock numbers multiple messages and repeats the banner at head + foot", () => {
