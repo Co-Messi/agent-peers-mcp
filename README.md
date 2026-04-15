@@ -58,11 +58,24 @@ You're done.
 
 ## Install
 
-Two install prompts below — one for Claude Code, one for Codex. Each is a plain-English prompt you paste into the agent, and the agent installs everything itself. Pick either or do both.
+**Important — ownership split.** The repo folder, `node_modules`, the broker, and the SQLite DB at `~/.agent-peers.db` are **shared** between any Claude and Codex sessions on this machine. To avoid races (both agents cloning at once, both running `bun install`, both trying to own the broker) responsibilities are split:
+
+- **Claude Code prompt** = the **primary** install. Owns all shared state: clones the repo, runs `bun install`, registers Claude's MCP with `claude mcp add`, writes the `agentpeers` alias.
+- **Codex prompt** = a **wire-only** install. It only writes the `[mcp_servers.agent-peers]` block to `~/.codex/config.toml`. It does **not** clone, it does **not** `bun install`, and it does **not** touch the broker or DB — those belong to Claude.
+
+Pick your path:
+
+- **Both Claude and Codex active?** Run the Claude prompt FIRST (it sets up the shared repo + deps). Then run the Codex prompt — it auto-detects the install path Claude chose.
+- **Claude only?** Run the Claude prompt. Done.
+- **Codex only, no Claude?** You need to set up the shared repo manually first. One-liner:
+  ```bash
+  git clone https://github.com/Co-Messi/agent-peers-mcp.git ~/agent-peers-mcp && cd ~/agent-peers-mcp && bun install
+  ```
+  Then run the Codex prompt below — it'll find `~/agent-peers-mcp` and wire your config.toml.
 
 ---
 
-### 🧠 For Claude Code
+### 🧠 For Claude Code — primary install (clones repo, installs deps, wires Claude)
 
 Open a Claude Code session and paste this verbatim:
 
@@ -89,28 +102,39 @@ Then do all of the following:
    - `source ~/.zshrc` (or open a new terminal)
    - Launch another tab with `PEER_NAME=my-name agentpeers`
    - Ask the new session to "list all peers on this machine"
+   - If I also want Codex wired up, paste the Codex wire-only install prompt from this repo's README into a Codex session.
 
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
 
 ---
 
-### 🤖 For Codex
+### 🤖 For Codex — wire-only install (assumes the shared repo is already cloned)
 
 Open a Codex session and paste this verbatim:
 
 ````
-Install https://github.com/Co-Messi/agent-peers-mcp for me.
+Wire the agent-peers MCP into my Codex config for me.
 
-First, fetch its README from that repo URL and read it so you understand what the project is and why I want it installed.
+CRITICAL — this is a WIRE-ONLY install. The shared agent-peers-mcp repo (node_modules, the broker, the DB at ~/.agent-peers.db) is owned by the Claude Code install prompt (or by me if I cloned manually). You must NOT:
+  - clone the repo
+  - run `bun install`
+  - modify any file outside ~/.codex/config.toml
+  - kill or start the broker daemon
+  - touch ~/.agent-peers.db or ~/.agent-peers-secret
 
-Then do all of the following:
+Doing any of those would race against the Claude Code side and can corrupt the shared install. Your only job in this prompt is to write one block into ~/.codex/config.toml. That's it.
 
-1. Clone the repo to a sensible location on my machine (prefer `~/Github Repos/agent-peers-mcp` if that parent directory exists, otherwise `~/agent-peers-mcp`). Remember the absolute path as $AGENT_PEERS_DIR.
+Do the following:
 
-2. cd into $AGENT_PEERS_DIR and run `bun install`.
+1. Locate the existing shared install. Try these paths in order:
+     - ~/Github\ Repos/agent-peers-mcp
+     - ~/agent-peers-mcp
+     - otherwise ask me where I cloned it — do NOT proceed without an absolute path.
+   Verify that $AGENT_PEERS_DIR/codex-server.ts exists. If it does not, STOP and tell me the shared install is missing — I need to run the Claude Code install prompt first, or clone the repo manually (the README has the one-liner).
+   Remember the verified absolute path as $AGENT_PEERS_DIR.
 
-3. Append this block to ~/.codex/config.toml (create the file if it doesn't exist; skip if the [mcp_servers.agent-peers] section already exists):
+2. Append this block to ~/.codex/config.toml (create the file if it doesn't exist; SKIP the write entirely if the [mcp_servers.agent-peers] section is already present — do NOT duplicate):
    [mcp_servers.agent-peers]
    command = "bun"
    args = ["$AGENT_PEERS_DIR/codex-server.ts"]
@@ -119,7 +143,7 @@ Then do all of the following:
 
    CRITICAL — do NOT omit the `env = { "AGENT_PEERS_ENABLED" = "1" }` line. Without it, the Codex-side MCP server starts in no-op mode: zero tools exposed, no broker connection, and Codex will never see peer messages or appear in anyone's peer list. Setting this env flag to "1" is what activates the peer network.
 
-4. Tell me the install is done and I should:
+3. Tell me the install is done and I should:
    - Open a new terminal and run `codex` — the MCP will load automatically
    - Optionally set `PEER_NAME=my-name` before launching for a stable name
    - Ask the new session to "list all peers on this machine"
@@ -339,11 +363,14 @@ Both can run simultaneously. They do not talk to each other — you'd run `claud
 
 ## Update (pull latest version)
 
-Two upgrade prompts below — parallel to Install / Uninstall. Each is a plain-English prompt you paste into your agent, and the agent performs a safe in-place upgrade: stops the broker, pulls the latest code from this repo, reinstalls dependencies, runs the test suite as a sanity check, and tells you to restart your sessions so the new code is loaded.
+**Ownership split applies here too.** The shared repo (and `bun install` + tests + broker-restart) is Claude's to maintain. Running the update from both agents concurrently would race on `git pull`, corrupt `node_modules`, and kill each other's broker mid-upgrade. So:
+
+- **Have Claude Code installed?** Run the **Claude update prompt** below — it handles the shared repo pull + deps + test run + tells you to restart BOTH Claude and Codex sessions when it's done. You do not need to run anything on the Codex side beyond closing and reopening your Codex terminals after Claude finishes.
+- **Have Codex only, no Claude Code?** Use the **Codex-only update prompt** further below — it's the same as the Claude one but assumes Codex is the sole installer, so it's safe for it to own the shared repo.
 
 ---
 
-### 🧠 For Claude Code — paste this to update
+### 🧠 For Claude Code — paste this to update (the ONLY update prompt if you have both agents installed)
 
 Open a Claude Code session and paste this verbatim:
 
@@ -381,21 +408,27 @@ Once I confirm the path, do all of the following in order:
 
 8. Print a summary: old commit SHA, new commit SHA, the short-log between them (`git log --oneline <old>..HEAD`), and what tests passed.
 
-9. Tell me to close and relaunch any running `agentpeers` and `codex` sessions so the new MCP server code is loaded. Existing sessions keep running the OLD code until they restart.
+9. Tell me to close and relaunch any running `agentpeers` AND `codex` sessions so the new MCP server code is loaded. Both agents share this repo, so both sets of sessions need to restart. Existing sessions keep running the OLD code until they restart.
 
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
 
 ---
 
-### 🤖 For Codex — paste this to update
+### 🤖 For Codex — update (Codex-only installs ONLY — do NOT run this if Claude Code is also wired up)
 
-Open a Codex session and paste this verbatim:
+Open a Codex session and paste this verbatim. **Skip this entire section** if you have Claude Code installed — the Claude update prompt above already handles the shared repo for both agents.
 
 ````
 Update agent-peers-mcp to the latest version on my machine.
 
-Step 1 — find the install directory. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp, or elsewhere under my home directory. If you find more than one candidate, or you're uncertain, LIST the candidates and ASK me which one to update before proceeding. Do NOT modify anything until I confirm.
+CRITICAL — before starting, verify I am the sole installer of this MCP:
+
+1. Check ~/.claude.json — if it has an entry with name "agent-peers" OR an mcpServers["agent-peers"] key, Claude Code is ALSO wired to this shared repo. STOP immediately and tell me: "Claude Code is also using this install. The shared repo update is Claude's job — paste the Claude Code update prompt from the README into a Claude session instead. Once Claude has updated, come back here and I'll just tell you to restart your Codex sessions." Do NOT proceed.
+
+2. If ~/.claude.json has NO agent-peers entry (or the file doesn't exist), I am the sole installer. Continue.
+
+Step 2 — find the install directory. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp, or elsewhere under my home directory. If you find more than one candidate, or you're uncertain, LIST the candidates and ASK me which one to update before proceeding. Do NOT modify anything until I confirm.
 
 Once I confirm the path, do all of the following in order:
 
@@ -410,23 +443,21 @@ Once I confirm the path, do all of the following in order:
    `git rev-parse --short HEAD` — save the value so you can tell me later.
 
 4. DIRTY WORKTREE CHECK — before any destructive git action:
-   Run `git status --porcelain`. If it produces ANY output (modified, added, or untracked files), STOP. Show me the output and ask whether I want to: (a) stash my changes and proceed, (b) abort the update, or (c) blow the changes away with a hard reset. Do NOT proceed to step 5 until I answer.
+   Run `git status --porcelain`. If it produces ANY output (modified, added, or untracked files), STOP. Show me the output and ask whether I want to: (a) stash my changes and proceed, (b) abort the update, or (c) blow the changes away with a hard reset. Do NOT proceed until I answer.
    If `git status --porcelain` is empty, continue.
 
-5. Pull the latest code. Prefer a fast-forward pull so accidental rebases or divergent local commits surface as an error rather than a silent clobber:
+5. Pull the latest code with a fast-forward pull:
    `git fetch origin main && git pull --ff-only origin main`
-   If that fails (e.g. because we chose "blow away changes" in step 4, or local commits diverged), fall back to `git reset --hard origin/main` — but only after explicit confirmation.
+   If that fails, fall back to `git reset --hard origin/main` — but only after explicit confirmation.
 
-5. Refresh dependencies:
-   `bun install`
+6. Refresh dependencies: `bun install`
 
-6. Run the test suite as a sanity check:
-   `bun test`
+7. Run the test suite as a sanity check: `bun test`
    If any test fails, STOP and show me the failure output — do NOT tell me the update is complete.
 
-7. Print a summary: old commit SHA, new commit SHA, the short-log between them (`git log --oneline <old>..HEAD`), and what tests passed.
+8. Print a summary: old commit SHA, new commit SHA, the short-log between them (`git log --oneline <old>..HEAD`), and what tests passed.
 
-9. Tell me to close and relaunch any running Claude `agentpeers` and Codex sessions so the new MCP server code is loaded. Existing sessions keep running the OLD code until they restart.
+9. Tell me to close and relaunch any running Codex sessions so the new MCP server code is loaded.
 
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
@@ -435,20 +466,64 @@ Confirm each step's outcome as you go. If any step fails, stop and ask me how to
 
 ## Uninstall
 
-Two uninstall prompts below — parallel to the install pair. Each is a plain-English prompt you paste into the agent, and the agent removes everything it installed. Each prompt first asks you to confirm the clone path (in case the agent is in a fresh session and doesn't remember where it was cloned to).
+**Ownership split — same rule as Install and Update.** The shared repo, broker, and DB are Claude's to own. Codex only owns its own `~/.codex/config.toml` entry.
+
+- **Both agents installed?** Run BOTH prompts below, in order: Codex-first (pulls only the `config.toml` block so Codex stops trying to launch a server during the next step), then Claude (tears down the shared repo, broker, DB, alias). If you run only one, the other agent will keep trying to launch a now-broken server every time it starts.
+- **Claude only?** Run the Claude prompt. Done.
+- **Codex only?** Run the Codex prompt — it detects you're the sole installer and will do a FULL teardown (including shared repo + DB).
 
 ---
 
-### 🧠 For Claude Code — paste this to uninstall
+### 🤖 For Codex — paste this FIRST if you have both agents installed (config-only teardown)
 
-Open a Claude Code session and paste this verbatim:
+Open a Codex session and paste this verbatim:
 
 ````
-Completely uninstall agent-peers-mcp for me — I want every trace gone.
+Remove the agent-peers MCP wiring from my Codex config. I may or may not still want Claude Code to keep using the shared repo — detect which and act accordingly.
+
+Do NOT wipe anything until you've done this detection step:
+
+1. Check ~/.claude.json for an "agent-peers" MCP entry (either a top-level `agent-peers` block or an mcpServers["agent-peers"] key). Tell me explicitly which case we're in:
+   - CASE A — Claude Code is also wired up: I'm doing a config-only teardown on the Codex side. The shared repo, node_modules, broker, and DB are staying — they belong to Claude Code. My only job is to remove my Codex wiring.
+   - CASE B — Claude Code is NOT wired up (or ~/.claude.json doesn't exist / has no agent-peers entry): I'm the sole installer, so I will do a FULL teardown — config, shared repo, and broker state.
+
+Ask me to confirm which case applies before touching anything. If I confirm CASE A, proceed with steps 2-3 below. If CASE B, proceed with steps 2-6.
+
+STEP 2 (both cases) — Remove the [mcp_servers.agent-peers] block from ~/.codex/config.toml. Keep every other mcp_servers entry and every other section intact. If you are not 100% certain you can surgically edit TOML, FIRST show me the exact block you intend to remove and ask me to confirm before writing.
+
+STEP 3 (CASE A only) — Summarize: tell me "Codex wiring removed. Shared repo at <path> and DB at ~/.agent-peers* are Claude Code's to own — if you want those gone too, run the Claude Code uninstall prompt from the README next." Stop here.
+
+STEP 4 (CASE B only) — Stop the broker:
+   - Run `lsof -t -i:7900` to find broker PIDs.
+   - Kill each one with `kill -TERM <pid>` (SIGKILL after 2s if needed).
+   - Also run `bun cli.ts kill-broker` from inside the repo directory if it still exists.
+
+STEP 5 (CASE B only) — Find and delete the shared repo. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp. If you find more than one or are uncertain, LIST candidates and ASK me before deleting. Remove recursively.
+
+STEP 6 (CASE B only) — Delete all broker state files in my home directory:
+   rm -f ~/.agent-peers.db ~/.agent-peers.db-shm ~/.agent-peers.db-wal ~/.agent-peers-secret
+   rm -rf ~/.agent-peers-codex
+   Run `ls -la ~/.agent-peers* 2>/dev/null || echo 'clean'` to confirm nothing is left.
+
+STEP 7 (CASE B only) — Summarize: list every path/resource you removed and paste the `ls -la ~/.agent-peers* 2>/dev/null || echo 'clean'` output so I can verify.
+
+Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
+````
+
+---
+
+### 🧠 For Claude Code — paste this to uninstall (tears down the shared repo + broker + DB)
+
+Open a Claude Code session and paste this verbatim. **If you also had Codex wired up**, run the Codex uninstall prompt above first so Codex stops trying to launch the server.
+
+````
+Completely uninstall agent-peers-mcp for me — I want every trace gone from the Claude side + the shared state.
 
 Step 1 — find the install directory. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp, or elsewhere under my home directory. If you find more than one candidate, or you're uncertain, LIST the candidates and ASK me which one to remove before proceeding. Do NOT delete anything until I confirm.
 
-Once I confirm the path, do a FULL wipe — do not ask per-item confirmations; just do everything:
+Step 2 — Codex coexistence check. Read ~/.codex/config.toml. If it still contains a [mcp_servers.agent-peers] block, WARN me: "Codex is still wired to this MCP — after I remove the shared repo, Codex will fail to start any new session until you also remove its [mcp_servers.agent-peers] block (run the Codex uninstall prompt). Want me to continue anyway?" Do not auto-edit Codex's config — that's its own prompt's job.
+
+Once I confirm the path (and any warnings), do a FULL wipe — do not ask per-item confirmations; just do everything:
 
 1. Stop any running broker daemon:
    - Run `lsof -t -i:7900` to find the broker PID(s).
@@ -464,48 +539,17 @@ Once I confirm the path, do a FULL wipe — do not ask per-item confirmations; j
 
 4. Delete the cloned repo directory (the exact path I confirmed in Step 1) — remove recursively.
 
-5. Delete ALL broker state files under my home directory. Specifically any file matching `~/.agent-peers*` — this normally means:
+5. Delete ALL broker + Codex-inbox state files under my home directory:
    - ~/.agent-peers.db
    - ~/.agent-peers.db-shm
    - ~/.agent-peers.db-wal
-   Use `rm -f ~/.agent-peers.db ~/.agent-peers.db-shm ~/.agent-peers.db-wal` so missing files don't error. Also run `ls -la ~/.agent-peers* 2>/dev/null` afterwards to confirm nothing is left.
+   - ~/.agent-peers-secret
+   - ~/.agent-peers-codex/ (directory, recursive — holds Codex's durable inbox files)
+   Use `rm -f ~/.agent-peers.db ~/.agent-peers.db-shm ~/.agent-peers.db-wal ~/.agent-peers-secret` and `rm -rf ~/.agent-peers-codex` so missing paths don't error. Also run `ls -la ~/.agent-peers* 2>/dev/null` afterwards to confirm nothing is left.
 
 6. Tell me to run `source ~/.zshrc` (or open a new terminal) so the alias change takes effect.
 
-7. Give me a final summary listing every path and resource you removed, plus anything you couldn't remove and why. Also paste the output of `ls -la ~/.agent-peers* 2>/dev/null || echo 'clean'` so I can see it's fully gone.
-
-Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
-````
-
----
-
-### 🤖 For Codex — paste this to uninstall
-
-Open a Codex session and paste this verbatim:
-
-````
-Completely uninstall agent-peers-mcp for me — I want every trace gone.
-
-Step 1 — find the install directory. Likely locations: ~/Github Repos/agent-peers-mcp, ~/agent-peers-mcp, or elsewhere under my home directory. If you find more than one candidate, or you're uncertain, LIST the candidates and ASK me which one to remove before proceeding. Do NOT delete anything until I confirm.
-
-Once I confirm the path, do a FULL wipe — do not ask per-item confirmations; just do everything:
-
-1. Stop any running broker daemon:
-   - Run `lsof -t -i:7900` to find the broker PID(s).
-   - Kill each one with `kill -TERM <pid>` (or SIGKILL if SIGTERM doesn't work within 2s).
-   - Also run `bun cli.ts kill-broker` from inside the confirmed repo directory if the repo still exists at this point — it's another way to stop the broker.
-
-2. Remove the [mcp_servers.agent-peers] block from ~/.codex/config.toml. Keep every other mcp_servers entry and every other section intact. If you are not 100% certain you can surgically edit TOML, FIRST show me the exact block you intend to remove and ask me to confirm before writing.
-
-3. Delete the cloned repo directory (the exact path I confirmed in Step 1) — remove recursively.
-
-4. Delete ALL broker state files under my home directory. Specifically any file matching `~/.agent-peers*` — this normally means:
-   - ~/.agent-peers.db
-   - ~/.agent-peers.db-shm
-   - ~/.agent-peers.db-wal
-   Use `rm -f ~/.agent-peers.db ~/.agent-peers.db-shm ~/.agent-peers.db-wal` so missing files don't error. Also run `ls -la ~/.agent-peers* 2>/dev/null` afterwards to confirm nothing is left.
-
-5. Give me a final summary listing every path and resource you removed, plus anything you couldn't remove and why. Also paste the output of `ls -la ~/.agent-peers* 2>/dev/null || echo 'clean'` so I can see it's fully gone.
+7. Give me a final summary listing every path and resource you removed, plus anything you couldn't remove and why. Also paste the output of `ls -la ~/.agent-peers* 2>/dev/null || echo 'clean'` so I can see it's fully gone. If I had Codex wired up and I haven't run the Codex uninstall prompt yet, remind me to do that now.
 
 Confirm each step's outcome as you go. If any step fails, stop and ask me how to proceed — don't silently move on.
 ````
