@@ -81,3 +81,27 @@ test("CodexInboxStore reset clears persisted unread messages", async () => {
 
   expect(await store.getUnreadMessages()).toHaveLength(0);
 });
+
+test("CodexInboxStore keeps unread messages in memory when consume persistence fails", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+
+  let shouldFail = false;
+  const store = new CodexInboxStore({
+    peerId: "peer-123",
+    rootDir: dir,
+    persistState: async (path, value) => {
+      if (shouldFail) throw new Error("disk full");
+      const writer = Bun.file(path);
+      await Bun.write(writer, JSON.stringify(value, null, 2));
+    },
+  });
+  await store.init();
+  await store.queueLeasedMessages([message(11), message(12)]);
+
+  shouldFail = true;
+  await expect(store.consumeUnreadMessages()).rejects.toThrow("disk full");
+
+  const unread = await store.getUnreadMessages();
+  expect(unread.map((msg) => msg.id)).toEqual([11, 12]);
+});
