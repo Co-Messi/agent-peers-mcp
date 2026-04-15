@@ -195,7 +195,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Passive trigger to surface pending inbox (same effect as any other tool call; does no extra work).",
+      "Surface peer messages waiting in the inbox. Call this at the START of every user turn — Codex only sees peer messages on the response of an agent-peers tool call, so without this habit, messages sent while you were idle (or working on non-peer tools) wait invisibly. One cheap call.",
     inputSchema: { type: "object" as const, properties: {} },
   },
   {

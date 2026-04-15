@@ -146,7 +146,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Passive helper. Messages from peers arrive automatically via the agent-peers channel push — you normally do not need to call this.",
+      "Surface peer messages received in the last 15 minutes. Call this at the START of every user turn — it is the only reliable way to see messages that arrived while this session was idle at the prompt (Claude Code's channel push silently queues idle deliveries). One cheap call. Without this habit, peer DMs sent while you were idle wait invisibly until something else triggers a redraw.",
     inputSchema: { type: "object" as const, properties: {} },
   },
   {
@@ -392,13 +392,17 @@ async function main() {
           continue;
         }
         try {
+          // Per the channels reference, `meta` is Record<string, string> —
+          // non-string values are silently dropped, and the `source` attribute
+          // is auto-generated from the server name (so passing it here would
+          // be redundant or conflict with the auto-set value). Stringify the
+          // numeric message_id and omit `source`.
           await mcp.notification({
             method: "notifications/claude/channel",
             params: {
               content: m.text,
               meta: {
-                source: "agent-peers",
-                message_id: m.id,
+                message_id: String(m.id),
                 from_id: m.from_id,
                 from_name: m.from_name,
                 from_peer_type: m.from_peer_type,
