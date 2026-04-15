@@ -290,7 +290,21 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
     );
     if ((reclaim.changes ?? 0) > 0) {
       const row = db.query<{ id: string }, [string]>("SELECT id FROM peers WHERE name = ?").get(req.name);
-      if (row) return { id: row.id, name: req.name, session_token };
+      if (row) {
+        // Clear any stale leases on undelivered messages for this peer. The
+        // previous session died mid-delivery — its lease_tokens are now
+        // worthless (the old session_token is gone), so the broker would
+        // otherwise hold those messages for up to LEASE_DURATION_MS before
+        // re-offering them. Clearing on reclaim makes the new session's
+        // first poll return the backlog immediately. Orphan observability
+        // is unaffected (acked=0 rows still show up in cli.ts orphaned-messages
+        // if the reclaimed peer dies again before reading).
+        db.query(
+          `UPDATE messages SET lease_token = NULL, lease_expires_at = NULL
+           WHERE to_id = ? AND acked = 0`
+        ).run(row.id);
+        return { id: row.id, name: req.name, session_token };
+      }
     }
   }
 

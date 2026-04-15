@@ -43,7 +43,7 @@ You're done.
 | Feature | Description |
 |---|---|
 | **Instant Claude ↔ Claude** | Messages arrive mid-task via Claude Code's `claude/channel` push protocol. |
-| **Codex ↔ Codex / Claude ↔ Codex** | Messages piggyback on Codex's next tool call — no polling, zero token waste when idle. |
+| **Codex ↔ Codex / Claude ↔ Codex** | Codex keeps a background-polled local inbox, then surfaces queued messages on the next agent-peers response as a `[PEER INBOX]` block. |
 | **Human-readable names** | Each peer gets a friendly name like `calm-fox`, or set your own via `PEER_NAME=frontend-tab`. Terminal tab titles update automatically so you can tell sessions apart. |
 | **Self-rename** | Any peer can rename itself via the `rename_peer` tool. |
 | **Scoped discovery** | Filter peers by machine, working directory, or git repo. |
@@ -172,7 +172,7 @@ The other session receives it:
 | Recipient | How the message arrives |
 |---|---|
 | **Claude** | Instantly, mid-task, as a `<channel source="agent-peers">` push |
-| **Codex** | In the response of its next tool call, as a `[PEER INBOX]` block |
+| **Codex** | After background polling queues it locally, on the next agent-peers response as a `[PEER INBOX]` block |
 
 ### Step 4 — Actually use it
 
@@ -214,7 +214,7 @@ Run these from inside the cloned `agent-peers-mcp/` directory.
 - **Broker daemon** (`broker.ts`) runs on `localhost:7900` with SQLite at `~/.agent-peers.db`. Auto-launches on first session.
 - **Each session** spawns an MCP server (`claude-server.ts` or `codex-server.ts`) that registers with the broker.
 - **Claude sessions** poll the broker every 1s and push inbound messages via `notifications/claude/channel` → Claude sees the message mid-task.
-- **Codex sessions** piggyback on tool calls: every tool handler's response is prepended with pending peer messages as a `[PEER INBOX]` block. Zero polling overhead when idle.
+- **Codex sessions** also poll every 1s, but instead of a client push channel they store unread messages in a local inbox queue and surface them as a `[PEER INBOX]` block on the next agent-peers response.
 - **Sessions gracefully restart**: if you SIGKILL a session and restart with the same `PEER_NAME` within 60s, the broker reclaims the same UUID and undelivered messages route correctly (at-least-once).
 
 Read the full technical spec at [`docs/superpowers/specs/2026-04-13-agent-peers-mcp-design.md`](docs/superpowers/specs/2026-04-13-agent-peers-mcp-design.md).
@@ -240,8 +240,8 @@ The `agentpeers` alias sets `AGENT_PEERS_ENABLED=1`. Plain `claude` does not, so
 
 **Codex always has peers active** (as long as you included `env = { "AGENT_PEERS_ENABLED" = "1" }` in your `config.toml` entry). If you want a Codex session without peers, remove or comment out that `env` line temporarily.
 
-**Codex only picks up peer messages on its next agent-peers tool call.**
-There is no push channel for Codex; messages surface in the response of the NEXT call to an agent-peers tool (`list_peers`, `send_message`, `set_summary`, `check_messages`, or `rename_peer`). If Codex is busy with other work and doesn't touch agent-peers, incoming messages wait at the broker. Ask Codex "check messages" to force a poll.
+**Codex keeps a local peer inbox warm in the background.**
+There is still no native Codex push channel, so queued peer messages surface on the next response from an agent-peers tool (`list_peers`, `send_message`, `set_summary`, `check_messages`, or `rename_peer`). The difference is that unread messages are already being polled and refreshed in the background, so they wait in Codex's local inbox instead of only at the broker. Ask Codex "check messages" when you want that inbox surfaced immediately.
 
 **Closed tabs disappear from discovery within ~60 seconds.**
 When you close a tab, the shell kills the session without graceful cleanup. The peer row stays in the broker until its heartbeat goes stale (~60s). `list_peers` filters stale peers out of results immediately — you won't see ghost peers there even in that window. If you restart with the same `PEER_NAME` within 60-90s, the broker reclaims the same UUID and any undelivered messages route correctly.
@@ -257,7 +257,7 @@ Make sure at least two sessions are running with the MCP loaded. Run `bun cli.ts
 Kill any old broker: `bun cli.ts kill-broker`. If another process owns the port, set `AGENT_PEERS_PORT=7901` in your env.
 
 **Codex doesn't see the inbox**
-Ask it to call `list_peers` or `check_messages` — messages surface on any MCP tool call, not just specific ones. If you still don't see the `[PEER INBOX]` block, your Codex version may not render tool responses verbatim; file an issue with your Codex version.
+Ask it to call `list_peers` or `check_messages` — messages surface on any agent-peers tool response, not just specific ones. If you still don't see the `[PEER INBOX]` block, your Codex version may not render tool responses verbatim; file an issue with your Codex version.
 
 **Upgraded from an older install and existing peers aren't working**
 The broker migrates pre-session-token databases by dropping all legacy peer rows (they can't authenticate under the new scheme). Restart all your sessions to re-register. Any in-flight messages for the dropped peers are visible via `bun cli.ts orphaned-messages`.

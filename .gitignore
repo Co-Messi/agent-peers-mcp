@@ -8,3 +8,4 @@ bun.lock
 .env
 .env.local
 dist/
+.worktrees/

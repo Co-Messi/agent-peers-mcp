@@ -104,6 +104,41 @@ test("registerPeer reclaims stale peer with same name, preserving UUID and issui
   expect(row.cwd).toBe("/new");
 });
 
+test("registerPeer on reclaim clears stale leases so new session sees backlog immediately", () => {
+  // Sender stays alive; receiver "dies" mid-delivery and is reclaimed.
+  const sender = reg({ name: "sender" });
+  const dying = reg({ name: "doomed" });
+
+  // Sender sends two messages; receiver leases one (but crashes before ack).
+  const s1 = sendMessage(db, {
+    from_id: sender.id, session_token: sender.session_token,
+    to_id_or_name: "doomed", text: "hi",
+  });
+  expect(s1.ok).toBe(true);
+  const leased = pollMessages(db, dying.id, dying.session_token);
+  expect(leased.length).toBe(1);
+  expect(leased[0]!.text).toBe("hi");
+  // A second message arrives AFTER the lease — still unleased.
+  const s2 = sendMessage(db, {
+    from_id: sender.id, session_token: sender.session_token,
+    to_id_or_name: "doomed", text: "second",
+  });
+  expect(s2.ok).toBe(true);
+
+  // Receiver dies (go stale) without acking the lease.
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+    .run("2000-01-01T00:00:00.000Z", dying.id);
+
+  // Another session reclaims the name. Reclaim should clear the stuck lease
+  // so the new session's first poll returns BOTH messages immediately.
+  const reclaimed = reg({ name: "doomed", pid: 777 });
+  expect(reclaimed.id).toBe(dying.id);
+
+  const backlog = pollMessages(db, reclaimed.id, reclaimed.session_token);
+  expect(backlog.length).toBe(2);
+  expect(backlog.map((m) => m.text).sort()).toEqual(["hi", "second"]);
+});
+
 test("registerPeer does NOT reclaim a LIVE peer, falls through to suffix", () => {
   const live = reg({ name: "active" });
   const second = reg({ name: "active" });

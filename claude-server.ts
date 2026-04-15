@@ -30,6 +30,7 @@ import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync } from "./shared/tab-title.ts";
 import { isValidName } from "./shared/names.ts";
+import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId } from "./shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
@@ -65,18 +66,13 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the agent-peers network. Other AI agents on this machine (Claude Code or Codex CLI) can see you and send you messages.
+    instructions: `${COLLEAGUE_PROTOCOL}
 
-IMPORTANT: When you receive a <channel source="agent-peers" ...> message, RESPOND IMMEDIATELY. Pause what you are doing, reply via send_message with the sender's from_id (or from_name), then resume.
-
-On startup, proactively call set_summary with a 1-2 sentence description of your work.
-
-Available tools:
-- list_peers(scope: machine|directory|repo, peer_type?)
-- send_message(to_id, message)  // to_id accepts a peer UUID or a human name
-- set_summary(summary)
-- check_messages  // passive helper; messages arrive automatically via channel
-- rename_peer(new_name)  // renames YOU; 1-32 chars, [a-zA-Z0-9_-]`,
+DELIVERY ON THIS SIDE (Claude Code): peer messages arrive instantly via
+\`<channel source="agent-peers" ...>\` push notifications. You do NOT need
+to poll — \`check_messages\` is a no-op here, kept only for protocol
+symmetry with Codex peers. When you see a channel push, apply the
+REACTIVE rules above.`,
   },
 );
 

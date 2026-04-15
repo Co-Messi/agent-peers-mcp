@@ -1,16 +1,64 @@
 #!/usr/bin/env bun
 // codex-server.ts
-// MCP stdio server for Codex CLI. Registers as peer_type="codex". Uses piggyback
-// delivery: every tool handler polls the broker at entry, prepends any pending
-// peer messages as a [PEER INBOX] block in the response text, and defers the ack
-// to the NEXT tool call (ack-on-next-call pattern, spec §5.5).
+// MCP stdio server for Codex CLI. Registers as peer_type="codex".
+//
+// DELIVERY PIPELINE — two layers with a strict division of labor, driven
+// by one invariant: no message is acked to the broker (nor pruned from
+// the durable queue) until we have evidence the previous tool-response
+// cycle actually completed. That evidence is "Codex called us again."
+//
+//   Layer 1 — Durable on-disk inbox at ~/.agent-peers-codex/<peer-id>.json
+//   ------------------------------------------------------------------
+//   Background poll (POLL_INTERVAL_MS) writes newly-leased messages here.
+//   This is the authoritative persistence layer: messages survive MCP
+//   restart within the 60s reclaim window, and nothing gets pruned until
+//   we're sure the model actually saw it. File perms hardened to 0o600
+//   (dir 0o700) to match the broker's DB trust boundary (see
+//   broker.ts enforceDbFilePerms).
+//
+//   Layer 2 — Authoritative piggyback [PEER INBOX] on tool call
+//   ------------------------------------------------------------------
+//   withPiggyback is the ONLY path that surfaces message CONTENT + reply
+//   cues to the model. It reads (not consumes) from the durable queue,
+//   filters out messages already confirmed delivered, and prepends what's
+//   left as a [PEER INBOX] block in the tool response.
+//
+//   Signal-only preview push (notifications/message)
+//   ------------------------------------------------------------------
+//   A best-effort MCP log notification fires after each background poll
+//   that landed new messages in the queue. It carries ONLY the sender's
+//   name + peer_type and a pointer to the next tool call — no body, no
+//   reply_action. This gives recent Codex CLI versions a "new message
+//   from X arrived, look at your inbox" signal in the live transcript
+//   without duplicating the authoritative delivery. It does NOT update
+//   any dedupe state — the [PEER INBOX] block (Layer 2) is the one and
+//   only "this was shown to the model" trigger.
+//
+// DEDUPE STATE MACHINE (two sets, confirm-on-next-call):
+//
+//   - `presentedPendingConfirm` — message_ids included in the CURRENT
+//     tool response's [PEER INBOX] block but not yet known-delivered.
+//     Populated inside withPiggyback just before return.
+//
+//   - `seen` — message_ids we're SURE reached the model. Populated at
+//     the START of the NEXT tool call (Codex calling us again is the
+//     evidence that the previous response cycle landed). Once a message
+//     is `seen`, we ack its lease, prune it from the durable queue, and
+//     ignore any future re-delivery of the same id.
+//
+// This splits what was previously a single `seen` set that conflated
+// "about to be shown" with "known shown." The earlier code could ack +
+// prune a message whose response was aborted before reaching Codex —
+// silent loss. The split closes that race: a dropped response leaves the
+// message in the durable queue AND outside the `seen` set, so on the
+// next tool call (or the next session after a restart) it re-surfaces.
+// At-least-once per spec §5.4.
 //
 // Shutdown: clear timers and exit. Deliberately do NOT flush pendingAcks
-// (those messages may not have reached Codex yet — flushing on exit would be
-// silent loss). Deliberately do NOT unregister (preserves reclaim-by-name).
-//
-// Dedupe: in-memory seen-set keyed by message_id. Session-local only;
-// at-least-once across restart per spec §5.4.
+// (those messages may not have reached Codex yet — flushing on exit would
+// be silent loss). Deliberately do NOT unregister (preserves
+// reclaim-by-name). Durable queue stays on disk so a restart within the
+// 60s reclaim window picks up exactly where this session left off.
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -25,12 +73,15 @@ import { waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync } from "./shared/tab-title.ts";
-import { formatInboxBlock } from "./shared/piggyback.ts";
+import { formatInboxBlock, formatInboxPreview } from "./shared/piggyback.ts";
+import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
+import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 
 function log(msg: string) {
@@ -50,32 +101,32 @@ let myName: string | null = null;
 let mySession: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let inboxStore: CodexInboxStore | null = null;
+let pollInFlight: Promise<void> | null = null;
 
 const mcp = new Server(
   { name: "agent-peers", version: "0.1.0" },
   {
-    capabilities: { tools: {} },
-    instructions: `You are connected to the agent-peers network — other AI agents on this machine (Claude Code or Codex) can discover you and send you messages.
+    // `logging: {}` enables MCP `notifications/message` — the background
+    // poll loop uses this as a best-effort "preview" push so recent Codex
+    // CLI versions see peer messages mid-task even when no agent-peers
+    // tool call has fired yet. Authoritative delivery still runs through
+    // the durable inbox queue + tool-response [PEER INBOX] block.
+    capabilities: { logging: {}, tools: {} },
+    instructions: `${COLLEAGUE_PROTOCOL}
 
-INBOX HANDLING — IMPORTANT:
-- This MCP does NOT push messages to you. You receive messages ONLY when you call a tool on this server; the response is prepended with a [PEER INBOX] block listing pending peer messages.
-- When the user says things like "wait for a reply", "did I get a message", or is in a collaborative flow with other peers, you MUST call check_messages (or any agent-peers tool) regularly — otherwise peer messages pile up at the broker unseen.
-- Default cadence: after completing every major step of a multi-peer task, call check_messages before moving on. When idle waiting for a reply, call check_messages every few user turns.
-- When you see a [PEER INBOX] block, treat each message like a coworker's Slack message: finish your current step, then respond via send_message(to_id=<from_name>, message="..."). The from_name and message_id are inside the block.
+DELIVERY ON THIS SIDE (Codex): this server keeps a local durable inbox
+refreshed every second from the broker. Peer messages reach you via:
 
-ON STARTUP:
-- Call set_summary once with a 1-2 sentence description of what you are working on.
+  1. A best-effort MCP \`notifications/message\` log push on each poll tick
+     (recent Codex CLI versions surface this into the live transcript).
+  2. A \`[PEER INBOX]\` block prepended to ANY agent-peers tool response —
+     this is the authoritative delivery. When you see the block, apply
+     the REACTIVE rules above.
 
-PEER DISCOVERY:
-- Use list_peers with scope="machine" to see all agents, "directory" for same cwd, "repo" for same git repo.
-- Each peer has a human-readable "name" (e.g. "frontend-tab") and an immutable UUID "id". peer_type is "claude" or "codex".
-
-TOOLS:
-- list_peers(scope, peer_type?)       — also surfaces any pending inbox
-- send_message(to_id, message)        — to_id accepts UUID or name; also surfaces inbox
-- set_summary(summary)                — also surfaces inbox
-- check_messages                      — explicit inbox poll, call this when waiting for replies
-- rename_peer(new_name)               — YOURSELF only; 1-32 chars, [a-zA-Z0-9_-]`,
+Because path (1) is best-effort, whenever you're in a collaborative flow
+or expecting a reply, call \`check_messages\` every 2-3 of your own turns —
+it's free and it flushes the local inbox.`,
   },
 );
 
@@ -132,20 +183,15 @@ const TOOLS = [
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-// Module-level ack-on-next-call state (spec §5.5).
-// pendingAcks holds lease tokens from the PREVIOUS tool call. A subsequent
-// request is a strong heuristic (not proof) that the previous response cycle
-// completed — see spec §5.5 "Residual limitations" for the narrow window this
-// does not fully close. On shutdown we intentionally do NOT flush pendingAcks;
-// let leases expire naturally.
-//
-// Bounded (code review round-2 fix): under repeated ack failure we'd otherwise
-// accumulate unbounded tokens. Cap keeps memory + HTTP payload sane. Oldest
-// tokens are dropped first; they'd have expired leases anyway (30s lease
-// horizon vs cap large enough to cover many minutes of new leases), so the
-// broker would have ack'd them 0 regardless.
 const MAX_PENDING_ACKS = 500;
 const pendingAcks: string[] = [];
+
+// Dedupe state (see top-of-file state-machine comment):
+//   - `presentedPendingConfirm`: messages in the CURRENT response's
+//     [PEER INBOX] block. Promoted to `seen` at the START of the NEXT call.
+//   - `seen`: messages we are SURE reached the model. Only these get their
+//     lease acked + are pruned from the durable queue.
+const presentedPendingConfirm = new Set<number>();
 const seen = new Set<number>();
 
 function enqueueAck(token: string) {
@@ -154,6 +200,108 @@ function enqueueAck(token: string) {
     const drop = pendingAcks.length - MAX_PENDING_ACKS;
     pendingAcks.splice(0, drop);
     log(`pendingAcks trimmed: dropped ${drop} oldest token(s); exceeding cap ${MAX_PENDING_ACKS}`);
+  }
+}
+
+async function pollBrokerIntoQueue(): Promise<void> {
+  if (!myId || !mySession || !inboxStore) return;
+  if (pollInFlight) {
+    await pollInFlight;
+    return;
+  }
+
+  pollInFlight = (async () => {
+    let leased: LeasedMessage[] = [];
+    try {
+      leased = await client.pollMessages({ id: myId!, session_token: mySession! });
+    } catch (e) {
+      log(`poll failed: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+
+    if (leased.length === 0) return;
+
+    // Triage leased messages by dedupe state.
+    const freshlyUnread: LeasedMessage[] = [];
+    for (const message of leased) {
+      if (seen.has(message.id)) {
+        // We're certain the model saw this one already (previous tool
+        // call's piggyback, confirmed by the call after). The lease just
+        // got re-offered because our earlier ack was lost or the lease
+        // expired before ack. Close it now — this is safe because the
+        // model-delivery evidence is already in hand.
+        enqueueAck(message.lease_token);
+      } else if (presentedPendingConfirm.has(message.id)) {
+        // We drew this into the CURRENT response's [PEER INBOX] block but
+        // haven't yet seen the next tool call that would confirm
+        // delivery. DO NOT ack (would silently drop if the response was
+        // lost). DO NOT re-queue in the durable inbox (would make the
+        // piggyback double-surface it within the same call). Just stash
+        // the new lease token so next-call confirm-flush closes both old
+        // + new leases atomically.
+        enqueueAck(message.lease_token);
+      } else {
+        freshlyUnread.push(message);
+      }
+    }
+
+    if (freshlyUnread.length === 0) return;
+
+    // Authoritative persistence FIRST — if this fails, we do not push and
+    // do not ack; next poll tick retries because the lease will expire at
+    // the broker and the message will be re-leased.
+    try {
+      await inboxStore.queueLeasedMessages(freshlyUnread);
+      log(`queued ${freshlyUnread.length} unread peer message(s): ${freshlyUnread.map((msg) => `#${msg.id} from ${msg.from_name}`).join(", ")}`);
+    } catch (e) {
+      log(`failed to persist unread peer messages: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+
+    // Best-effort signal-only preview push. Recent Codex CLI versions
+    // surface MCP log notifications into the live transcript — this
+    // fires a "heads up, message waiting" nudge so the model can decide
+    // whether to interrupt current work or finish first. It carries NO
+    // body and NO reply cues; full content + reply_action live in the
+    // authoritative [PEER INBOX] block in the next tool response. This
+    // split avoids the double-reply risk where the model would see the
+    // same message twice (once via log, once via piggyback) and send two
+    // replies. Failures are non-fatal — the authoritative path still
+    // delivers on the next tool call.
+    for (const m of freshlyUnread) {
+      try {
+        await mcp.notification({
+          method: "notifications/message",
+          params: {
+            level: "info",
+            logger: "agent-peers",
+            // Intentionally body-free: just the sender's identity + a
+            // pointer to where the actual message will appear. No
+            // message text. No reply_action. See formatInboxPreview for
+            // the rationale and the tests in piggyback.test.ts that
+            // guarantee this property.
+            data: formatInboxPreview(m),
+            _meta: {
+              source: "agent-peers",
+              signal_only: true,
+              message_id: m.id,
+              from_id: m.from_id,
+              from_name: m.from_name,
+              from_peer_type: m.from_peer_type,
+              sent_at: m.sent_at,
+            },
+          },
+        });
+      } catch (e) {
+        log(`preview push failed for msg #${m.id} (non-fatal; tool-call will deliver): ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  })();
+
+  try {
+    await pollInFlight;
+  } finally {
+    pollInFlight = null;
   }
 }
 
@@ -167,55 +315,112 @@ async function withPiggyback(
     };
   }
 
-  // 1. Flush previous-call acks. Only now do we know the previous response
-  //    cycle completed (Codex is calling us again).
+  // ------------------------------------------------------------------------
+  // STEP 1a — Unconditional ack flush.
   //
-  // Code review round-1 fix: only remove tokens from pendingAcks on SUCCESSFUL
-  // ack. If the HTTP call throws, keep them so the next call retries instead
-  // of silently waiting for lease expiry (which would cause a guaranteed
-  // duplicate when the message is re-leased + re-injected).
+  // We always attempt to ack every token in pendingAcks, even when
+  // presentedPendingConfirm is empty. pollBrokerIntoQueue's seen-branch
+  // stashes re-lease tokens for messages we already confirmed delivered
+  // — those must be flushed even in tool calls that don't draw any new
+  // inbox items, otherwise the broker re-leases the row forever and it
+  // never transitions to acked=1 (perpetually-unacked zombie row per
+  // codex review PR #2 round 2).
+  //
+  // Tokens are removed from pendingAcks only on HTTP success; an
+  // exception leaves them for the next call to retry. HTTP success with
+  // `acked: 0` at the broker (stale tokens) still counts — the next
+  // re-lease will land new tokens in pendingAcks via the seen-branch,
+  // and this flush will eventually succeed against the current lease.
   if (pendingAcks.length > 0) {
     const toFlush = pendingAcks.slice();
     try {
-      await client.ackMessages({ id: myId, session_token: mySession, lease_tokens: toFlush });
-      // Remove only after success. Use splice by indices-of-toFlush to be
-      // robust against concurrent appends (though withPiggyback is strictly
-      // serialized per tool call, so this is defense in depth).
+      await client.ackMessages({
+        id: myId, session_token: mySession, lease_tokens: toFlush,
+      });
       for (const tok of toFlush) {
         const idx = pendingAcks.indexOf(tok);
         if (idx !== -1) pendingAcks.splice(idx, 1);
       }
     } catch (e) {
-      log(`pending ack flush failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
+      log(`ack flush failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
-  // 2. Poll for new messages.
-  let leased: LeasedMessage[] = [];
+  // ------------------------------------------------------------------------
+  // STEP 1b — Confirm-promote: items drawn into the PREVIOUS response
+  // are now (with Codex calling us again as evidence) known to have
+  // reached the model. Prune them from the durable queue and move their
+  // ids into `seen`. Pruning can fail independently of the ack above
+  // (disk I/O vs broker HTTP); if it does we keep the items in
+  // presentedPendingConfirm and retry next call. Partial promotion is
+  // not allowed — would re-open the silent-loss window.
+  if (presentedPendingConfirm.size > 0) {
+    const confirming = [...presentedPendingConfirm];
+    try {
+      if (inboxStore) await inboxStore.removeByIds(confirming);
+      for (const id of confirming) {
+        seen.add(id);
+        presentedPendingConfirm.delete(id);
+      }
+    } catch (e) {
+      log(`confirm-flush queue-prune failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // STEP 2 — Inline poll so we pick up anything that arrived in the last
+  // POLL_INTERVAL_MS window. Background loop does the same thing on a
+  // timer; calling it here collapses the worst-case "message landed 0.99s
+  // before this tool call" tail.
   try {
-    leased = await client.pollMessages({ id: myId, session_token: mySession });
-    if (leased.length > 0) {
-      log(`piggyback poll leased ${leased.length} message(s): ${leased.map((m) => `#${m.id} from ${m.from_name}`).join(", ")}`);
-    }
+    await pollBrokerIntoQueue();
   } catch (e) {
-    log(`poll failed: ${e instanceof Error ? e.message : String(e)}`);
+    log(`inline poll failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  // 3. Partition polled messages into fresh vs re-delivery.
+  // ------------------------------------------------------------------------
+  // STEP 3 — Read (do NOT consume) the durable queue. Items stay on disk
+  // until the NEXT call's confirm-flush promotes them to `seen` and
+  // removes them. A dropped response thus leaves the message in place
+  // for re-delivery, fixing the silent-loss race the codex-reviewer bot
+  // flagged on PR #2 round 1.
+  let queued: LeasedMessage[] = [];
+  try {
+    queued = inboxStore ? await inboxStore.getUnreadMessages() : [];
+  } catch (e) {
+    log(`failed to read unread peer messages: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  // Filter out anything already confirmed delivered (defensive — the
+  // durable queue shouldn't contain `seen` ids, but pollBrokerIntoQueue's
+  // seen-branch guarantees it) and anything we already drew into an
+  // earlier-but-unconfirmed response (presentedPendingConfirm). The
+  // latter can happen if the previous call's confirm-flush partially
+  // failed above; we want to keep showing the same items until flush
+  // succeeds, not start dealing duplicates.
   const fresh: LeasedMessage[] = [];
-  for (const m of leased) {
-    if (seen.has(m.id)) {
-      // Re-delivery after lost ack. Queue lease token for next-call ack so the
-      // broker can finally close the stuck lease. Do NOT re-inject.
-      enqueueAck(m.lease_token);
-    } else {
-      fresh.push(m);
-      seen.add(m.id);
-      enqueueAck(m.lease_token);
+  for (const m of queued) {
+    if (seen.has(m.id)) continue;
+    if (presentedPendingConfirm.has(m.id)) {
+      // Already showed this in an earlier response whose confirm-flush
+      // hasn't completed yet. Skip re-drawing — the earlier presentation
+      // is still the one we're waiting to confirm.
+      continue;
     }
+    fresh.push(m);
   }
 
-  // 4. Run the tool's own logic.
+  // Mark fresh items as "presented this call, awaiting confirm" and
+  // stash their lease tokens for the NEXT call's confirm-flush. This is
+  // the single write point where a message transitions from "sitting in
+  // queue" to "shown to the model."
+  for (const m of fresh) {
+    presentedPendingConfirm.add(m.id);
+    enqueueAck(m.lease_token);
+  }
+
+  // ------------------------------------------------------------------------
+  // STEP 4 — Run the tool handler + build the response.
   let toolText = "";
   let toolError: boolean | undefined;
   try {
@@ -227,7 +432,6 @@ async function withPiggyback(
     toolError = true;
   }
 
-  // 5. Return response with inbox prepended. Ack happens on the NEXT call.
   const inbox = formatInboxBlock(fresh);
   const finalText = inbox + toolText;
   return { content: [{ type: "text", text: finalText }], isError: toolError };
@@ -370,6 +574,8 @@ async function main() {
   myId = reg.id;
   myName = reg.name;
   mySession = reg.session_token;
+  inboxStore = new CodexInboxStore({ peerId: myId });
+  await inboxStore.init();
   setTabTitle(`peer:${myName}`);
   log(`Registered as ${myName} (id=${myId})`);
 
@@ -384,6 +590,17 @@ async function main() {
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
+  let pollStopped = false;
+  let pollTickTimer: ReturnType<typeof setTimeout> | null = null;
+  const scheduleNextPoll = () => {
+    if (pollStopped) return;
+    pollTickTimer = setTimeout(async () => {
+      try { await pollBrokerIntoQueue(); }
+      finally { scheduleNextPoll(); }
+    }, POLL_INTERVAL_MS);
+  };
+  scheduleNextPoll();
+
   const hb = setInterval(async () => {
     if (myId && mySession) {
       try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
@@ -395,6 +612,8 @@ async function main() {
   // unregister (preserves reclaim-by-name window). Timer cleanup only.
   lifecycleCleanup = async () => {
     clearInterval(hb);
+    pollStopped = true;
+    if (pollTickTimer) clearTimeout(pollTickTimer);
   };
   // Note: all signal handlers + 'exit' handler are already armed at the top
   // of main(), before any setTabTitle() call — so a terminal close during
