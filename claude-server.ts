@@ -29,6 +29,8 @@ import { waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
+import { formatInboxBlock } from "./shared/piggyback.ts";
+import { recordDelivered, getRecentDelivered } from "./shared/recent-delivered.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId } from "./shared/types.ts";
@@ -59,6 +61,10 @@ let mySession: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
+// The recent-delivered ring buffer is the backfill surface for check_messages.
+// See shared/recent-delivered.ts for the full rationale. Extracted out of this
+// file so the behavior (retention, TTL, cap) is unit-testable in isolation.
+
 const mcp = new Server(
   { name: "agent-peers", version: "0.1.0" },
   {
@@ -68,11 +74,36 @@ const mcp = new Server(
     },
     instructions: `${COLLEAGUE_PROTOCOL}
 
-DELIVERY ON THIS SIDE (Claude Code): peer messages arrive instantly via
-\`<channel source="agent-peers" ...>\` push notifications. You do NOT need
-to poll — \`check_messages\` is a no-op here, kept only for protocol
-symmetry with Codex peers. When you see a channel push, apply the
-REACTIVE rules above.`,
+DELIVERY ON THIS SIDE (Claude Code):
+
+There are TWO surfaces for peer messages on your side, and you need
+to use both:
+
+  1. LIVE channel push (\`<channel source="agent-peers" ...>\`):
+     Messages arrive instantly this way when a peer sends something
+     WHILE you are actively in a turn. Treat these the moment you see
+     them — apply the REACTIVE rules above (investigate first, reply
+     only when substantive, push back on disagreement).
+
+  2. BACKFILL via \`check_messages\`:
+     When a peer sends a message while this session is IDLE at the
+     prompt, Claude Code queues the channel push — the model doesn't
+     see it until the next turn begins, and it may not render
+     visibly even then. Calling \`check_messages\` returns a
+     [PEER INBOX] block containing every peer message received in
+     the last 15 minutes, so nothing gets lost to idle-queue silence.
+
+RULE: Call \`check_messages\` as the FIRST thing you do at the START of
+every user turn. This is the same rule Codex uses. It's one cheap
+tool call. It surfaces anything that arrived while you were idle.
+Without this habit, a peer DM sent while you were at the prompt
+waits invisibly until something else happens to trigger a redraw.
+
+Exception: you do NOT need to call \`check_messages\` again within the
+same turn — once per turn is enough. If the user sent you a task
+right after a peer message arrived mid-task, you've already seen it
+via the live channel push, and check_messages will just re-show the
+same thing.`,
   },
 );
 
@@ -184,15 +215,33 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "check_messages": {
-      // Deliberately do NOT poll+ack inside this handler (spec §5.4).
-      // That would ack before the tool response is confirmed delivered to Claude.
-      // The background pollAndPush loop owns delivery + ack via the channel push
-      // path, which is the one place ack actually fires and is gated on
-      // successful mcp.notification() resolution.
+      // BACKFILL: return whatever the background poll has recorded in the
+      // ring buffer. This is Claude's equivalent of Codex's [PEER INBOX]
+      // piggyback — the single reliable surface for "what peer messages
+      // have I received recently?" We keep the buffer independent of the
+      // broker (broker already acked those messages) so the user can
+      // always retrieve recent peer activity even when Claude Code's
+      // channel push was silently queued (which happens when the
+      // session was idle at the prompt).
+      //
+      // Dedupe is the model's job: each entry includes message_id, and
+      // the colleague protocol says "don't re-reply to something you
+      // already replied to." So repeated check_messages calls within
+      // the 15-min TTL window are safe — they show the same messages,
+      // Claude just won't re-respond to ones it already handled.
+      const recent = getRecentDelivered();
+      if (recent.length === 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "No peer messages in the last 15 minutes. (Messages also arrive live mid-turn via the agent-peers channel when a peer sends something while you're active — this tool is the fallback for messages that arrived while this session was idle at the prompt.)",
+          }],
+        };
+      }
       return {
         content: [{
           type: "text" as const,
-          text: "Messages arrive automatically via the agent-peers channel. If you have not seen one recently, none are pending.",
+          text: formatInboxBlock(recent),
         }],
       };
     }
@@ -255,6 +304,14 @@ async function main() {
   process.on("SIGQUIT", earlyKillHandler);
   process.on("exit", clearTabTitleSync);
 
+  // Write a placeholder title + arm the keepalive BEFORE register() so
+  // there's no "node" window between MCP-spawn and peer-registered.
+  // The post-register setTabTitle(`peer:${myName}`) overwrites this
+  // placeholder with the real name. Fixes the bug where fresh sessions
+  // showed "node" for 3-5s (the time register + generateSummary takes).
+  setTabTitle("peer:starting");
+  startTabTitleKeepalive();
+
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
   await ensureBroker(isBrokerAlive, brokerScriptUrl);
   // Now that the broker is up, read the per-user shared secret it wrote into
@@ -297,11 +354,9 @@ async function main() {
   myName = reg.name;
   mySession = reg.session_token;
   setTabTitle(`peer:${myName}`);
-  // Keep re-asserting the title every few seconds. Terminals like iTerm2
-  // periodically overwrite the title with the running process name
-  // ("node" / "bun"), so a one-shot OSC write at startup decays. See
-  // shared/tab-title.ts for the rationale.
-  startTabTitleKeepalive();
+  // Note: keepalive was already armed earlier in main(), before register().
+  // The setTabTitle above just updates `lastTitle`; the running keepalive
+  // will re-assert the new name on its next tick (≤1s).
   log(`Registered as ${myName} (id=${myId})`);
 
   // Late summary upload if generation took longer than 3s.
@@ -354,9 +409,19 @@ async function main() {
             },
           });
           // Mark delivered in seen BEFORE queueing the ack so a later ack
-          // failure cannot cause a re-push within this session.
+          // failure cannot cause a re-push within this session. Also
+          // record in the recent-delivered ring buffer so check_messages
+          // can surface it if Claude Code silently queued the channel
+          // push (e.g. session was idle at the prompt).
           seen.add(m.id);
+          recordDelivered(m);
           toAck.push(m.lease_token);
+          // Visible proof-of-delivery in stderr so a live operator can
+          // tell from the log alone whether the push fired. Claude Code's
+          // rendering is opaque to us (especially in idle-at-prompt
+          // cases), so having a hard "yes, we pushed it" line in
+          // stderr is the one debug signal that always works.
+          log(`📬 pushed channel msg #${m.id} from ${m.from_name} (${m.from_peer_type}): ${m.text.slice(0, 80)}${m.text.length > 80 ? "…" : ""}`);
         } catch (e) {
           log(`push failed (lease will expire + redeliver): ${e instanceof Error ? e.message : String(e)}`);
         }

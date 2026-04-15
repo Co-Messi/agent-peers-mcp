@@ -273,14 +273,19 @@ The `agentpeers` alias sets `AGENT_PEERS_ENABLED=1`. Plain `claude` does not, so
 
 **Codex always has peers active** (as long as you included `env = { "AGENT_PEERS_ENABLED" = "1" }` in your `config.toml` entry). If you want a Codex session without peers, remove or comment out that `env` line temporarily.
 
-**Codex has no mid-task MCP push, so `check_messages` runs at the start of every user turn.**
-[OpenAI Codex CLI v0.120 docs](https://github.com/openai/codex/blob/main/docs/config.md) list `tools` as the only supported MCP feature — resources, prompts, and `notifications/message` are not surfaced to the model. The shared colleague prompt therefore tells Codex to call `check_messages` before responding to any user prompt. Worst-case delivery latency is one of your turns. If you want it surfaced immediately, just type "check messages" or "did I get anything from claude?" — either triggers the poll.
+**Idle sessions don't auto-reply — they see messages on their next turn.**
+Both Claude and Codex process peer messages **during turns**, not while idle at the prompt. If you send a message to a peer who is sitting at an empty prompt, they won't magically reply — their session will surface the message on its next user turn (when you type something, or ask them to "check messages"). This is a hard constraint of both Claude Code and Codex CLI, not a bug in this server — neither client exposes a way for an MCP server to trigger a turn from outside.
 
-**The background `notifications/message` preview is dormant on current Codex.**
-We still emit it every poll tick as future-compatible plumbing. When a future Codex CLI adds MCP log-notification surfacing to the model, it'll light up automatically with no code change. Today it's a no-op you can safely ignore.
+What we do to make this as painless as possible: **both agents are instructed to call `check_messages` at the start of every user turn.** Claude additionally has the live `<channel source="agent-peers" ...>` push path for mid-turn arrivals. So the worst-case lag is "one of your own user turns" — type "hi" or "what's new" to a quiet peer and any pending messages surface in their first response.
 
-**Tab title ("peer:calm-fox") is re-asserted every 3 seconds.**
-Most terminals (iTerm2, Terminal.app, Ghostty, Warp) track the running foreground process and periodically overwrite the tab title with the binary name ("node" / "bun"). A one-shot OSC title write at startup therefore decays within seconds. The MCP server runs a lightweight keepalive that re-writes the title every 3s so `peer:<name>` stays visible for the whole session. Low overhead — 30 bytes to `/dev/tty` every 3s. Disable with `AGENT_PEERS_DISABLE_TAB_TITLE=1` if you prefer to manage tab titles yourself.
+**`check_messages` works on BOTH agents and returns the same `[PEER INBOX]` framing.**
+On Codex, it drains the durable on-disk queue. On Claude, it drains an in-memory ring buffer (last 15 min, max 50 messages) populated by the background channel-push loop. On either side, it's the reliable "give me my inbox" button. Just type "check messages" whenever you want to see what peers have sent.
+
+**On Codex, the `notifications/message` preview is dormant.**
+[OpenAI Codex CLI v0.120 docs](https://github.com/openai/codex/blob/main/docs/config.md) list `tools` as the only supported MCP feature — resources, prompts, and `notifications/message` are not surfaced to the model. We still emit the preview every poll tick as future-compatible plumbing. When a future Codex CLI adds MCP log-notification surfacing, it'll light up automatically with no code change. Today it's a no-op you can safely ignore.
+
+**Tab title ("peer:calm-fox") is re-asserted every 1 second via OSC 0/1/2.**
+Most terminals (iTerm2, Terminal.app, Ghostty, Warp) track the running foreground process and periodically overwrite the tab title with the binary name ("node" / "bun"). A one-shot OSC write at startup therefore decays. The MCP server runs a lightweight keepalive that writes OSC 0 (window+icon title), OSC 1 (icon/tab title — what iTerm2 uses for tabs), and OSC 2 (window title) every 1s so `peer:<name>` stays visible. If your terminal is configured with a hardcoded title source (e.g. iTerm2 "Profile → General → Title" overriding application writes), we can't win — set `AGENT_PEERS_DISABLE_TAB_TITLE=1` to opt out of the keepalive entirely.
 
 **Closed tabs disappear from discovery within ~60 seconds, but the backlog isn't stranded.**
 When you close a tab, the shell kills the session without graceful cleanup. The peer row stays in the broker until its heartbeat goes stale (~60s). `list_peers` filters stale peers out of results immediately — you won't see ghost peers there even in that window. If you restart with the same `PEER_NAME` within 60-90s, the broker reclaims the same UUID AND clears any stale leases for that peer, so the new session picks up undelivered backlog on its first poll instead of waiting up to 30s for leases to expire. Codex additionally persists its durable inbox on disk, so messages sitting on a reclaimed session are replayed even if they were drawn but not yet confirmed delivered.

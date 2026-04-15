@@ -565,6 +565,12 @@ async function main() {
   process.on("SIGQUIT", earlyKillHandler);
   process.on("exit", clearTabTitleSync);
 
+  // Write a placeholder title + arm the keepalive BEFORE register() so
+  // there's no "node" window between MCP-spawn and peer-registered.
+  // The post-register setTabTitle(`peer:${myName}`) overwrites this.
+  setTabTitle("peer:starting");
+  startTabTitleKeepalive();
+
   const brokerScriptUrl = new URL("./broker.ts", import.meta.url).href;
   await ensureBroker(isBrokerAlive, brokerScriptUrl);
   const sharedSecret = await waitForSharedSecret();
@@ -605,11 +611,9 @@ async function main() {
   inboxStore = new CodexInboxStore({ peerId: myId });
   await inboxStore.init();
   setTabTitle(`peer:${myName}`);
-  // Keep re-asserting the title every few seconds. Terminals like iTerm2
-  // periodically overwrite the title with the running process name
-  // ("node" / "bun"), so a one-shot OSC write at startup decays. See
-  // shared/tab-title.ts for the rationale.
-  startTabTitleKeepalive();
+  // Note: keepalive was already armed earlier in main(), before register().
+  // The setTabTitle above just updates `lastTitle`; the running keepalive
+  // will re-assert the new name on its next tick (≤1s).
   log(`Registered as ${myName} (id=${myId})`);
 
   if (!initialSummary) {
