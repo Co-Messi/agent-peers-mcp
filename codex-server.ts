@@ -72,7 +72,7 @@ import { ensureBroker } from "./shared/ensure-broker.ts";
 import { waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
-import { setTabTitle, clearTabTitle, clearTabTitleSync } from "./shared/tab-title.ts";
+import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
 import { formatInboxBlock, formatInboxPreview } from "./shared/piggyback.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
@@ -107,26 +107,54 @@ let pollInFlight: Promise<void> | null = null;
 const mcp = new Server(
   { name: "agent-peers", version: "0.1.0" },
   {
-    // `logging: {}` enables MCP `notifications/message` — the background
-    // poll loop uses this as a best-effort "preview" push so recent Codex
-    // CLI versions see peer messages mid-task even when no agent-peers
-    // tool call has fired yet. Authoritative delivery still runs through
-    // the durable inbox queue + tool-response [PEER INBOX] block.
+    // `logging: {}` enables MCP `notifications/message`. Current (v0.120)
+    // Codex CLI does NOT surface these to the model — confirmed via the
+    // official docs at github.com/openai/codex/docs/config.md which list
+    // only `tools` as a supported MCP feature. We keep the capability +
+    // keep sending the preview pushes as future-compatible plumbing, but
+    // the authoritative delivery channel is the [PEER INBOX] block in
+    // tool responses (Codex's only MCP input surface). The prompt above
+    // instructs Codex to call `check_messages` at the start of every
+    // user turn to keep delivery latency bounded by one user turn
+    // instead of "until Codex happens to call an agent-peers tool."
     capabilities: { logging: {}, tools: {} },
     instructions: `${COLLEAGUE_PROTOCOL}
 
-DELIVERY ON THIS SIDE (Codex): this server keeps a local durable inbox
-refreshed every second from the broker. Peer messages reach you via:
+DELIVERY ON THIS SIDE (Codex) — READ CAREFULLY, THIS IS LOAD-BEARING:
 
-  1. A best-effort MCP \`notifications/message\` log push on each poll tick
-     (recent Codex CLI versions surface this into the live transcript).
-  2. A \`[PEER INBOX]\` block prepended to ANY agent-peers tool response —
-     this is the authoritative delivery. When you see the block, apply
-     the REACTIVE rules above.
+The current Codex CLI does NOT surface mid-task MCP push notifications
+to the model. That means you do not see peer messages the instant they
+arrive — you only see them when YOU call an agent-peers tool. A peer
+can send you a DM at 10:00; if you don't touch agent-peers until 10:20,
+you won't know about it until 10:20. This is a hard constraint of the
+Codex runtime, not a bug in this server.
 
-Because path (1) is best-effort, whenever you're in a collaborative flow
-or expecting a reply, call \`check_messages\` every 2-3 of your own turns —
-it's free and it flushes the local inbox.`,
+RULE: Call \`check_messages\` as the FIRST thing you do every time the
+user sends you a message. It is one cheap tool call. It surfaces any
+pending peer inbox as a \`[PEER INBOX]\` block prepended to the
+response. Without this habit, peer messages pile up for minutes or
+hours before you notice them — and the "colleague" experience
+collapses into "broken chat."
+
+Exceptions: you do NOT need to call \`check_messages\` before:
+  - calling another agent-peers tool in the same turn (they all surface
+    the inbox too — \`list_peers\`, \`send_message\`, \`set_summary\`,
+    and \`rename_peer\` all prepend \`[PEER INBOX]\` if there is one)
+  - running a long sequence of file-editing / shell tools where you
+    have no reason to expect a peer interaction. Even then, call
+    \`check_messages\` again at the start of the next user turn.
+
+DELIVERY CHANNELS:
+
+  1. \`[PEER INBOX]\` block prepended to ANY agent-peers tool response.
+     This is the AUTHORITATIVE delivery — full message body, sender
+     identity, reply instructions. When you see it, apply the REACTIVE
+     rules above.
+
+  2. A best-effort MCP \`notifications/message\` log push also fires
+     on each background poll tick, but current Codex CLI does not
+     expose these to the model. Treat the [PEER INBOX] block as your
+     only input. Path (2) is future-compatible plumbing.`,
   },
 );
 
@@ -577,6 +605,11 @@ async function main() {
   inboxStore = new CodexInboxStore({ peerId: myId });
   await inboxStore.init();
   setTabTitle(`peer:${myName}`);
+  // Keep re-asserting the title every few seconds. Terminals like iTerm2
+  // periodically overwrite the title with the running process name
+  // ("node" / "bun"), so a one-shot OSC write at startup decays. See
+  // shared/tab-title.ts for the rationale.
+  startTabTitleKeepalive();
   log(`Registered as ${myName} (id=${myId})`);
 
   if (!initialSummary) {

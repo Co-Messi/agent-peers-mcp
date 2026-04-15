@@ -46,7 +46,7 @@ Brief. Substantive. Initiative on both sides. No spam. That's the whole pitch.
 | | |
 |---|---|
 | 🧠 → 🧠 **Claude ↔ Claude** | Messages arrive mid-task via Claude's native `claude/channel` push. Instant. |
-| 🤖 → 🤖 / 🧠 → 🤖 **Claude ↔ Codex** | Codex polls the broker every 1s and persists unread messages to a durable local inbox. Full content surfaces as a `[PEER INBOX]` block in the next agent-peers tool response. A signal-only MCP log preview also fires mid-task on Codex builds that surface them. |
+| 🤖 → 🤖 / 🧠 → 🤖 **Claude ↔ Codex** | Current Codex CLI (v0.120, Apr 2026) has no mid-task push channel for MCP servers, so Codex picks up peer messages on the next agent-peers tool call — its shared instructions tell it to call `check_messages` at the start of every user turn, which bounds delivery latency to one user turn. Background poll (1s) and a durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600) mean Codex never loses a message even across restart. A signal-only `notifications/message` preview also fires per poll as future-compatible plumbing for whenever Codex CLI adds MCP log surfacing. |
 | 👥 **Colleague behavior protocol** | Shared prompt imported by both servers: don't auto-reply "got it", investigate before answering, push back on disagreement, ping proactively when you find something the other peer cares about, close every loop. |
 | 🏷️ **Friendly names** | Random `calm-fox` by default, or `PEER_NAME=frontend-tab` for a stable one. Your terminal tab renames itself so you can tell sessions apart at a glance. Peers can rename themselves mid-session. |
 | 🔍 **Scoped discovery** | `list_peers` with scope `machine` / `directory` / `repo`. Agents find relevant peers without a global cloud directory. |
@@ -58,20 +58,19 @@ Brief. Substantive. Initiative on both sides. No spam. That's the whole pitch.
 
 ## Install
 
-**Important — ownership split.** The repo folder, `node_modules`, the broker, and the SQLite DB at `~/.agent-peers.db` are **shared** between any Claude and Codex sessions on this machine. To avoid races (both agents cloning at once, both running `bun install`, both trying to own the broker) responsibilities are split:
+**Ownership split (applies to install, update, AND uninstall).** The repo folder, `node_modules`, the broker daemon, and the SQLite DB at `~/.agent-peers.db` are **shared** between any Claude and Codex sessions on this machine. Claude owns all that shared state. Codex owns only its own `~/.codex/config.toml` entry. If you run prompts from both agents concurrently without this split, they'll race on `git clone`, `bun install`, `rm -rf`, and broker kill — real risk of corrupted install.
 
-- **Claude Code prompt** = the **primary** install. Owns all shared state: clones the repo, runs `bun install`, registers Claude's MCP with `claude mcp add`, writes the `agentpeers` alias.
-- **Codex prompt** = a **wire-only** install. It only writes the `[mcp_servers.agent-peers]` block to `~/.codex/config.toml`. It does **not** clone, it does **not** `bun install`, and it does **not** touch the broker or DB — those belong to Claude.
+**Pick your case — exact steps differ:**
 
-Pick your path:
+| Your setup | What to run | Order |
+|---|---|---|
+| 🧠 **Claude only** (no Codex) | Claude install prompt | 1 step |
+| 🧠 **+** 🤖 **Both Claude and Codex** | Claude install prompt, then Codex wire-only prompt | Claude FIRST (sets up shared repo), then Codex (writes config.toml only) |
+| 🤖 **Codex only** (no Claude) | Manual clone, then Codex wire-only prompt | 1. Shell: `git clone https://github.com/Co-Messi/agent-peers-mcp.git ~/agent-peers-mcp && cd ~/agent-peers-mcp && bun install` — 2. Paste the Codex wire-only prompt |
 
-- **Both Claude and Codex active?** Run the Claude prompt FIRST (it sets up the shared repo + deps). Then run the Codex prompt — it auto-detects the install path Claude chose.
-- **Claude only?** Run the Claude prompt. Done.
-- **Codex only, no Claude?** You need to set up the shared repo manually first. One-liner:
-  ```bash
-  git clone https://github.com/Co-Messi/agent-peers-mcp.git ~/agent-peers-mcp && cd ~/agent-peers-mcp && bun install
-  ```
-  Then run the Codex prompt below — it'll find `~/agent-peers-mcp` and wire your config.toml.
+> **Why Claude-first when you have both:** the Codex wire-only prompt refuses to proceed if it can't find the already-cloned repo + deps. It will not `git clone` or `bun install`, because those are Claude's to own.
+
+> **What the Codex wire-only prompt does:** reads `~/Github Repos/agent-peers-mcp` or `~/agent-peers-mcp` to find the existing install, then appends a single `[mcp_servers.agent-peers]` block to `~/.codex/config.toml`. That's the entire write. It does NOT touch the broker, DB, shared secret, or any file outside `~/.codex/config.toml`.
 
 ---
 
@@ -197,8 +196,8 @@ You should see the other. Then:
 
 What happens on the receiving side:
 
-- **Claude** sees it **instantly**, mid-task, via a `<channel source="agent-peers">` push.
-- **Codex** persists it to its local inbox within 1 second and fires a `notifications/message` preview. The full `[PEER INBOX]` block lands on Codex's next agent-peers tool response (call `check_messages` if you want it surfaced right now).
+- **Claude** sees it **instantly**, mid-task, via a `<channel source="agent-peers">` push. No manual action.
+- **Codex** (v0.120, Apr 2026) has no mid-task MCP push, so peer messages land on Codex's **next agent-peers tool call**. The shared instructions tell Codex to call `check_messages` at the start of every user turn — so the worst-case lag is one of your turns, not "until Codex happens to think of it." You can also just type "check messages" to force it.
 
 ### Step 4 — Real use
 
@@ -242,10 +241,11 @@ Run these from inside the cloned `agent-peers-mcp/` directory.
 - **Broker daemon** (`broker.ts`) runs on `localhost:7900` with SQLite at `~/.agent-peers.db`. Auto-launches on first session. DB + WAL sidecars are 0o600, per-user shared secret at `~/.agent-peers-secret` (also 0o600) authenticates peer HTTP calls.
 - **Each session** spawns an MCP server (`claude-server.ts` or `codex-server.ts`) that registers with the broker and receives a rotating session token.
 - **Claude sessions** poll the broker every 1s and push inbound messages via `notifications/claude/channel` → Claude sees the message mid-task.
-- **Codex sessions** have no native push channel, so they run a two-layer delivery pipeline:
+- **Codex sessions** have no mid-task MCP push channel ([OpenAI Codex docs list `tools` as the only supported MCP feature](https://github.com/openai/codex/blob/main/docs/config.md) — resources, prompts, and `notifications/message` aren't surfaced). So Codex runs a two-layer delivery pipeline plus a prompt-level nudge:
   1. **Background poll (1s)** writes each new leased message to a durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600 file, 0o700 dir, fail-closed perm check on read). Crash/restart safe.
-  2. **Best-effort signal-only preview** fires an MCP `notifications/message` log event on each tick — carries sender name + peer_type + a pointer to where the authoritative delivery lands. No message body, no reply instructions (prevents the double-reply risk if both channels render to the model).
-  3. **Authoritative `[PEER INBOX]` block** is prepended to the NEXT agent-peers tool response. This is the single source of truth for the model — full body, reply hints, sender metadata, and per-message ids.
+  2. **Authoritative `[PEER INBOX]` block** is prepended to the NEXT agent-peers tool response. This is the **only** delivery path the Codex model sees. Full body, reply hints, sender metadata, per-message ids.
+  3. **Prompt-level nudge:** the shared colleague instructions tell Codex to call `check_messages` at the start of every user turn. This bounds delivery latency to one user turn — the pragmatic answer to "Codex CLI doesn't support MCP push."
+  4. **Signal-only `notifications/message` preview** also fires per poll tick — but current Codex CLI silently drops log notifications, so this is dormant future-compatible plumbing. When Codex adds MCP log surfacing, the preview will light up automatically.
 - **Confirm-on-next-call dedupe.** Codex uses a two-set state machine: `presentedPendingConfirm` (drawn into current response, not yet known-delivered) + `seen` (confirmed delivered). Messages only transition to `seen` (+ get acked + get pruned from disk) at the START of the NEXT tool call, which proves the previous response cycle completed. Dropped MCP responses don't silently lose messages — they re-surface on the next call or after a session restart.
 - **Shared colleague protocol.** Both servers import the same `COLLEAGUE_PROTOCOL` string from `shared/colleague-prompt.ts`, so Claude and Codex can't drift on reactive/proactive/maintenance behavior.
 - **Sessions gracefully restart.** If you SIGKILL a session and restart with the same `PEER_NAME` within 60s, the broker reclaims the same UUID AND clears stale leases for that peer so the new session sees any undelivered backlog on its first poll (instead of waiting 30s for leases to expire).
@@ -273,11 +273,14 @@ The `agentpeers` alias sets `AGENT_PEERS_ENABLED=1`. Plain `claude` does not, so
 
 **Codex always has peers active** (as long as you included `env = { "AGENT_PEERS_ENABLED" = "1" }` in your `config.toml` entry). If you want a Codex session without peers, remove or comment out that `env` line temporarily.
 
-**Codex keeps a local peer inbox warm in the background.**
-There is still no native Codex push channel, so authoritative delivery happens on the next response from an agent-peers tool (`list_peers`, `send_message`, `set_summary`, `check_messages`, or `rename_peer`). Background polling (1s) keeps the local inbox at `~/.agent-peers-codex/<peer-id>.json` fresh, and a signal-only `notifications/message` preview fires when new messages land — "heads up, message from X waiting." Ask Codex "check messages" when you want the inbox surfaced immediately.
+**Codex has no mid-task MCP push, so `check_messages` runs at the start of every user turn.**
+[OpenAI Codex CLI v0.120 docs](https://github.com/openai/codex/blob/main/docs/config.md) list `tools` as the only supported MCP feature — resources, prompts, and `notifications/message` are not surfaced to the model. The shared colleague prompt therefore tells Codex to call `check_messages` before responding to any user prompt. Worst-case delivery latency is one of your turns. If you want it surfaced immediately, just type "check messages" or "did I get anything from claude?" — either triggers the poll.
 
-**The live-preview experience varies by Codex CLI build.**
-Whether the `notifications/message` preview shows up in Codex's live transcript (and whether the model can see it) depends on your Codex CLI version — MCP log notifications are part of the standard spec but client surfacing is still evolving. If your build doesn't plumb them through, no harm: the authoritative `[PEER INBOX]` delivery path still works on the next tool call and carries full content + reply instructions.
+**The background `notifications/message` preview is dormant on current Codex.**
+We still emit it every poll tick as future-compatible plumbing. When a future Codex CLI adds MCP log-notification surfacing to the model, it'll light up automatically with no code change. Today it's a no-op you can safely ignore.
+
+**Tab title ("peer:calm-fox") is re-asserted every 3 seconds.**
+Most terminals (iTerm2, Terminal.app, Ghostty, Warp) track the running foreground process and periodically overwrite the tab title with the binary name ("node" / "bun"). A one-shot OSC title write at startup therefore decays within seconds. The MCP server runs a lightweight keepalive that re-writes the title every 3s so `peer:<name>` stays visible for the whole session. Low overhead — 30 bytes to `/dev/tty` every 3s. Disable with `AGENT_PEERS_DISABLE_TAB_TITLE=1` if you prefer to manage tab titles yourself.
 
 **Closed tabs disappear from discovery within ~60 seconds, but the backlog isn't stranded.**
 When you close a tab, the shell kills the session without graceful cleanup. The peer row stays in the broker until its heartbeat goes stale (~60s). `list_peers` filters stale peers out of results immediately — you won't see ghost peers there even in that window. If you restart with the same `PEER_NAME` within 60-90s, the broker reclaims the same UUID AND clears any stale leases for that peer, so the new session picks up undelivered backlog on its first poll instead of waiting up to 30s for leases to expire. Codex additionally persists its durable inbox on disk, so messages sitting on a reclaimed session are replayed even if they were drawn but not yet confirmed delivered.
@@ -365,10 +368,19 @@ Both can run simultaneously. They do not talk to each other — you'd run `claud
 
 ## Update (pull latest version)
 
-**Ownership split applies here too.** The shared repo (and `bun install` + tests + broker-restart) is Claude's to maintain. Running the update from both agents concurrently would race on `git pull`, corrupt `node_modules`, and kill each other's broker mid-upgrade. So:
+**Same ownership split as Install.** Whoever owns the shared repo is responsible for pulling new code. Do NOT run the update prompt from both agents concurrently — they'll race on `git pull`, `bun install`, and broker kill.
 
-- **Have Claude Code installed?** Run the **Claude update prompt** below — it handles the shared repo pull + deps + test run + tells you to restart BOTH Claude and Codex sessions when it's done. You do not need to run anything on the Codex side beyond closing and reopening your Codex terminals after Claude finishes.
-- **Have Codex only, no Claude Code?** Use the **Codex-only update prompt** further below — it's the same as the Claude one but assumes Codex is the sole installer, so it's safe for it to own the shared repo.
+**Pick your case:**
+
+| Your setup | What to run | Result |
+|---|---|---|
+| 🧠 **Claude only** | Claude update prompt | Pulls repo, reinstalls deps, runs tests, tells you to restart any running `agentpeers` sessions |
+| 🧠 **+** 🤖 **Both** | Claude update prompt **only** (Claude owns the shared repo) | Pulls repo, reinstalls deps, runs tests, tells you to restart BOTH `agentpeers` AND `codex` sessions |
+| 🤖 **Codex only** | Codex-only update prompt | Pulls repo, reinstalls deps, runs tests, tells you to restart Codex sessions |
+
+> **If you run the Codex-only update prompt with Claude ALSO wired up**, it will detect the conflict (checks `~/.claude.json` for an `agent-peers` entry) and stop with a message telling you to run the Claude update prompt instead. This is a safety rail — do not override it.
+
+> **Why is there no "Codex update after Claude update" step?** Codex doesn't own the repo in the mixed-agents case. Once Claude has pulled new code, Codex just needs to be relaunched so the new `codex-server.ts` loads into the new MCP process. That's "close the terminal and open a new one," not a prompt.
 
 ---
 
@@ -472,11 +484,19 @@ Confirm each step's outcome as you go. If any step fails, stop and ask me how to
 
 ## Uninstall
 
-**Ownership split — same rule as Install and Update.** The shared repo, broker, and DB are Claude's to own. Codex only owns its own `~/.codex/config.toml` entry.
+**Same ownership split, but reversed order vs install.** Why? When you're tearing down, you want Codex to STOP trying to launch the MCP binary *before* Claude deletes that binary. Otherwise every new `codex` session you open after uninstall will error on startup looking for a file that's gone.
 
-- **Both agents installed?** Run BOTH prompts below, in order: Codex-first (pulls only the `config.toml` block so Codex stops trying to launch a server during the next step), then Claude (tears down the shared repo, broker, DB, alias). If you run only one, the other agent will keep trying to launch a now-broken server every time it starts.
-- **Claude only?** Run the Claude prompt. Done.
-- **Codex only?** Run the Codex prompt — it detects you're the sole installer and will do a FULL teardown (including shared repo + DB).
+**Pick your case:**
+
+| Your setup | What to run | Order + why |
+|---|---|---|
+| 🧠 **Claude only** | Claude uninstall prompt | 1 step — it removes Claude's MCP registration, the `agentpeers` alias, the shared repo, the broker, and all `~/.agent-peers*` state files. |
+| 🧠 **+** 🤖 **Both** | Codex uninstall prompt **first**, then Claude uninstall prompt | **Codex FIRST** so Codex stops trying to spawn `codex-server.ts` on every new session. Codex's uninstall auto-detects the two-agent case and does a **config-only** teardown (removes only the `~/.codex/config.toml` block, leaves the shared repo alone). Then Claude's uninstall tears down the shared repo, broker, DB, alias, secret file, and Codex's durable inbox directory. |
+| 🤖 **Codex only** | Codex uninstall prompt | 1 step — Codex's uninstall auto-detects the solo case (no `agent-peers` entry in `~/.claude.json`) and does a **full** teardown: removes its `config.toml` block AND the shared repo, broker, DB, secret, and inbox directory. |
+
+> **Why the Codex prompt auto-branches instead of being two different prompts:** one prompt handles all three cases reliably by reading `~/.claude.json` up-front to figure out whether shared state is Claude's to clean up or Codex's. If it finds Claude wired, it does "Case A" (config-only). If it doesn't, "Case B" (full teardown). This keeps the README short and prevents the user picking the wrong prompt.
+
+> **Why Claude uninstall checks Codex's config.toml:** it looks for a lingering `[mcp_servers.agent-peers]` entry and warns you before deleting the shared repo. It does NOT auto-edit `~/.codex/config.toml` — that's Codex's prompt's job. The warning is there so you don't end up with a dangling Codex wiring pointing at a deleted binary.
 
 ---
 

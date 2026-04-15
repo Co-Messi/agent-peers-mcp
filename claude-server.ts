@@ -28,7 +28,7 @@ import { ensureBroker } from "./shared/ensure-broker.ts";
 import { waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
-import { setTabTitle, clearTabTitle, clearTabTitleSync } from "./shared/tab-title.ts";
+import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId } from "./shared/types.ts";
@@ -297,6 +297,11 @@ async function main() {
   myName = reg.name;
   mySession = reg.session_token;
   setTabTitle(`peer:${myName}`);
+  // Keep re-asserting the title every few seconds. Terminals like iTerm2
+  // periodically overwrite the title with the running process name
+  // ("node" / "bun"), so a one-shot OSC write at startup decays. See
+  // shared/tab-title.ts for the rationale.
+  startTabTitleKeepalive();
   log(`Registered as ${myName} (id=${myId})`);
 
   // Late summary upload if generation took longer than 3s.
