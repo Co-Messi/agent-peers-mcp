@@ -28,13 +28,19 @@ async function atomicWriteJson(path: string, value: CodexInboxState): Promise<vo
 
 export class CodexInboxStore {
   private readonly filePath: string;
+  private readonly persistState: (path: string, value: CodexInboxState) => Promise<void>;
   private state: CodexInboxState = { unread: [] };
   private queue: Promise<void> = Promise.resolve();
 
-  constructor(opts: { peerId: PeerId; rootDir?: string }) {
+  constructor(opts: {
+    peerId: PeerId;
+    rootDir?: string;
+    persistState?: (path: string, value: CodexInboxState) => Promise<void>;
+  }) {
     const rootDir = opts.rootDir ?? process.env.AGENT_PEERS_CODEX_STATE_DIR ?? defaultRootDir();
     const safePeerId = encodeURIComponent(opts.peerId);
     this.filePath = join(rootDir, `${safePeerId}.json`);
+    this.persistState = opts.persistState ?? atomicWriteJson;
   }
 
   async init(): Promise<void> {
@@ -51,24 +57,27 @@ export class CodexInboxStore {
     await this.withLock(async () => {
       const unreadById = new Map(this.state.unread.map((message) => [message.id, { ...message }]));
       for (const message of messages) unreadById.set(message.id, { ...message });
-      this.state = { unread: Array.from(unreadById.values()).sort((a, b) => a.id - b.id) };
-      await atomicWriteJson(this.filePath, this.state);
+      const nextState = { unread: Array.from(unreadById.values()).sort((a, b) => a.id - b.id) };
+      await this.persistState(this.filePath, nextState);
+      this.state = nextState;
     });
   }
 
   async consumeUnreadMessages(): Promise<LeasedMessage[]> {
     return this.withLock(async () => {
       const unread = cloneMessages(this.state.unread);
-      this.state = { unread: [] };
-      await atomicWriteJson(this.filePath, this.state);
+      const nextState = { unread: [] };
+      await this.persistState(this.filePath, nextState);
+      this.state = nextState;
       return unread;
     });
   }
 
   async reset(): Promise<void> {
     await this.withLock(async () => {
-      this.state = { unread: [] };
-      await atomicWriteJson(this.filePath, this.state);
+      const nextState = { unread: [] };
+      await this.persistState(this.filePath, nextState);
+      this.state = nextState;
     });
   }
 
