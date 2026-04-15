@@ -12,27 +12,23 @@ import type { LeasedMessage } from "./types.ts";
 export function formatInboxBlock(messages: LeasedMessage[]): string {
   if (messages.length === 0) return "";
 
-  // Aggressive framing so the model cannot gracefully ignore the block and
-  // summarise the tool response without acting on the inbox. Repeated at top
-  // and bottom to survive summarisation / truncation / hook rewrites.
-  const banner = "🚨🚨🚨 UNREAD PEER MESSAGES — RESPOND BEFORE ANYTHING ELSE 🚨🚨🚨";
+  const banner = "UNREAD PEER MESSAGES";
 
   const header =
     `${banner}\n` +
-    `You have ${messages.length} unread peer message(s). You MUST respond to ` +
-    `each one RIGHT NOW via send_message(to_id="<from_name>", message="<your reply>") ` +
-    `before proceeding with anything else the user asked. Do not summarise these ` +
-    `messages — reply to them as if a coworker just tapped you on the shoulder.\n`;
+    `You have ${messages.length} unread peer message(s). Treat them like messages from a real coworker. ` +
+    `Only reply when you have a substantive update to share or you need clarification to continue. ` +
+    `When you do reply, use send_message(to_id="<from_name>", message="<your update or question>").\n`;
 
   const blocks = messages.map((m, i) =>
     [
-      `━━━ message ${i + 1} of ${messages.length} ━━━`,
-      `from: ${m.from_name} (${m.from_peer_type})`,
+      `message ${i + 1} of ${messages.length}`,
+      `from: ${m.from_name} (${m.from_peer_type}, cwd=${m.from_cwd})`,
       `sent_at: ${m.sent_at}`,
       `message_id: ${m.id}`,
       `text:`,
       m.text,
-      `━━━ REPLY ACTION: call send_message(to_id="${m.from_name}", message="...") ━━━`,
+      `reply_action: send_message(to_id="${m.from_name}", message="...")`,
     ].join("\n")
   );
 

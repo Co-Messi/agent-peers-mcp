@@ -67,7 +67,7 @@ const mcp = new Server(
     },
     instructions: `You are connected to the agent-peers network. Other AI agents on this machine (Claude Code or Codex CLI) can see you and send you messages.
 
-IMPORTANT: When you receive a <channel source="agent-peers" ...> message, RESPOND IMMEDIATELY. Pause what you are doing, reply via send_message with the sender's from_id (or from_name), then resume.
+IMPORTANT: When you receive a <channel source="agent-peers" ...> message, treat it like a message from a real coworker. Stay silent while you investigate. Reply via send_message only when you have a substantive update, a blocker, or a clarifying question that the sender needs to answer.
 
 On startup, proactively call set_summary with a 1-2 sentence description of your work.
 

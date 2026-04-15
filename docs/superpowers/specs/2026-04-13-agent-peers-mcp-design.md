@@ -21,7 +21,7 @@ Goal: one project where Claude↔Claude, Codex↔Codex, and Claude↔Codex all w
 ### Phase 1 (this spec) — post-adversarial-review revision
 - Broker on isolated port + DB
 - `claude-server.ts` reusing proven push-via-channel pattern
-- `codex-server.ts` with **piggyback delivery on every tool call** (every tool handler polls broker first; pending messages prepended to the response)
+- `codex-server.ts` with **background polling + queue-backed piggyback delivery** (poll broker every second, persist unread Codex messages locally, prepend them to the next response)
 - **Explicit ack/lease protocol** (broker leases messages for 30s; client acks only after transport-level send confirms; expired leases re-deliver)
 - **Broker-owned timer GC** (stale peers removed every 30s; liveness check on every `/send-message`)
 - **Self-rename only** in the `rename_peer` tool; admin rename lives only in `cli.ts` (local operator action)
@@ -78,7 +78,7 @@ Both systems can be active simultaneously. The user can keep using `claudedpeers
                        └──┬──────────┬───────────┬──────┘
                           │          │           │
                   claude-server  claude-server  codex-server
-                  (push channel) (push channel) (check_messages)
+                  (push channel) (push channel) (queued inbox)
                           │          │           │
                        Claude A   Claude B   Codex A
                        (claudedpeers-style alias 'agentpeers')
@@ -537,16 +537,19 @@ If step 4 throws or step 5 fails, the lease expires → next poll re-delivers. C
 ### 7.2 Claude → Codex
 1. Claude A calls `send_message(to="backend-codex", text="…")`
 2. claude-server A → `/send-message` (same liveness check)
-3. codex-server X has no timer poll. Next time Codex calls **any** tool on this MCP (`list_peers`, `send_message`, `set_summary`, `check_messages`, `rename_peer`):
-   - **Flush previous call's acks first** — if `pendingAcks` is non-empty, call `/ack-messages` now (heuristic confirmation that the previous response cycle succeeded; see §5.5 on the narrow residual-loss window this does NOT fully close).
-   - Call `/poll-messages` → broker leases any pending messages for this peer and returns them with fresh lease tokens.
-   - For each polled message: if `seen.has(m.id)` queue its lease_token in `pendingAcks` and do NOT re-inject. Else `seen.add(m.id)`, push the lease_token into `pendingAcks`, and include the message in the inbox block built for this response.
+3. codex-server X's 1s background loop calls `/poll-messages` and writes unread messages into the local Codex inbox queue.
+   - If `seen.has(m.id)`, queue the fresh lease token in `pendingAcks` and do NOT re-queue the message.
+   - Otherwise, upsert the unread message in the local queue so the newest lease token survives while Codex stays busy.
+4. Next time Codex calls **any** tool on this MCP (`list_peers`, `send_message`, `set_summary`, `check_messages`, `rename_peer`):
+   - **Flush previous call's acks first** — if `pendingAcks` is non-empty, call `/ack-messages` now.
+   - Do one best-effort immediate poll into the local queue for freshness.
+   - Drain unread messages from the local queue, prepend them to the tool response as `[PEER INBOX]`, and push their lease tokens into `pendingAcks`.
    - Run the tool's own logic.
    - Return response with the inbox block prepended.
    - **Do NOT ack inside this handler.** The tokens in `pendingAcks` will be flushed by the NEXT tool call.
-4. Codex sees the `[PEER INBOX]` block in the tool output and responds via `send_message(to_id="frontend-tab", …)`. The reply hint is inline in every block.
+5. Codex sees the `[PEER INBOX]` block in the tool output and replies only when it has a substantive update or a clarifying question.
 
-Latency: bounded by Codex issuing another tool call. Every-step tool usage (common in Codex) keeps this sub-second. If Codex is idle, messages wait at the broker until the next tool call. If Codex crashes before the next call, leases expire after 30s and the next session re-leases + re-injects.
+Latency: broker pickup is bounded by the 1s background poll. Visible delivery is bounded by the next agent-peers response. If Codex is idle, messages wait in the local queue instead of only at the broker. If Codex crashes before visible delivery, unread queue state and lease expiry allow re-delivery without silent loss.
 
 ### 7.3 Codex → Claude
 1. Codex calls `send_message(to="frontend-tab", text="…")`
@@ -557,7 +560,7 @@ Latency: bounded by Codex issuing another tool call. Every-step tool usage (comm
 Instant from Claude's perspective. `send_message` response that Codex sees confirms the send plus surfaces any incoming inbox that happened to be pending.
 
 ### 7.4 Codex → Codex
-Same as 7.2 but recipient is also Codex (piggybacks into its own next tool call).
+Same as 7.2 but recipient is also Codex (background-polled into its local queue, then surfaced on the next agent-peers response).
 
 ---
 
@@ -643,9 +646,9 @@ Manual end-to-end tests, in order:
 3. **Two Claudes message** — open two `agentpeers` terminals, send between them, confirm push works
 4. **Single Codex registers** — `codex` with config entry, run `bun cli.ts peers`, see entry with peer_type=codex
 5. **Codex empty inbox** — Codex calls `list_peers`. Tool response has no `[PEER INBOX]` block (or block says zero messages). Calling `check_messages` is interchangeable but unnecessary.
-6. **Claude → Codex** — Claude session sends to Codex peer; Codex calls **any** tool (e.g. `list_peers`); the response is prepended with a `[PEER INBOX]` block containing the message. `check_messages` is NOT a required trigger.
+6. **Claude → Codex** — Claude session sends to Codex peer; Codex's background poll picks it up and stores it locally; the next agent-peers response prepends a `[PEER INBOX]` block containing the message. `check_messages` is a freshness trigger, not a broker-only trigger.
 7. **Codex → Claude** — Codex sends to Claude peer; Claude receives instant channel push
-8. **Codex → Codex** — two Codex sessions message each other; the recipient sees the `[PEER INBOX]` block on its next tool call regardless of which tool
+8. **Codex → Codex** — two Codex sessions message each other; the recipient's background poll queues the message and the next agent-peers response surfaces it regardless of which tool
 9. **Mixed list_peers** — Claude lists peers, sees both Claude and Codex peers with type column
 10. **Crash recovery** — kill broker mid-session; confirm next call shows error; restart broker; restart sessions; everything works again
 
