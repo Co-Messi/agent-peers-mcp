@@ -26,11 +26,13 @@ import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync } from "./shared/tab-title.ts";
 import { formatInboxBlock } from "./shared/piggyback.ts";
+import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 
 function log(msg: string) {
@@ -50,6 +52,8 @@ let myName: string | null = null;
 let mySession: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let inboxStore: CodexInboxStore | null = null;
+let pollInFlight: Promise<void> | null = null;
 
 const mcp = new Server(
   { name: "agent-peers", version: "0.1.0" },
@@ -58,10 +62,9 @@ const mcp = new Server(
     instructions: `You are connected to the agent-peers network — other AI agents on this machine (Claude Code or Codex) can discover you and send you messages.
 
 INBOX HANDLING — IMPORTANT:
-- This MCP does NOT push messages to you. You receive messages ONLY when you call a tool on this server; the response is prepended with a [PEER INBOX] block listing pending peer messages.
-- When the user says things like "wait for a reply", "did I get a message", or is in a collaborative flow with other peers, you MUST call check_messages (or any agent-peers tool) regularly — otherwise peer messages pile up at the broker unseen.
-- Default cadence: after completing every major step of a multi-peer task, call check_messages before moving on. When idle waiting for a reply, call check_messages every few user turns.
-- When you see a [PEER INBOX] block, treat each message like a coworker's Slack message: finish your current step, then respond via send_message(to_id=<from_name>, message="..."). The from_name and message_id are inside the block.
+- This server keeps a local peer inbox refreshed in the background. Pending messages are surfaced as a [PEER INBOX] block on the next response from this server.
+- When the user says things like "wait for a reply", "did I get a message", or is in a collaborative flow with other peers, call check_messages (or any other agent-peers tool) to surface anything waiting in the local inbox right away.
+- When you see a [PEER INBOX] block, treat each message like a coworker's Slack message. Stay silent while you investigate, and only reply via send_message when you have a substantive update, a blocker, or a clarifying question.
 
 ON STARTUP:
 - Call set_summary once with a 1-2 sentence description of what you are working on.
@@ -132,18 +135,6 @@ const TOOLS = [
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-// Module-level ack-on-next-call state (spec §5.5).
-// pendingAcks holds lease tokens from the PREVIOUS tool call. A subsequent
-// request is a strong heuristic (not proof) that the previous response cycle
-// completed — see spec §5.5 "Residual limitations" for the narrow window this
-// does not fully close. On shutdown we intentionally do NOT flush pendingAcks;
-// let leases expire naturally.
-//
-// Bounded (code review round-2 fix): under repeated ack failure we'd otherwise
-// accumulate unbounded tokens. Cap keeps memory + HTTP payload sane. Oldest
-// tokens are dropped first; they'd have expired leases anyway (30s lease
-// horizon vs cap large enough to cover many minutes of new leases), so the
-// broker would have ack'd them 0 regardless.
 const MAX_PENDING_ACKS = 500;
 const pendingAcks: string[] = [];
 const seen = new Set<number>();
@@ -154,6 +145,50 @@ function enqueueAck(token: string) {
     const drop = pendingAcks.length - MAX_PENDING_ACKS;
     pendingAcks.splice(0, drop);
     log(`pendingAcks trimmed: dropped ${drop} oldest token(s); exceeding cap ${MAX_PENDING_ACKS}`);
+  }
+}
+
+async function pollBrokerIntoQueue(): Promise<void> {
+  if (!myId || !mySession || !inboxStore) return;
+  if (pollInFlight) {
+    await pollInFlight;
+    return;
+  }
+
+  pollInFlight = (async () => {
+    let leased: LeasedMessage[] = [];
+    try {
+      leased = await client.pollMessages({ id: myId!, session_token: mySession! });
+    } catch (e) {
+      log(`poll failed: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+
+    if (leased.length === 0) return;
+
+    const unread: LeasedMessage[] = [];
+    for (const message of leased) {
+      if (seen.has(message.id)) {
+        enqueueAck(message.lease_token);
+      } else {
+        unread.push(message);
+      }
+    }
+
+    if (unread.length === 0) return;
+
+    try {
+      await inboxStore.queueLeasedMessages(unread);
+      log(`queued ${unread.length} unread peer message(s): ${unread.map((msg) => `#${msg.id} from ${msg.from_name}`).join(", ")}`);
+    } catch (e) {
+      log(`failed to persist unread peer messages: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  })();
+
+  try {
+    await pollInFlight;
+  } finally {
+    pollInFlight = null;
   }
 }
 
@@ -190,32 +225,24 @@ async function withPiggyback(
     }
   }
 
-  // 2. Poll for new messages.
-  let leased: LeasedMessage[] = [];
   try {
-    leased = await client.pollMessages({ id: myId, session_token: mySession });
-    if (leased.length > 0) {
-      log(`piggyback poll leased ${leased.length} message(s): ${leased.map((m) => `#${m.id} from ${m.from_name}`).join(", ")}`);
-    }
+    await pollBrokerIntoQueue();
   } catch (e) {
-    log(`poll failed: ${e instanceof Error ? e.message : String(e)}`);
+    log(`inline poll failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  // 3. Partition polled messages into fresh vs re-delivery.
-  const fresh: LeasedMessage[] = [];
-  for (const m of leased) {
-    if (seen.has(m.id)) {
-      // Re-delivery after lost ack. Queue lease token for next-call ack so the
-      // broker can finally close the stuck lease. Do NOT re-inject.
-      enqueueAck(m.lease_token);
-    } else {
-      fresh.push(m);
-      seen.add(m.id);
-      enqueueAck(m.lease_token);
-    }
+  let fresh: LeasedMessage[] = [];
+  try {
+    fresh = inboxStore ? await inboxStore.consumeUnreadMessages() : [];
+  } catch (e) {
+    log(`failed to read unread peer messages: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  // 4. Run the tool's own logic.
+  for (const message of fresh) {
+    seen.add(message.id);
+    enqueueAck(message.lease_token);
+  }
+
   let toolText = "";
   let toolError: boolean | undefined;
   try {
@@ -227,7 +254,6 @@ async function withPiggyback(
     toolError = true;
   }
 
-  // 5. Return response with inbox prepended. Ack happens on the NEXT call.
   const inbox = formatInboxBlock(fresh);
   const finalText = inbox + toolText;
   return { content: [{ type: "text", text: finalText }], isError: toolError };
@@ -370,6 +396,8 @@ async function main() {
   myId = reg.id;
   myName = reg.name;
   mySession = reg.session_token;
+  inboxStore = new CodexInboxStore({ peerId: myId });
+  await inboxStore.init();
   setTabTitle(`peer:${myName}`);
   log(`Registered as ${myName} (id=${myId})`);
 
@@ -384,6 +412,17 @@ async function main() {
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
+  let pollStopped = false;
+  let pollTickTimer: ReturnType<typeof setTimeout> | null = null;
+  const scheduleNextPoll = () => {
+    if (pollStopped) return;
+    pollTickTimer = setTimeout(async () => {
+      try { await pollBrokerIntoQueue(); }
+      finally { scheduleNextPoll(); }
+    }, POLL_INTERVAL_MS);
+  };
+  scheduleNextPoll();
+
   const hb = setInterval(async () => {
     if (myId && mySession) {
       try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
@@ -395,6 +434,8 @@ async function main() {
   // unregister (preserves reclaim-by-name window). Timer cleanup only.
   lifecycleCleanup = async () => {
     clearInterval(hb);
+    pollStopped = true;
+    if (pollTickTimer) clearTimeout(pollTickTimer);
   };
   // Note: all signal handlers + 'exit' handler are already armed at the top
   // of main(), before any setTabTitle() call — so a terminal close during

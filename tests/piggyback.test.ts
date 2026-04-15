@@ -19,22 +19,21 @@ test("formatInboxBlock returns empty string for no messages", () => {
   expect(formatInboxBlock([])).toBe("");
 });
 
-test("formatInboxBlock carries reply hint with from_name + message_id + body", () => {
+test("formatInboxBlock carries sender identity and substantive reply guidance", () => {
   const out = formatInboxBlock([m(42, "ping")]);
   expect(out).toContain("UNREAD PEER MESSAGES");
-  expect(out).toContain("send_message(to_id=\"alpha\"");
+  expect(out).toContain("from: alpha (claude");
   expect(out).toContain("message_id: 42");
-  expect(out).toContain("from: alpha");
+  expect(out).toContain("Only reply when you have a substantive update");
   expect(out).toContain("ping");
 });
 
-test("formatInboxBlock numbers multiple messages and emits banner twice", () => {
+test("formatInboxBlock numbers multiple messages and repeats the banner", () => {
   const out = formatInboxBlock([m(1, "a"), m(2, "b", "beta")]);
   expect(out).toContain("message 1 of 2");
   expect(out).toContain("message 2 of 2");
-  expect(out).toContain("from: alpha");
-  expect(out).toContain("from: beta");
-  // Banner appears at both top and bottom for summarisation resilience
+  expect(out).toContain("send_message(to_id=\"alpha\"");
+  expect(out).toContain("send_message(to_id=\"beta\"");
   const bannerCount = (out.match(/UNREAD PEER MESSAGES/g) ?? []).length;
   expect(bannerCount).toBeGreaterThanOrEqual(2);
 });
