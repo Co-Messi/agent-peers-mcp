@@ -301,7 +301,11 @@ async function pollBrokerIntoQueue(): Promise<void> {
         await mcp.notification({
           method: "notifications/message",
           params: {
-            level: "info",
+            // Use `notice` so patched Codex clients (with the trigger-turn
+            // filter) treat this as actionable and wake the session. Routine
+            // info/debug logs are intentionally filtered out upstream to
+            // avoid spurious turns.
+            level: "notice",
             logger: "agent-peers",
             // Intentionally body-free: just the sender's identity + a
             // pointer to where the actual message will appear. No
