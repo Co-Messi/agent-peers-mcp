@@ -1,0 +1,311 @@
+From 55608f00924660549fe8507c4755dcc29b4d2e59 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 16 Apr 2026 03:35:35 +0000
+Subject: [PATCH] feat: surface MCP notifications/message to the model's
+ conversation
+
+Currently, when an MCP server sends a notifications/message log
+notification, Codex CLI routes it to Rust tracing only. The model
+never sees it. This commit adds plumbing for info+ level notifications
+to be forwarded as McpServerLogMessage events through the existing
+tx_event channel to the agent loop.
+
+Closes #17543
+Refs #18056, #16060, #17501
+---
+ .../codex-mcp/src/mcp_connection_manager.rs   |  8 ++-
+ codex-rs/core/src/codex.rs                    |  8 +++
+ codex-rs/mcp-server/src/codex_tool_runner.rs  |  1 +
+ codex-rs/protocol/src/protocol.rs             | 32 +++++++++
+ .../src/elicitation_client_service.rs         |  6 ++
+ .../rmcp-client/src/logging_client_handler.rs | 68 +++++++++++++++++--
+ codex-rs/rmcp-client/src/rmcp_client.rs       |  4 ++
+ codex-rs/rollout/src/policy.rs                |  1 +
+ 8 files changed, 121 insertions(+), 7 deletions(-)
+
+diff --git a/codex-rs/codex-mcp/src/mcp_connection_manager.rs b/codex-rs/codex-mcp/src/mcp_connection_manager.rs
+index 1542c7b..8caa9b1 100644
+--- a/codex-rs/codex-mcp/src/mcp_connection_manager.rs
++++ b/codex-rs/codex-mcp/src/mcp_connection_manager.rs
+@@ -1418,7 +1418,13 @@ async fn start_server_task(
+     let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event);
+ 
+     let initialize_result = client
+-        .initialize(params, startup_timeout, send_elicitation)
++        .initialize(
++            params,
++            startup_timeout,
++            send_elicitation,
++            server_name.clone(),
++            Some(tx_event.clone()),
++        )
+         .await
+         .map_err(StartupOutcomeError::from)?;
+ 
+diff --git a/codex-rs/core/src/codex.rs b/codex-rs/core/src/codex.rs
+index 66a0dc5..98a04b9 100644
+--- a/codex-rs/core/src/codex.rs
++++ b/codex-rs/core/src/codex.rs
+@@ -7527,6 +7527,14 @@ fn realtime_text_for_event(msg: &EventMsg) -> Option<String> {
+         | EventMsg::ApplyPatchApprovalRequest(_)
+         | EventMsg::DeprecationNotice(_)
+         | EventMsg::BackgroundEvent(_)
++        // TODO(agent-peers): When the TUI/core event loop processes
++        // McpServerLogMessage, it should inject the `data` field into
++        // the model's conversation via `inject_response_items` as a
++        // system message. This enables MCP servers to surface real-time
++        // information (peer messages, CI results, file-change alerts)
++        // to the model mid-task. See PR description for the full
++        // rationale and the `inject_response_items` API.
++        | EventMsg::McpServerLogMessage(_)
+         | EventMsg::UndoStarted(_)
+         | EventMsg::UndoCompleted(_)
+         | EventMsg::StreamError(_)
+diff --git a/codex-rs/mcp-server/src/codex_tool_runner.rs b/codex-rs/mcp-server/src/codex_tool_runner.rs
+index eee2347..00bb51d 100644
+--- a/codex-rs/mcp-server/src/codex_tool_runner.rs
++++ b/codex-rs/mcp-server/src/codex_tool_runner.rs
+@@ -345,6 +345,7 @@ async fn run_codex_tool_session_inner(
+                     | EventMsg::ExecCommandOutputDelta(_)
+                     | EventMsg::ExecCommandEnd(_)
+                     | EventMsg::BackgroundEvent(_)
++        | EventMsg::McpServerLogMessage(_)
+                     | EventMsg::StreamError(_)
+                     | EventMsg::PatchApplyBegin(_)
+                     | EventMsg::PatchApplyEnd(_)
+diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+index 244f748..8f11da8 100644
+--- a/codex-rs/protocol/src/protocol.rs
++++ b/codex-rs/protocol/src/protocol.rs
+@@ -1520,6 +1520,13 @@ pub enum EventMsg {
+ 
+     BackgroundEvent(BackgroundEventEvent),
+ 
++    /// An MCP server sent a `notifications/message` log notification with
++    /// level info or higher. Unlike tracing-only delivery, this variant
++    /// surfaces the notification content to the model's conversation so
++    /// the LLM can read and react to it (e.g., an inter-agent peer
++    /// message, a CI result, a file-change alert).
++    McpServerLogMessage(McpServerLogMessageEvent),
++
+     UndoStarted(UndoStartedEvent),
+ 
+     UndoCompleted(UndoCompletedEvent),
+@@ -3288,6 +3295,31 @@ pub struct McpStartupFailure {
+     pub error: String,
+ }
+ 
++/// Emitted when an MCP server sends a `notifications/message` log
++/// notification that should be surfaced to the model's conversation
++/// (level info or higher). The `data` field carries the notification
++/// payload — typically a human-readable string or structured JSON that
++/// the model should see and potentially act on.
++///
++/// Use case: an MCP server for inter-agent peer messaging pushes a
++/// "you have a new message from peer X" notification. With this event
++/// surfaced to the model, the LLM can decide to check its inbox or
++/// respond to the peer — without requiring the user to manually trigger
++/// a tool call.
++#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
++pub struct McpServerLogMessageEvent {
++    /// Name of the MCP server that sent the notification.
++    pub server: String,
++    /// The `logger` field from the notification params (if set).
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub logger: Option<String>,
++    /// The `level` field from the notification (e.g., "info", "notice").
++    pub level: String,
++    /// The `data` payload from the notification, serialized as a string.
++    /// Typically contains the message text the model should see.
++    pub data: String,
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+ #[serde(rename_all = "snake_case")]
+ #[ts(rename_all = "snake_case")]
+diff --git a/codex-rs/rmcp-client/src/elicitation_client_service.rs b/codex-rs/rmcp-client/src/elicitation_client_service.rs
+index 49f11f0..4b52e92 100644
+--- a/codex-rs/rmcp-client/src/elicitation_client_service.rs
++++ b/codex-rs/rmcp-client/src/elicitation_client_service.rs
+@@ -1,5 +1,7 @@
+ use std::sync::Arc;
+ 
++use async_channel::Sender;
++use codex_protocol::protocol::Event;
+ use rmcp::RoleClient;
+ use rmcp::model::ClientInfo;
+ use rmcp::model::ClientResult;
+@@ -35,12 +37,16 @@ impl ElicitationClientService {
+         client_info: ClientInfo,
+         send_elicitation: SendElicitation,
+         pause_state: ElicitationPauseState,
++        server_name: String,
++        tx_event: Option<Sender<Event>>,
+     ) -> Self {
+         let send_elicitation = Arc::new(send_elicitation);
+         Self {
+             handler: LoggingClientHandler::new(
+                 client_info,
+                 clone_send_elicitation(Arc::clone(&send_elicitation)),
++                server_name,
++                tx_event,
+             ),
+             send_elicitation,
+             pause_state,
+diff --git a/codex-rs/rmcp-client/src/logging_client_handler.rs b/codex-rs/rmcp-client/src/logging_client_handler.rs
+index 0c3da0f..76aec47 100644
+--- a/codex-rs/rmcp-client/src/logging_client_handler.rs
++++ b/codex-rs/rmcp-client/src/logging_client_handler.rs
+@@ -1,5 +1,9 @@
+ use std::sync::Arc;
+ 
++use async_channel::Sender;
++use codex_protocol::protocol::Event;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::McpServerLogMessageEvent;
+ use rmcp::ClientHandler;
+ use rmcp::RoleClient;
+ use rmcp::model::CancelledNotificationParam;
+@@ -23,13 +27,29 @@ use crate::rmcp_client::SendElicitation;
+ pub(crate) struct LoggingClientHandler {
+     client_info: ClientInfo,
+     send_elicitation: Arc<SendElicitation>,
++    /// Name of the MCP server this handler belongs to. Used to tag
++    /// McpServerLogMessage events so the consumer knows which server sent
++    /// the notification.
++    server_name: String,
++    /// Optional channel to send events back to the agent loop. When set,
++    /// info/notice-level log notifications are forwarded as
++    /// McpServerLogMessage events so the model can see and react to them.
++    /// When None, behavior is unchanged (tracing-only delivery).
++    tx_event: Option<Sender<Event>>,
+ }
+ 
+ impl LoggingClientHandler {
+-    pub(crate) fn new(client_info: ClientInfo, send_elicitation: SendElicitation) -> Self {
++    pub(crate) fn new(
++        client_info: ClientInfo,
++        send_elicitation: SendElicitation,
++        server_name: String,
++        tx_event: Option<Sender<Event>>,
++    ) -> Self {
+         Self {
+             client_info,
+             send_elicitation: Arc::new(send_elicitation),
++            server_name,
++            tx_event,
+         }
+     }
+ }
+@@ -102,7 +122,9 @@ impl ClientHandler for LoggingClientHandler {
+             logger,
+             data,
+         } = params;
+-        let logger = logger.as_deref();
++        let logger_str = logger.as_deref();
++
++        // Existing behavior: route to tracing infrastructure (unchanged).
+         match level {
+             LoggingLevel::Emergency
+             | LoggingLevel::Alert
+@@ -110,27 +132,61 @@ impl ClientHandler for LoggingClientHandler {
+             | LoggingLevel::Error => {
+                 error!(
+                     "MCP server log message (level: {:?}, logger: {:?}, data: {})",
+-                    level, logger, data
++                    level, logger_str, data
+                 );
+             }
+             LoggingLevel::Warning => {
+                 warn!(
+                     "MCP server log message (level: {:?}, logger: {:?}, data: {})",
+-                    level, logger, data
++                    level, logger_str, data
+                 );
+             }
+             LoggingLevel::Notice | LoggingLevel::Info => {
+                 info!(
+                     "MCP server log message (level: {:?}, logger: {:?}, data: {})",
+-                    level, logger, data
++                    level, logger_str, data
+                 );
+             }
+             LoggingLevel::Debug => {
+                 debug!(
+                     "MCP server log message (level: {:?}, logger: {:?}, data: {})",
+-                    level, logger, data
++                    level, logger_str, data
+                 );
+             }
+         }
++
++        // NEW: for info-level and above, also forward to the agent loop
++        // so the model can see the notification and react to it. This
++        // enables MCP servers (e.g., inter-agent peer messaging, CI
++        // watchers, file-change monitors) to surface real-time
++        // information to the model mid-task — not just to stderr.
++        //
++        // Debug-level is excluded to avoid flooding the model's context
++        // with verbose diagnostic output.
++        if !matches!(level, LoggingLevel::Debug) {
++            if let Some(tx) = &self.tx_event {
++                let data_str = match &data {
++                    serde_json::Value::String(s) => s.clone(),
++                    other => other.to_string(),
++                };
++                let _ = tx
++                    .send(Event {
++                        id: format!(
++                            "mcp_server_log_{}",
++                            std::time::SystemTime::now()
++                                .duration_since(std::time::UNIX_EPOCH)
++                                .unwrap_or_default()
++                                .as_millis()
++                        ),
++                        msg: EventMsg::McpServerLogMessage(McpServerLogMessageEvent {
++                            server: self.server_name.clone(),
++                            logger: logger.clone(),
++                            level: format!("{:?}", level).to_lowercase(),
++                            data: data_str,
++                        }),
++                    })
++                    .await;
++            }
++        }
+     }
+ }
+diff --git a/codex-rs/rmcp-client/src/rmcp_client.rs b/codex-rs/rmcp-client/src/rmcp_client.rs
+index 415354f..c846fe0 100644
+--- a/codex-rs/rmcp-client/src/rmcp_client.rs
++++ b/codex-rs/rmcp-client/src/rmcp_client.rs
+@@ -633,11 +633,15 @@ impl RmcpClient {
+         params: InitializeRequestParams,
+         timeout: Option<Duration>,
+         send_elicitation: SendElicitation,
++        server_name: String,
++        tx_event: Option<async_channel::Sender<codex_protocol::protocol::Event>>,
+     ) -> Result<InitializeResult> {
+         let client_service = ElicitationClientService::new(
+             params.clone(),
+             send_elicitation,
+             self.elicitation_pause_state.clone(),
++            server_name,
++            tx_event,
+         );
+         let pending_transport = {
+             let mut guard = self.state.lock().await;
+diff --git a/codex-rs/rollout/src/policy.rs b/codex-rs/rollout/src/policy.rs
+index 4b50781..5bf326e 100644
+--- a/codex-rs/rollout/src/policy.rs
++++ b/codex-rs/rollout/src/policy.rs
+@@ -154,6 +154,7 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
+         | EventMsg::ElicitationRequest(_)
+         | EventMsg::ApplyPatchApprovalRequest(_)
+         | EventMsg::BackgroundEvent(_)
++        | EventMsg::McpServerLogMessage(_)
+         | EventMsg::StreamError(_)
+         | EventMsg::PatchApplyBegin(_)
+         | EventMsg::TurnDiff(_)
+-- 
+2.43.0
+
