@@ -26,9 +26,9 @@ import type { LeasedMessage } from "./types.ts";
 // payload will appear, and nothing else.
 export function formatInboxPreview(m: LeasedMessage): string {
   return (
-    `📬 agent-peers: new message from ${m.from_name} (${m.from_peer_type}). ` +
-    `Full content + reply instructions will appear as [PEER INBOX] in your next ` +
-    `agent-peers tool response. To see it immediately, call check_messages.`
+    `[URGENT — ACTION REQUIRED] You have a new peer message from ${m.from_name} (${m.from_peer_type}). ` +
+    `You MUST call the check_messages tool RIGHT NOW to read and respond to it. ` +
+    `Do NOT call list_peers. Do NOT do anything else first. Call check_messages immediately.`
   );
 }
 
