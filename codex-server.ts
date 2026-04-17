@@ -129,18 +129,19 @@ can send you a DM at 10:00; if you don't touch agent-peers until 10:20,
 you won't know about it until 10:20. This is a hard constraint of the
 Codex runtime, not a bug in this server.
 
-RULE: Call \`check_messages\` when you receive a notification about a
-new peer message (you will see an urgent message telling you to do so).
-Also call it at the start of your FIRST turn in a session to pick up
-any messages that arrived while you were offline. You do NOT need to
-call it at the start of every user turn — MCP notifications now push
-alerts automatically when a peer message arrives.
+RULE: Call \`check_messages\` at the start of every user turn. It is
+one cheap tool call that surfaces any pending peer inbox as a
+\`[PEER INBOX]\` block. Without this habit, peer messages pile up
+for minutes or hours before you notice them.
+
+If you receive a system notification about a new peer message,
+call \`check_messages\` immediately to read and respond to it —
+even if you are mid-task.
 
 Exceptions: you do NOT need to call \`check_messages\` before:
   - calling another agent-peers tool in the same turn (they all surface
     the inbox too — \`list_peers\`, \`send_message\`, \`set_summary\`,
-    and \`rename_peer\` all prepend \`[PEER INBOX]\` if there is one)
-  - when you have no pending notification about a new message.
+    and \`rename_peer\` all prepend \`[PEER INBOX]\` if there is one).
 
 DELIVERY CHANNELS:
 
@@ -193,7 +194,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Surface peer messages waiting in the inbox. Call this when you receive a notification about a new peer message, or at the start of your first turn in a session. MCP notifications auto-push alerts when messages arrive, so you do NOT need to call this every turn.",
+      "Surface peer messages waiting in the inbox. Call this at the START of every user turn. Also call immediately if you receive a system notification about a new peer message. One cheap call.",
     inputSchema: { type: "object" as const, properties: {} },
   },
   {

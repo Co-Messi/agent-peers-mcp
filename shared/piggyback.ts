@@ -25,10 +25,12 @@ import type { LeasedMessage } from "./types.ts";
 // string therefore carries sender identity + a pointer to where the real
 // payload will appear, and nothing else.
 export function formatInboxPreview(m: LeasedMessage): string {
+  // Keep the tone restrained — caps-lock / "URGENT" trains the model to
+  // over-react (see comment block at top of file). Clear and direct is
+  // enough for the developer-role injection path.
   return (
-    `[URGENT — ACTION REQUIRED] You have a new peer message from ${m.from_name} (${m.from_peer_type}). ` +
-    `You MUST call the check_messages tool RIGHT NOW to read and respond to it. ` +
-    `Do NOT call list_peers. Do NOT do anything else first. Call check_messages immediately.`
+    `New peer message from ${m.from_name} (${m.from_peer_type}). ` +
+    `Call check_messages now to read and respond.`
   );
 }
 
