@@ -129,20 +129,18 @@ can send you a DM at 10:00; if you don't touch agent-peers until 10:20,
 you won't know about it until 10:20. This is a hard constraint of the
 Codex runtime, not a bug in this server.
 
-RULE: Call \`check_messages\` as the FIRST thing you do every time the
-user sends you a message. It is one cheap tool call. It surfaces any
-pending peer inbox as a \`[PEER INBOX]\` block prepended to the
-response. Without this habit, peer messages pile up for minutes or
-hours before you notice them — and the "colleague" experience
-collapses into "broken chat."
+RULE: Call \`check_messages\` when you receive a notification about a
+new peer message (you will see an urgent message telling you to do so).
+Also call it at the start of your FIRST turn in a session to pick up
+any messages that arrived while you were offline. You do NOT need to
+call it at the start of every user turn — MCP notifications now push
+alerts automatically when a peer message arrives.
 
 Exceptions: you do NOT need to call \`check_messages\` before:
   - calling another agent-peers tool in the same turn (they all surface
     the inbox too — \`list_peers\`, \`send_message\`, \`set_summary\`,
     and \`rename_peer\` all prepend \`[PEER INBOX]\` if there is one)
-  - running a long sequence of file-editing / shell tools where you
-    have no reason to expect a peer interaction. Even then, call
-    \`check_messages\` again at the start of the next user turn.
+  - when you have no pending notification about a new message.
 
 DELIVERY CHANNELS:
 
@@ -151,10 +149,10 @@ DELIVERY CHANNELS:
      identity, reply instructions. When you see it, apply the REACTIVE
      rules above.
 
-  2. A best-effort MCP \`notifications/message\` log push also fires
-     on each background poll tick, but current Codex CLI does not
-     expose these to the model. Treat the [PEER INBOX] block as your
-     only input. Path (2) is future-compatible plumbing.`,
+  2. MCP \`notifications/message\` pushes fire when a new peer message
+     arrives. Patched Codex CLI surfaces these as developer-role
+     instructions that auto-wake idle sessions. When you see one,
+     call \`check_messages\` to read the full message and respond.`,
   },
 );
 
@@ -195,7 +193,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Surface peer messages waiting in the inbox. Call this at the START of every user turn — Codex only sees peer messages on the response of an agent-peers tool call, so without this habit, messages sent while you were idle (or working on non-peer tools) wait invisibly. One cheap call.",
+      "Surface peer messages waiting in the inbox. Call this when you receive a notification about a new peer message, or at the start of your first turn in a session. MCP notifications auto-push alerts when messages arrive, so you do NOT need to call this every turn.",
     inputSchema: { type: "object" as const, properties: {} },
   },
   {
