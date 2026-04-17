@@ -221,6 +221,10 @@ const pendingAcks: string[] = [];
 //     lease acked + are pruned from the durable queue.
 const presentedPendingConfirm = new Set<number>();
 const seen = new Set<number>();
+// Messages for which we already fired a notifications/message push.
+// Prevents the 30s poll loop from re-triggering an auto-wake turn for
+// the same unread message while the model hasn't called check_messages yet.
+const notifiedViaLog = new Set<number>();
 
 function enqueueAck(token: string) {
   pendingAcks.push(token);
@@ -297,6 +301,11 @@ async function pollBrokerIntoQueue(): Promise<void> {
     // replies. Failures are non-fatal — the authoritative path still
     // delivers on the next tool call.
     for (const m of freshlyUnread) {
+      // Skip if we already pushed a notification for this message. Without
+      // this guard, the 30s poll loop re-fires the notification every tick
+      // for unread messages, causing the model to auto-wake and loop on
+      // the same message repeatedly.
+      if (notifiedViaLog.has(m.id)) continue;
       try {
         await mcp.notification({
           method: "notifications/message",
@@ -324,6 +333,7 @@ async function pollBrokerIntoQueue(): Promise<void> {
             },
           },
         });
+        notifiedViaLog.add(m.id);
       } catch (e) {
         log(`preview push failed for msg #${m.id} (non-fatal; tool-call will deliver): ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -393,6 +403,7 @@ async function withPiggyback(
       for (const id of confirming) {
         seen.add(id);
         presentedPendingConfirm.delete(id);
+        notifiedViaLog.delete(id);
       }
     } catch (e) {
       log(`confirm-flush queue-prune failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
