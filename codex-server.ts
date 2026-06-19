@@ -63,6 +63,9 @@ import { formatInboxBlock, formatInboxPreview } from "./shared/piggyback.ts";
 import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
+import { waitForFreshPeerMessages as waitForFreshPeerMessagesLoop } from "./shared/wait-for-peer-messages.ts";
+import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
+import { WakeLaunchClaimStore, type CompleteWakeLaunchClaim } from "./shared/wake-launch-claims.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
 import { sanitizeTerminalText as safe } from "./shared/safe-output.ts";
 import { selectMessagesForPresentation } from "./shared/delivery-state.ts";
@@ -85,6 +88,9 @@ const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const logger = createLogger("codex-mcp");
 const renameMutex = new AsyncMutex();
+const WAIT_FOR_MESSAGES_DEFAULT_MS = 300_000;
+const WAIT_FOR_MESSAGES_MAX_MS = 300_000;
+const WAIT_FOR_MESSAGES_POLL_MS = 500;
 
 function log(msg: string) {
   logger.info("status", { detail: msg });
@@ -153,6 +159,11 @@ Exceptions: you do NOT need to call \`check_messages\` before:
   - running a long sequence of file-editing / shell tools where you
     have no reason to expect a peer interaction. Even then, call
     \`check_messages\` again at the start of the next user turn.
+
+If the user asks you to stand by for peer collaboration, call
+\`wait_for_peer_messages\` with a bounded timeout. It keeps this same
+Codex turn alive until messages arrive or the timeout expires; it is not
+the same as waking a fully idle session.
 
 DELIVERY CHANNELS:
 
@@ -225,6 +236,22 @@ const TOOLS = [
     },
   },
   {
+    name: "wait_for_peer_messages",
+    description:
+      "Stand by for incoming peer messages for up to timeout_ms, then surface them through the normal [PEER INBOX] tool-response path. This keeps this same Codex turn alive; it is not a fully idle wake mechanism.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        timeout_ms: {
+          type: "number" as const,
+          minimum: 0,
+          maximum: WAIT_FOR_MESSAGES_MAX_MS,
+          description: "Maximum time to wait, in milliseconds (default and max: 300000).",
+        },
+      },
+    },
+  },
+  {
     name: "rename_peer",
     description: "Rename YOURSELF. 1-32 chars, [a-zA-Z0-9_-].",
     inputSchema: {
@@ -236,6 +263,18 @@ const TOOLS = [
 ];
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+
+async function waitForFreshPeerMessages(timeoutMs: number): Promise<boolean> {
+  return waitForFreshPeerMessagesLoop({
+    timeoutMs,
+    pollIntervalMs: WAIT_FOR_MESSAGES_POLL_MS,
+    poll: pollBrokerIntoQueue,
+    readUnread: async () => inboxStore ? inboxStore.getUnreadMessages() : [],
+    // Every durable entry remains pending until explicit acknowledgement.
+    isFresh: () => true,
+    onError: (message) => log(`wait_for_peer_messages ${message}`),
+  });
+}
 
 async function pollBrokerIntoQueue(): Promise<void> {
   if (!myId || !mySession || !inboxStore) return;
@@ -318,7 +357,7 @@ async function pollBrokerIntoQueue(): Promise<void> {
 
 async function withPiggyback(
   handler: () => Promise<{ text: string; isError?: boolean }>,
-  opts: { suppressInbox?: boolean } = {},
+  opts: { suppressInbox?: boolean; beforeReadQueue?: () => Promise<void> } = {},
 ): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
   if (!myId || !mySession) {
     return { content: [{ type: "text", text: "Not registered with broker yet" }], isError: true };
@@ -331,6 +370,16 @@ async function withPiggyback(
     await pollBrokerIntoQueue();
   } catch (error) {
     log(`inline poll failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  // Optional pre-draw hook for tools that need to wait before the inbox
+  // snapshot is taken. In particular, wait_for_peer_messages must block here
+  // rather than inside its handler, otherwise messages arriving during the
+  // wait would miss this response's [PEER INBOX] block.
+  try {
+    await opts.beforeReadQueue?.();
+  } catch (e) {
+    log(`before-read hook failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
   let queued: LeasedMessage[] = [];
@@ -363,6 +412,7 @@ async function withPiggyback(
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
+  let waitResult: { didWait: boolean; found: boolean; timeoutMs: number } | null = null;
 
   return withPiggyback(async () => {
     switch (name) {
@@ -430,6 +480,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return { text: `Acknowledged message IDs: ${result.acknowledged_ids.join(", ") || "none"}.${missing}${warning}` };
       }
 
+      case "wait_for_peer_messages": {
+        if (!waitResult?.didWait) {
+          return { text: "wait_for_peer_messages did not run.", isError: true };
+        }
+        if (waitResult.found) {
+          return { text: `Peer message(s) arrived while waiting (${waitResult.timeoutMs}ms timeout).` };
+        }
+        return { text: `No peer messages arrived within ${waitResult.timeoutMs}ms.` };
+      }
+
       case "rename_peer": {
         return renameMutex.runExclusive(async () => {
           const { new_name } = parseRenameToolArgs(args);
@@ -465,7 +525,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       default:
         return { text: `Unknown tool: ${name}`, isError: true };
     }
-  }, { suppressInbox: name === "ack_messages" });
+  }, {
+    suppressInbox: name === "ack_messages",
+    beforeReadQueue: name === "wait_for_peer_messages"
+      ? async () => {
+          const rawTimeout = (args as { timeout_ms?: unknown } | undefined)?.timeout_ms;
+          if (rawTimeout !== undefined && (typeof rawTimeout !== "number" || !Number.isFinite(rawTimeout))) {
+            throw new Error("timeout_ms must be a finite number");
+          }
+          const normalized = rawTimeout === undefined
+            ? WAIT_FOR_MESSAGES_DEFAULT_MS
+            : Math.max(0, Math.min(WAIT_FOR_MESSAGES_MAX_MS, Math.floor(rawTimeout)));
+          const found = await waitForFreshPeerMessages(normalized);
+          waitResult = { didWait: true, found, timeoutMs: normalized };
+        }
+      : undefined,
+  });
 });
 
 async function main() {
@@ -559,6 +634,14 @@ async function main() {
   myReclaimToken = reg.reclaim_token;
   inboxStore = new CodexInboxStore({ peerId: myId });
   await inboxStore.init();
+  await registerWakeableSessionIfEnabled({
+    peerId: myId,
+    peerName: myName,
+    sessionToken: mySession,
+    cwd: myCwd,
+    gitRoot: myGitRoot,
+    tty,
+  });
   setTabTitle(`peer:${myName}`);
   // Note: keepalive was already armed earlier in main(), before register().
   // The setTabTitle above just updates `lastTitle`; the running keepalive
@@ -605,6 +688,92 @@ async function main() {
   // Note: all signal handlers + 'exit' handler are already armed at the top
   // of main(), before any setTabTitle() call — so a terminal close during
   // startup also clears the title.
+}
+
+async function registerWakeableSessionIfEnabled(opts: {
+  peerId: PeerId;
+  peerName: string;
+  sessionToken: string;
+  cwd: string;
+  gitRoot: string | null;
+  tty: string | null;
+}): Promise<void> {
+  const hints = await resolveWakeRegistrationHints(opts);
+  if (!hints) return;
+
+  const appServerPid = hints.app_server_pid;
+  if (!Number.isFinite(appServerPid) || appServerPid <= 0) {
+    log("wake registry skipped: invalid app-server pid in launch hints");
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const registry = new WakeRegistry();
+  await registry.init();
+  await registry.upsert({
+    peer_id: opts.peerId,
+    peer_name: opts.peerName,
+    cwd: opts.cwd,
+    git_root: opts.gitRoot,
+    tty: opts.tty,
+    thread_id: hints.thread_id,
+    rollout_path: hints.rollout_path,
+    app_server_url: hints.app_server_url,
+    app_server_socket_path: hints.app_server_socket_path,
+    app_server_pid: appServerPid,
+    tui_pid: hints.tui_pid,
+    mcp_pid: process.pid,
+    broker_session_token_hash: hashBrokerSessionToken(opts.sessionToken),
+    status: "ready",
+    capabilities: ["app-server-ws"],
+    created_at: hints.created_at,
+    updated_at: now,
+    last_seen_at: now,
+  });
+  if (hints.claim_id !== "env") {
+    await new WakeLaunchClaimStore().consume(hints.claim_id, opts.peerId).catch(() => {});
+  }
+  log(`wake registry updated for thread ${hints.thread_id}`);
+}
+
+async function resolveWakeRegistrationHints(opts: {
+  cwd: string;
+  tty: string | null;
+}): Promise<(CompleteWakeLaunchClaim & { claim_id: string }) | null> {
+  if (process.env.AGENT_PEERS_WAKE_ENABLED === "1") {
+    const threadId = process.env.AGENT_PEERS_WAKE_THREAD_ID;
+    const appServerUrl = process.env.AGENT_PEERS_WAKE_APP_SERVER_URL;
+    const appServerPid = Number.parseInt(process.env.AGENT_PEERS_WAKE_APP_SERVER_PID ?? "", 10);
+    if (!threadId || !appServerUrl || !Number.isFinite(appServerPid) || appServerPid <= 0) {
+      log("wake registry skipped: missing AGENT_PEERS_WAKE_THREAD_ID, AGENT_PEERS_WAKE_APP_SERVER_URL, or AGENT_PEERS_WAKE_APP_SERVER_PID");
+      return null;
+    }
+    const now = new Date().toISOString();
+    return {
+      claim_id: "env",
+      cwd: opts.cwd,
+      tty: opts.tty,
+      requested_peer_name: process.env.PEER_NAME ?? null,
+      app_server_url: appServerUrl,
+      app_server_pid: appServerPid,
+      app_server_socket_path: process.env.AGENT_PEERS_WAKE_APP_SERVER_SOCKET_PATH || null,
+      thread_id: threadId,
+      rollout_path: process.env.AGENT_PEERS_WAKE_ROLLOUT_PATH || null,
+      tui_pid: process.ppid > 0 ? process.ppid : null,
+      status: "ready",
+      created_at: now,
+      updated_at: now,
+      consumed_by_peer_id: null,
+    };
+  }
+
+  const claimStore = new WakeLaunchClaimStore();
+  return claimStore.findMatching({
+    cwd: opts.cwd,
+    tty: opts.tty,
+    waitMs: 30_000,
+    includeConsumed: true,
+  });
 }
 
 main().catch(async (e) => {

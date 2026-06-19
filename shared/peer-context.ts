@@ -21,10 +21,13 @@ export async function getGitRoot(cwd: string): Promise<string | null> {
 }
 
 export function getTty(): string | null {
+  return readProcessTty(process.pid) ?? readProcessTty(process.ppid);
+}
+
+function readProcessTty(pid: number): string | null {
   try {
-    const ppid = process.ppid;
-    if (!ppid) return null;
-    const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]);
+    if (!pid) return null;
+    const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(pid)]);
     const tty = new TextDecoder().decode(proc.stdout).trim();
     if (tty && tty !== "?" && tty !== "??") return tty;
     return null;

@@ -6,6 +6,9 @@ import { createClient } from "./shared/broker-client.ts";
 import { readSharedSecret } from "./shared/shared-secret.ts";
 import { sanitizeTerminalText as safe } from "./shared/safe-output.ts";
 import { parsePort } from "./shared/config.ts";
+import { WakeRegistry, hashBrokerSessionToken } from "./shared/wake-registry.ts";
+import { WakeLaunchClaimStore } from "./shared/wake-launch-claims.ts";
+import type { Peer } from "./shared/types.ts";
 
 const BROKER_PORT = parsePort(process.env.AGENT_PEERS_PORT, 7900);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -16,6 +19,61 @@ const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 // gated by OS file permissions on the DB + secret files.
 const sharedSecret = readSharedSecret();
 const client = createClient(BROKER_URL, sharedSecret ?? "");
+
+interface PeerAuthRow {
+  id: string;
+  session_token: string;
+  name: string;
+  peer_type: string;
+  pid: number;
+  cwd: string;
+  git_root: string | null;
+  tty: string | null;
+}
+
+async function readPeerAuth(target: string): Promise<PeerAuthRow | null> {
+  const { Database } = await import("bun:sqlite");
+  const { resolve } = await import("node:path");
+  const { homedir } = await import("node:os");
+  const dbPath = process.env.AGENT_PEERS_DB || resolve(homedir(), ".agent-peers.db");
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    return db.query<PeerAuthRow, [string, string]>(
+      `SELECT id, session_token, name, peer_type, pid, cwd, git_root, tty
+       FROM peers
+       WHERE id = ? OR name = ?`
+    ).get(target, target) ?? null;
+  } finally {
+    db.close();
+  }
+}
+
+async function readUnreadCountsByPeer(): Promise<Map<string, number>> {
+  const { readdir, readFile } = await import("node:fs/promises");
+  const { homedir } = await import("node:os");
+  const { join } = await import("node:path");
+  const rootDir = process.env.AGENT_PEERS_CODEX_STATE_DIR ?? join(homedir(), ".agent-peers-codex");
+  const counts = new Map<string, number>();
+  let files: string[];
+  try {
+    files = await readdir(rootDir);
+  } catch {
+    return counts;
+  }
+
+  for (const file of files) {
+    if (!file.endsWith(".metadata.json")) continue;
+    try {
+      const raw = await readFile(join(rootDir, file), "utf8");
+      const parsed = JSON.parse(raw) as { unread?: unknown[] };
+      const peerId = decodeURIComponent(file.slice(0, -".metadata.json".length));
+      counts.set(peerId, Array.isArray(parsed.unread) ? parsed.unread.length : 0);
+    } catch {
+      /* ignore malformed metadata */
+    }
+  }
+  return counts;
+}
 
 async function cmdStatus() {
   const alive = await client.isAlive();
@@ -31,6 +89,8 @@ async function cmdStatus() {
     `orphans=${diagnostics.orphaned_messages}`,
   );
   await cmdPeers();
+  console.log("");
+  await cmdWakeStatus();
 }
 
 async function cmdPeers() {
@@ -99,19 +159,7 @@ async function cmdRename(target: string, newName: string) {
   // NOT an unauthenticated HTTP admin endpoint. The security model excludes the
   // /admin/rename-peer HTTP endpoint because any local process could have
   // hijacked peer identities.
-  const { Database } = await import("bun:sqlite");
-  const { resolve } = await import("node:path");
-  const { homedir } = await import("node:os");
-  const dbPath = process.env.AGENT_PEERS_DB || resolve(homedir(), ".agent-peers.db");
-  const db = new Database(dbPath, { readonly: true });
-  let row: { id: string; session_token: string; name: string } | null;
-  try {
-    row = db.query<{ id: string; session_token: string; name: string }, [string, string]>(
-      "SELECT id, session_token, name FROM peers WHERE id = ? OR name = ?"
-    ).get(target, target);
-  } finally {
-    db.close();
-  }
+  const row = await readPeerAuth(target);
   if (!row) {
     console.error(`no peer matching '${target}'`);
     process.exit(1);
@@ -126,6 +174,191 @@ async function cmdRename(target: string, newName: string) {
     process.exit(1);
   }
   console.log(`renamed ${row.name} -> ${res.name}`);
+}
+
+async function cmdRetire(target: string) {
+  // Operator-side graceful shutdown: remove the peer from broker discovery and
+  // remove any wake registry row for this exact peer id. Message history stays
+  // in the broker; inbox files are deliberately left alone.
+  const row = await readPeerAuth(target);
+  if (!row) {
+    const registry = new WakeRegistry();
+    await registry.init();
+    const entry = (await registry.list({ includeStale: true }))
+      .find((candidate) => candidate.peer_id === target || candidate.peer_name === target);
+    if (!entry) {
+      console.error(`no peer or wake registry entry matching '${target}'`);
+      process.exit(1);
+    }
+    await registry.removeByPeerId(entry.peer_id);
+    console.log(`retired stale wake entry ${entry.peer_name} (${entry.peer_id})`);
+    console.log("  broker row was already missing");
+    return;
+  }
+
+  await client.unregister({ id: row.id, session_token: row.session_token });
+
+  const registry = new WakeRegistry();
+  await registry.init();
+  await registry.removeByPeerId(row.id);
+
+  console.log(`retired ${row.name} (${row.id})`);
+  console.log("  removed from broker discovery and wake registry");
+  console.log("  message history and local inbox files were preserved");
+}
+
+async function cmdRepairWake(target: string) {
+  const row = await readPeerAuth(target);
+  if (!row) {
+    console.error(`no peer matching '${target}'`);
+    process.exit(1);
+  }
+  if (row.peer_type !== "codex") {
+    console.error(`peer '${row.name}' is ${row.peer_type}, not codex`);
+    process.exit(1);
+  }
+
+  const claimStore = new WakeLaunchClaimStore();
+  const candidates = await claimStore.listMatchingCandidates({
+    cwd: row.cwd,
+    tty: row.tty,
+    includeConsumed: true,
+    requestedPeerName: row.name,
+  });
+  if (candidates.length === 0) {
+    console.error(`no live wake launch claim found for ${row.name} (cwd=${row.cwd}${row.tty ? ` tty=${row.tty}` : ""})`);
+    process.exit(1);
+  }
+
+  // Ambiguity guard: if two or more *live* sessions with DISTINCT threads match
+  // this cwd/tty, we cannot safely tell which one belongs to this peer — wiring
+  // the wake pointer to the wrong thread would wake the wrong session. Refuse
+  // and tell the operator to retire the stragglers first. (This is the
+  // same-repo / null-tty Zed case where cwd+tty alone can't disambiguate.)
+  const liveThreads = new Set(candidates.filter((c) => c.live).map((c) => c.thread_id));
+  if (liveThreads.size > 1) {
+    console.error(`ambiguous wake claims for ${row.name}: ${liveThreads.size} live sessions share cwd=${row.cwd}${row.tty ? ` tty=${row.tty}` : ""}`);
+    for (const c of candidates.filter((c) => c.live)) {
+      console.error(`  thread=${c.thread_id}  app_server=${c.app_server_url}  app_server_pid=${c.app_server_pid}`);
+    }
+    console.error("refusing to guess. Retire the session(s) you don't want with `codex-peer retire <name-or-id>`, then retry repair-wake.");
+    process.exit(1);
+  }
+
+  // Prefer a live candidate; fall back to the newest complete claim.
+  const claim = candidates.find((c) => c.live) ?? candidates[0]!;
+
+  const now = new Date().toISOString();
+  const registry = new WakeRegistry();
+  await registry.init();
+  await registry.upsert({
+    peer_id: row.id,
+    peer_name: row.name,
+    cwd: row.cwd,
+    git_root: row.git_root,
+    tty: row.tty,
+    thread_id: claim.thread_id,
+    rollout_path: claim.rollout_path,
+    app_server_url: claim.app_server_url,
+    app_server_socket_path: claim.app_server_socket_path,
+    app_server_pid: claim.app_server_pid,
+    tui_pid: claim.tui_pid,
+    mcp_pid: row.pid,
+    broker_session_token_hash: hashBrokerSessionToken(row.session_token),
+    status: "ready",
+    capabilities: ["app-server-ws"],
+    created_at: claim.created_at,
+    updated_at: now,
+    last_seen_at: now,
+  });
+  await claimStore.consume(claim.claim_id, row.id).catch(() => {});
+
+  console.log(`repaired wake registry for ${row.name} (${row.id})`);
+  console.log(`  thread=${claim.thread_id}`);
+  console.log(`  app_server=${claim.app_server_url}`);
+}
+
+async function cmdWakeStatus() {
+  const peers = await client.listPeers({
+    scope: "machine", cwd: process.cwd(), git_root: null,
+  });
+  const codexPeers = peers.filter((peer) => peer.peer_type === "codex");
+
+  const registry = new WakeRegistry();
+  await registry.init();
+  const registryEntries = await registry.list({ includeStale: true });
+  const registryByPeerId = new Map(registryEntries.map((entry) => [entry.peer_id, entry]));
+  const unreadCounts = await readUnreadCountsByPeer();
+
+  if (codexPeers.length === 0 && registryEntries.length === 0) {
+    console.log("wakeable codex: no live Codex peers or wake registry entries");
+    return;
+  }
+
+  const rows = codexPeers.sort(comparePeers).map((peer) => ({
+    peer,
+    entry: registryByPeerId.get(peer.id),
+    pending: unreadCounts.get(peer.id) ?? 0,
+  }));
+  const wakeableRows = rows.filter((row) => row.entry?.status === "ready");
+  const needsRepairRows = rows.filter((row) =>
+    !row.entry && /(?:^|-)codex(?:-\d+)?$/.test(row.peer.name)
+  );
+  const otherRows = rows.filter((row) =>
+    !wakeableRows.includes(row) && !needsRepairRows.includes(row)
+  );
+
+  console.log("wakeable Codex sessions:");
+  if (wakeableRows.length === 0) {
+    console.log("  (none)");
+  } else {
+    for (const row of wakeableRows) printWakePeer(row.peer, row.entry, row.pending);
+  }
+
+  if (needsRepairRows.length > 0) {
+    console.log("");
+    console.log("Codex peers that look like wakeable launches but need repair:");
+    for (const row of needsRepairRows) printWakePeer(row.peer, row.entry, row.pending);
+  }
+
+  if (otherRows.length > 0) {
+    console.log("");
+    console.log("Other live Codex peers:");
+    for (const row of otherRows) printWakePeer(row.peer, row.entry, row.pending);
+  }
+
+  const liveIds = new Set(codexPeers.map((peer) => peer.id));
+  const registryOnly = registryEntries.filter((entry) => !liveIds.has(entry.peer_id));
+  if (registryOnly.length > 0) {
+    console.log("");
+    console.log("Stale or registry-only wake entries:");
+    for (const entry of registryOnly) {
+      const pending = unreadCounts.get(entry.peer_id) ?? 0;
+      console.log(`  ${entry.peer_name}  broker=missing  wakeable=${entry.status === "ready" ? "registry-only" : `no (${entry.status})`}  unread=${pending}  id=${entry.peer_id}`);
+      console.log(`    cwd=${entry.cwd}${entry.tty ? `  tty=${entry.tty}` : ""}`);
+      console.log(`    thread=${entry.thread_id}  app_server_pid=${entry.app_server_pid}  mcp_pid=${entry.mcp_pid}${entry.tui_pid ? `  tui_pid=${entry.tui_pid}` : ""}`);
+    }
+  }
+
+  if (needsRepairRows.length > 0) {
+    console.log("");
+    console.log("tip: run codex-peer repair-wake <name-or-id> for any live Codex peer that should be wakeable.");
+    console.log("     run codex-peer retire <name-or-id> to remove stale/confusing names from discovery.");
+  }
+}
+
+function printWakePeer(peer: Peer, entry: Awaited<ReturnType<WakeRegistry["list"]>>[number] | undefined, pending: number): void {
+  const wakeable = entry ? (entry.status === "ready" ? "yes" : `no (${entry.status})`) : "no";
+  console.log(`  ${peer.name}  wakeable=${wakeable}  unread=${pending}  id=${peer.id}`);
+  console.log(`    cwd=${peer.cwd}${peer.tty ? `  tty=${peer.tty}` : ""}`);
+  if (entry) {
+    console.log(`    thread=${entry.thread_id}  app_server_pid=${entry.app_server_pid}  mcp_pid=${entry.mcp_pid}${entry.tui_pid ? `  tui_pid=${entry.tui_pid}` : ""}`);
+  }
+  if (peer.summary) console.log(`    summary: ${peer.summary}`);
+}
+
+function comparePeers(a: Peer, b: Peer): number {
+  return a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
 }
 
 async function cmdMessages() {
@@ -269,6 +502,10 @@ switch (sub) {
   case "peers":
     await cmdPeers();
     break;
+  case "wake-status":
+  case "live":
+    await cmdWakeStatus();
+    break;
   case "send":
     if (rest.length < 2) {
       console.error("usage: cli.ts send <name-or-id> <message>");
@@ -282,6 +519,22 @@ switch (sub) {
       process.exit(2);
     }
     await cmdRename(rest[0]!, rest[1]!);
+    break;
+  case "retire":
+  case "unregister":
+    if (rest.length !== 1) {
+      console.error("usage: cli.ts retire <name-or-id>");
+      process.exit(2);
+    }
+    await cmdRetire(rest[0]!);
+    break;
+  case "repair-wake":
+  case "attach-wake":
+    if (rest.length !== 1) {
+      console.error("usage: cli.ts repair-wake <name-or-id>");
+      process.exit(2);
+    }
+    await cmdRepairWake(rest[0]!);
     break;
   case "messages":
     await cmdMessages();
@@ -299,8 +552,11 @@ switch (sub) {
     console.log(`usage:
   bun cli.ts status
   bun cli.ts peers
+  bun cli.ts wake-status
   bun cli.ts send <name-or-id> <message>
   bun cli.ts rename <name-or-id> <new-name>
+  bun cli.ts retire <name-or-id>
+  bun cli.ts repair-wake <name-or-id>
   bun cli.ts messages
   bun cli.ts orphaned-messages
   bun cli.ts purge

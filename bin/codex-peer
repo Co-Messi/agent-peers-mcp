@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="${AGENT_PEERS_MCP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+GOOGLE_ADS_REPO="${GOOGLE_ADS_EXPERT_REPO:-/Users/mike/www/ai/google-ads-expert}"
+CCR_WEBSITE_REPO="${CCR_WEBSITE_REPO:-/Users/mike/www/ai/ccr-website}"
+DEFAULT_INSTALL_PATH="${HOME}/.local/bin/codex-peer"
+DOC_PATH="${ROOT_DIR}/docs/examples/wakeable-codex-peer-demo.html"
+
+STATE_DIR="${AGENT_PEERS_CODEX_STATE_DIR:-${HOME}/.agent-peers-codex}"
+DAEMON_PIDFILE="${STATE_DIR}/wake-daemon.pid"
+DAEMON_LOGFILE="${STATE_DIR}/wake-daemon.log"
+DAEMON_LOCKDIR="${STATE_DIR}/wake-daemon.lock"
+DAEMON_INTERVAL="${CODEX_PEER_DAEMON_INTERVAL:-5}"
+
+usage() {
+  cat <<'EOF'
+codex-peer: easy launcher for wakeable Codex peers on the agent peer network
+
+Simple zsh aliases installed on Mike's machine:
+  peerwake   -> codex-peer daemon
+  adspeer    -> codex-peer google-ads
+  ccrpeer    -> codex-peer ccr
+  peerlist   -> codex-peer peers
+  peerstatus -> codex-peer live
+  peerrepair -> codex-peer repair-wake
+  peerretire -> codex-peer retire
+  peerdoc    -> codex-peer doc
+
+Usage:
+  codex-peer
+      Start wakeable Codex in the current directory.
+      Auto-names the peer from the repo, like ccr-website-codex.
+
+  codex-peer google-ads [-- extra codex args]
+      Start a wakeable Codex peer in /Users/mike/www/ai/google-ads-expert
+      with peer name google-ads-codex.
+
+  codex-peer ccr [-- extra codex args]
+      Start a wakeable Codex peer in /Users/mike/www/ai/ccr-website
+      with peer name ccr-codex.
+
+  codex-peer start <peer-name> <repo-path> [-- extra codex args]
+      Start any repo as a wakeable Codex peer with a stable peer name.
+
+  codex-peer daemon [seconds]
+      Run the wake loop in the FOREGROUND. Keep this open in one Zed terminal.
+      Default interval: 5 seconds. You normally do NOT need this — any launch
+      (codex-peer / google-ads / ccr / start) auto-starts a background daemon.
+
+  codex-peer daemon-stop
+      Stop the background wake daemon.
+
+  codex-peer daemon-status
+      Report whether the background wake daemon is running.
+
+  codex-peer wake
+      Run one wake pass, then exit.
+
+  codex-peer send <peer-name-or-id> <message...>
+      Send a shell-originated peer message.
+
+  codex-peer peers
+  codex-peer status
+  codex-peer live
+  codex-peer messages
+      Inspect the peer network.
+
+  codex-peer retire <peer-name-or-id>
+      Mark a peer as intentionally gone and remove its wake pointer.
+      Use this when a closed/stuck Codex session is confusing discovery.
+
+  codex-peer repair-wake <peer-name-or-id>
+      Attach a live Codex peer to its matching wakeable app-server session.
+      Use this if live/status says wakeable=no but the session was started by codex-peer.
+
+  codex-peer doc
+      Open the illustrated HTML explainer.
+
+  codex-peer install [path]
+      Symlink this command to ~/.local/bin/codex-peer by default.
+
+Examples:
+  codex-peer
+  codex-peer daemon
+  codex-peer google-ads
+  codex-peer ccr
+  codex-peer send ccr-codex "Google Ads peer here. Please list peers and reply."
+  codex-peer live
+  codex-peer retire ccr-codex-2
+  codex-peer repair-wake ccr-codex-2
+EOF
+}
+
+die() {
+  printf 'codex-peer: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+ensure_repo() {
+  local repo="$1"
+  [ -d "$repo" ] || die "repo path does not exist: $repo"
+}
+
+canonical_dir() {
+  local dir="$1"
+  (cd "$dir" && pwd -P)
+}
+
+repo_root_or_dir() {
+  local dir="$1"
+  git -C "$dir" rev-parse --show-toplevel 2>/dev/null || canonical_dir "$dir"
+}
+
+sanitize_peer_segment() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9_-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
+}
+
+auto_peer_name() {
+  local repo_path="$1"
+  local repo_root repo_root_canon google_canon ccr_canon base clean max_base
+  repo_root="$(repo_root_or_dir "$repo_path")"
+  repo_root_canon="$(canonical_dir "$repo_root")"
+  google_canon="$(canonical_dir "$GOOGLE_ADS_REPO" 2>/dev/null || printf '%s' "$GOOGLE_ADS_REPO")"
+  ccr_canon="$(canonical_dir "$CCR_WEBSITE_REPO" 2>/dev/null || printf '%s' "$CCR_WEBSITE_REPO")"
+
+  case "$repo_root_canon" in
+    "$google_canon") printf 'google-ads-codex\n'; return ;;
+    "$ccr_canon") printf 'ccr-codex\n'; return ;;
+  esac
+
+  base="$(basename "$repo_root_canon")"
+  clean="$(sanitize_peer_segment "$base")"
+  [ -n "$clean" ] || clean="repo"
+
+  max_base=26
+  if [ "${#clean}" -gt "$max_base" ]; then
+    clean="${clean:0:$max_base}"
+    clean="$(printf '%s' "$clean" | sed -E 's/-+$//')"
+    [ -n "$clean" ] || clean="repo"
+  fi
+  printf '%s-codex\n' "$clean"
+}
+
+run_bun() {
+  need_cmd bun
+  cd "$ROOT_DIR"
+  bun "$@"
+}
+
+start_peer() {
+  local peer_name="$1"
+  local repo_path="$2"
+  shift 2
+  ensure_repo "$repo_path"
+  need_cmd codex
+  ensure_daemon
+  run_bun wakeable-codex.ts --cwd "$repo_path" --name "$peer_name" "$@"
+}
+
+start_here() {
+  local repo_path peer_name
+  repo_path="$(canonical_dir "$PWD")"
+  peer_name="$(auto_peer_name "$repo_path")"
+  printf 'codex-peer: starting wakeable Codex in %s as %s\n' "$repo_path" "$peer_name" >&2
+  start_peer "$peer_name" "$repo_path" "$@"
+}
+
+# Print the PID of a live wake daemon (and succeed) or return non-zero.
+daemon_pid() {
+  [ -f "$DAEMON_PIDFILE" ] || return 1
+  local pid
+  pid="$(cat "$DAEMON_PIDFILE" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 1
+  if kill -0 "$pid" 2>/dev/null; then
+    printf '%s' "$pid"
+    return 0
+  fi
+  return 1
+}
+
+# Idempotently make sure a background wake daemon is running. Called by every
+# launch path so Mike never has to remember to start `peerwake` by hand — after
+# a reboot, the first `codexpeer` launch brings the waker up on its own. Safe to
+# call concurrently: an atomic lock dir ensures only one racer starts it.
+ensure_daemon() {
+  mkdir -p "$STATE_DIR"
+  if daemon_pid >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! mkdir "$DAEMON_LOCKDIR" 2>/dev/null; then
+    return 0  # another launch is already starting it
+  fi
+  if daemon_pid >/dev/null 2>&1; then
+    rmdir "$DAEMON_LOCKDIR" 2>/dev/null || true
+    return 0
+  fi
+  nohup "$ROOT_DIR/bin/codex-peer" daemon "$DAEMON_INTERVAL" >>"$DAEMON_LOGFILE" 2>&1 &
+  local dpid=$!
+  printf '%s\n' "$dpid" >"$DAEMON_PIDFILE"
+  disown 2>/dev/null || true
+  rmdir "$DAEMON_LOCKDIR" 2>/dev/null || true
+  printf 'codex-peer: started background wake daemon (pid %s, log %s)\n' "$dpid" "$DAEMON_LOGFILE" >&2
+}
+
+daemon_stop() {
+  local pid
+  if pid="$(daemon_pid 2>/dev/null)"; then
+    kill "$pid" 2>/dev/null || true
+    rm -f "$DAEMON_PIDFILE"
+    printf 'codex-peer: stopped wake daemon (pid %s)\n' "$pid"
+  else
+    rm -f "$DAEMON_PIDFILE" 2>/dev/null || true
+    printf 'codex-peer: no running wake daemon\n'
+  fi
+}
+
+daemon_status() {
+  local pid
+  if pid="$(daemon_pid 2>/dev/null)"; then
+    printf 'codex-peer: wake daemon running (pid %s, log %s)\n' "$pid" "$DAEMON_LOGFILE"
+  else
+    printf 'codex-peer: wake daemon not running\n'
+  fi
+}
+
+run_daemon() {
+  local interval="${1:-5}"
+  case "$interval" in
+    ''|*[!0-9]*) die "daemon interval must be a whole number of seconds" ;;
+  esac
+  mkdir -p "$STATE_DIR"
+  local existing
+  if existing="$(daemon_pid 2>/dev/null)"; then
+    if [ "$existing" != "$$" ]; then
+      die "wake daemon already running (pid $existing). Stop it with 'codex-peer daemon-stop' first."
+    fi
+  fi
+  printf '%s\n' "$$" >"$DAEMON_PIDFILE"
+  trap 'rm -f "$DAEMON_PIDFILE"' EXIT
+  trap 'rm -f "$DAEMON_PIDFILE"; exit 130' INT TERM
+  printf 'codex-peer: wake daemon running every %s seconds. Leave this terminal open.\n' "$interval"
+  printf 'codex-peer: press Ctrl-C to stop.\n'
+  while true; do
+    run_bun wake-daemon.ts --quiet-noop
+    sleep "$interval"
+  done
+}
+
+install_command() {
+  local dest="${1:-$DEFAULT_INSTALL_PATH}"
+  local dest_dir
+  dest_dir="$(dirname "$dest")"
+  mkdir -p "$dest_dir"
+  ln -sfn "$ROOT_DIR/bin/codex-peer" "$dest"
+  printf 'codex-peer: installed command shim at %s\n' "$dest"
+  case ":$PATH:" in
+    *":$dest_dir:"*) ;;
+    *) printf 'codex-peer: warning: %s is not currently in PATH for this shell.\n' "$dest_dir" >&2 ;;
+  esac
+}
+
+open_doc() {
+  [ -f "$DOC_PATH" ] || die "doc not found: $DOC_PATH"
+  if command -v open >/dev/null 2>&1; then
+    open "$DOC_PATH"
+  else
+    printf '%s\n' "$DOC_PATH"
+  fi
+}
+
+cmd="${1:-here}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+case "$cmd" in
+  help|-h|--help)
+    usage
+    ;;
+  here|.)
+    start_here "$@"
+    ;;
+  google-ads|ads)
+    start_peer "google-ads-codex" "$GOOGLE_ADS_REPO" "$@"
+    ;;
+  ccr|ccr-website)
+    start_peer "ccr-codex" "$CCR_WEBSITE_REPO" "$@"
+    ;;
+  start)
+    [ "$#" -ge 2 ] || die "usage: codex-peer start <peer-name> <repo-path> [-- extra codex args]"
+    peer_name="$1"
+    repo_path="$2"
+    shift 2
+    start_peer "$peer_name" "$repo_path" "$@"
+    ;;
+  daemon)
+    run_daemon "${1:-5}"
+    ;;
+  daemon-stop|stop-daemon)
+    daemon_stop
+    ;;
+  daemon-status)
+    daemon_status
+    ;;
+  ensure-daemon)
+    ensure_daemon
+    ;;
+  wake|wake-once)
+    run_bun wake-daemon.ts
+    ;;
+  send)
+    [ "$#" -ge 2 ] || die "usage: codex-peer send <peer-name-or-id> <message...>"
+    target="$1"
+    shift
+    run_bun cli.ts send "$target" "$*"
+    ;;
+  peers)
+    run_bun cli.ts peers
+    ;;
+  live|wake-status)
+    run_bun cli.ts wake-status
+    ;;
+  status)
+    run_bun cli.ts status
+    ;;
+  retire|unregister)
+    [ "$#" -eq 1 ] || die "usage: codex-peer retire <peer-name-or-id>"
+    run_bun cli.ts retire "$1"
+    ;;
+  repair-wake|attach-wake)
+    [ "$#" -eq 1 ] || die "usage: codex-peer repair-wake <peer-name-or-id>"
+    run_bun cli.ts repair-wake "$1"
+    ;;
+  messages)
+    run_bun cli.ts messages
+    ;;
+  doc|open-doc)
+    open_doc
+    ;;
+  install)
+    install_command "${1:-$DEFAULT_INSTALL_PATH}"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

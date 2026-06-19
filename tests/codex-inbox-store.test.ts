@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmod, link, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir, platform } from "node:os";
 
@@ -117,6 +117,43 @@ test("CodexInboxStore.removeByIds persists across restart", async () => {
   const second = new CodexInboxStore({ peerId: "peer-123", rootDir: dir });
   await second.init();
   expect((await second.getUnreadMessages()).map((m) => m.id)).toEqual([1, 3]);
+});
+
+test("CodexInboxStore writes adjacent bodyless metadata without message bodies or lease tokens", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+
+  const store = new CodexInboxStore({ peerId: "peer-123", rootDir: dir });
+  await store.init();
+  await store.queueLeasedMessages([
+    message(1, { text: "SECRET MESSAGE BODY", lease_token: "SECRET LEASE TOKEN" }),
+  ]);
+
+  const metadataPath = join(dir, `${encodeURIComponent("peer-123")}.metadata.json`);
+  const raw = await readFile(metadataPath, "utf8");
+  const parsed = JSON.parse(raw) as { unread: Array<Record<string, unknown>> };
+
+  expect(raw).not.toContain("SECRET MESSAGE BODY");
+  expect(raw).not.toContain("SECRET LEASE TOKEN");
+  expect(parsed.unread).toHaveLength(1);
+  expect(parsed.unread[0]?.id).toBe(1);
+  expect(parsed.unread[0]).not.toHaveProperty("text");
+  expect(parsed.unread[0]).not.toHaveProperty("lease_token");
+});
+
+test("CodexInboxStore metadata updates do not remove authoritative queued messages", async () => {
+  const store = await makeStore("peer-meta");
+  await store.queueLeasedMessages([message(1), message(2)]);
+
+  const metadata = await store.getUnreadMessageMetadata();
+  expect(metadata.map((m) => m.id)).toEqual([1, 2]);
+  expect(metadata[0]).not.toHaveProperty("text");
+  expect(metadata[0]).not.toHaveProperty("lease_token");
+
+  const unread = await store.getUnreadMessages();
+  expect(unread.map((m) => m.id)).toEqual([1, 2]);
+  expect(unread[0]?.text).toBe("message-1");
+  expect(unread[0]?.lease_token).toBe("lease-1");
 });
 
 test.if(IS_POSIX)("CodexInboxStore writes inbox file at 0o600 and directory at 0o700", async () => {
