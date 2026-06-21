@@ -20,7 +20,14 @@ export function parseWakeableLauncherArgs(argv: string[]): WakeableLauncherOptio
   const opts: WakeableLauncherOptions = {
     cwd: process.cwd(),
     noAltScreen: true,
-    materialize: false,
+    // Materialize by default: `thread/start` only reserves a rollout path; the
+    // rollout JSONL is not written to disk until the thread takes its first
+    // turn. `codex resume --remote <threadId>` requires that on-disk rollout to
+    // exist, so without a setup turn the bare `codexpeer` launch fails with
+    // "no rollout found for thread id ... (code -32600)". `--no-materialize`
+    // remains as an experimental opt-out. See
+    // .specs/2026-06-18-wakeable-codex-zed-recipe.md and error-patterns.md.
+    materialize: true,
     extraCodexArgs: [],
   };
 

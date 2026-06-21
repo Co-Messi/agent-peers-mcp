@@ -28,8 +28,14 @@ test("parseWakeableLauncherArgs parses launcher flags and passthrough args", () 
   expect(opts.extraCodexArgs).toEqual(["--model", "gpt-5"]);
 });
 
-test("parseWakeableLauncherArgs defaults to no visible materialization turn", () => {
+test("parseWakeableLauncherArgs materializes by default so bare resume has a rollout", () => {
   const opts = parseWakeableLauncherArgs([]);
+
+  expect(opts.materialize).toBe(true);
+});
+
+test("parseWakeableLauncherArgs honors --no-materialize opt-out", () => {
+  const opts = parseWakeableLauncherArgs(["--no-materialize"]);
 
   expect(opts.materialize).toBe(false);
 });
