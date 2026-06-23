@@ -12,6 +12,12 @@ DAEMON_PIDFILE="${STATE_DIR}/wake-daemon.pid"
 DAEMON_LOGFILE="${STATE_DIR}/wake-daemon.log"
 DAEMON_LOCKDIR="${STATE_DIR}/wake-daemon.lock"
 DAEMON_INTERVAL="${CODEX_PEER_DAEMON_INTERVAL:-5}"
+# Size-based rotation for the wake-daemon log so it can never grow unbounded.
+# When the live log reaches DAEMON_LOG_MAX_BYTES it is copy-truncated to .1, .2…
+# keeping DAEMON_LOG_KEEP rotations. Copytruncate (not rename) because the
+# backgrounded daemon holds the log fd open in append mode for its whole life.
+DAEMON_LOG_MAX_BYTES="${CODEX_PEER_DAEMON_LOG_MAX_BYTES:-5242880}"  # 5 MiB
+DAEMON_LOG_KEEP="${CODEX_PEER_DAEMON_LOG_KEEP:-3}"
 
 usage() {
   cat <<'EOF'
@@ -230,6 +236,26 @@ daemon_status() {
   fi
 }
 
+# Copy-truncate the daemon log once it exceeds the size cap, keeping a bounded
+# number of rotations. Safe to call from inside the daemon loop: the daemon's
+# append-mode fd seeks to EOF on every write, so truncating the file in place
+# makes subsequent writes resume at offset 0 with no corruption (at most a line
+# or two written between the copy and the truncate is lost).
+rotate_daemon_log_if_needed() {
+  [ -f "$DAEMON_LOGFILE" ] || return 0
+  case "$DAEMON_LOG_MAX_BYTES" in ''|*[!0-9]*) return 0 ;; esac
+  local size
+  size="$(wc -c <"$DAEMON_LOGFILE" 2>/dev/null | tr -d '[:space:]')" || return 0
+  [ -n "$size" ] || return 0
+  [ "$size" -ge "$DAEMON_LOG_MAX_BYTES" ] || return 0
+  local i
+  for (( i=DAEMON_LOG_KEEP-1; i>=1; i-- )); do
+    [ -f "${DAEMON_LOGFILE}.$i" ] && mv -f "${DAEMON_LOGFILE}.$i" "${DAEMON_LOGFILE}.$((i+1))"
+  done
+  cp -f "$DAEMON_LOGFILE" "${DAEMON_LOGFILE}.1" 2>/dev/null || return 0
+  : >"$DAEMON_LOGFILE"
+}
+
 run_daemon() {
   local interval="${1:-5}"
   case "$interval" in
@@ -245,9 +271,10 @@ run_daemon() {
   printf '%s\n' "$$" >"$DAEMON_PIDFILE"
   trap 'rm -f "$DAEMON_PIDFILE"' EXIT
   trap 'rm -f "$DAEMON_PIDFILE"; exit 130' INT TERM
-  printf 'codex-peer: wake daemon running every %s seconds. Leave this terminal open.\n' "$interval"
-  printf 'codex-peer: press Ctrl-C to stop.\n'
+  printf '%s codex-peer: wake daemon running every %s seconds. Leave this terminal open.\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$interval"
+  printf '%s codex-peer: press Ctrl-C to stop.\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   while true; do
+    rotate_daemon_log_if_needed
     run_bun wake-daemon.ts --quiet-noop
     sleep "$interval"
   done

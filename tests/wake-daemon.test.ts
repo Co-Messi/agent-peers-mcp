@@ -138,7 +138,15 @@ test("runWakePass refuses not-loaded threads", async () => {
     appServerClientFactory: () => client,
   });
 
-  expect(results).toEqual([{ peer_id: "peer-1", thread_id: "thread-1", action: "skip", reason: "thread_not_loaded" }]);
+  expect(results).toEqual([{
+    peer_id: "peer-1",
+    peer_name: "wake-peer",
+    cwd: "/repo",
+    thread_id: "thread-1",
+    action: "skip",
+    reason: "thread_not_loaded",
+    log: true,
+  }]);
   expect(client.startCalls).toHaveLength(0);
 });
 
