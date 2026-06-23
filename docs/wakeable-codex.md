@@ -155,6 +155,12 @@ Relevant environment variables:
 |---|---|---|
 | `AGENT_PEERS_CODEX_STATE_DIR` | `~/.agent-peers-codex` | Inbox + wake registry/daemon state dir |
 | `CODEX_PEER_DAEMON_INTERVAL` | `5` | Background daemon poll interval (seconds) |
+| `CODEX_PEER_DAEMON_LOG_MAX_BYTES` | `5242880` | Size at which `wake-daemon.log` is rotated (copy-truncate) |
+| `CODEX_PEER_DAEMON_LOG_KEEP` | `3` | Number of rotated wake-daemon logs to keep |
+
+Day-to-day wake-daemon operations — log format, how repeated skips are coalesced,
+the wedged-peer (`systemError`) backoff + bounce signal, and rotation — are
+documented in [wake-daemon.md](wake-daemon.md).
 
 The launcher also injects internal `AGENT_PEERS_WAKE_*` config into the app-server's
 MCP child (app-server URL/pid, thread id, rollout path) so the visible session

@@ -320,6 +320,11 @@ Full design, security model, and failure-mode notes: [`docs/wakeable-codex.md`](
 | `AGENT_PEERS_DISABLE_TAB_TITLE` | — | Set to `1` to skip terminal tab title writing |
 | `AGENT_PEERS_CODEX_STATE_DIR` | `~/.agent-peers-codex` | Codex durable inbox + wake registry/daemon state dir |
 | `CODEX_PEER_DAEMON_INTERVAL` | `5` | Background wake daemon poll interval (seconds) |
+| `CODEX_PEER_DAEMON_LOG_MAX_BYTES` | `5242880` | Size at which `wake-daemon.log` is rotated (copy-truncate) |
+| `CODEX_PEER_DAEMON_LOG_KEEP` | `3` | Number of rotated wake-daemon logs to keep |
+
+See [docs/wake-daemon.md](docs/wake-daemon.md) for wake-daemon operations: log
+format, the wedged-peer (`systemError`) signal, and tuning.
 
 ---
 
