@@ -9,6 +9,7 @@ import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, chmodSync, openSync, closeSync, writeSync, fsyncSync, linkSync, unlinkSync, existsSync, renameSync, statSync } from "node:fs";
 import { validateSecretFilePerms } from "./shared/shared-secret.ts";
+import { createHealthProof } from "./shared/broker-auth.ts";
 import type {
   RegisterRequest, RegisterResponse, Peer,
   ListPeersRequest, SendMessageRequest, SendMessageResponse,
@@ -830,7 +831,17 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
       const url = new URL(req.url);
       try {
         if (req.method === "GET" && url.pathname === "/health") {
-          return json({ ok: true, pid: process.pid });
+          const nonce = url.searchParams.get("nonce") ?? "";
+          try {
+            return json({
+              ok: true,
+              pid: process.pid,
+              nonce,
+              proof: createHealthProof(sharedSecret, nonce, process.pid),
+            });
+          } catch {
+            return json({ error: "invalid health challenge" }, { status: 400 });
+          }
         }
         if (req.method !== "POST") return json({ error: "method not allowed" }, { status: 405 });
 

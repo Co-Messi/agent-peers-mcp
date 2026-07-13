@@ -69,7 +69,7 @@ import {
 
 import { createClient } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
-import { waitForSharedSecret } from "./shared/shared-secret.ts";
+import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts";
 import { getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
@@ -90,10 +90,8 @@ function log(msg: string) {
 
 let client: ReturnType<typeof createClient>;
 async function isBrokerAlive(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-    return res.ok;
-  } catch { return false; }
+  const secret = readSharedSecret();
+  return secret ? createClient(BROKER_URL, secret).isAlive() : false;
 }
 
 let myId: PeerId | null = null;

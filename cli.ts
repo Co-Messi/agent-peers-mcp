@@ -219,22 +219,22 @@ async function cmdOrphans() {
 }
 
 async function cmdKillBroker() {
-  const proc = Bun.spawn(["lsof", "-t", "-i", `:${BROKER_PORT}`], {
-    stdout: "pipe", stderr: "ignore",
-  });
-  const out = (await new Response(proc.stdout).text()).trim();
-  await proc.exited;
-  if (!out) {
+  if (!sharedSecret) {
+    console.error("cannot authenticate broker: shared secret is unavailable");
+    process.exitCode = 1;
+    return;
+  }
+  const health = await client.health();
+  if (!health) {
     console.log("broker not running");
     return;
   }
-  for (const pid of out.split("\n")) {
-    try {
-      process.kill(Number(pid), "SIGTERM");
-      console.log(`killed pid=${pid}`);
-    } catch (e) {
-      console.error(`kill ${pid} failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
+  try {
+    process.kill(health.pid, "SIGTERM");
+    console.log(`killed authenticated broker pid=${health.pid}`);
+  } catch (e) {
+    console.error(`kill ${health.pid} failed: ${e instanceof Error ? e.message : String(e)}`);
+    process.exitCode = 1;
   }
 }
 

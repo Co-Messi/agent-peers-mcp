@@ -88,6 +88,43 @@ test("broker-client isAlive returns true for live broker, false for wrong port",
   expect(await dead.isAlive()).toBe(false);
 });
 
+test("broker-client rejects an unauthenticated service that only mimics /health", async () => {
+  const impostor = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch() {
+      return Response.json({ ok: true, pid: 12345 });
+    },
+  });
+  try {
+    const client = createClient(`http://127.0.0.1:${impostor.port}`, testSecret);
+    expect(await client.isAlive()).toBe(false);
+  } finally {
+    impostor.stop(true);
+  }
+});
+
+test("broker-client times out authenticated requests", async () => {
+  const stalled = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch() {
+      await Bun.sleep(5_000);
+      return Response.json({});
+    },
+  });
+  try {
+    const client = createClient(`http://127.0.0.1:${stalled.port}`, testSecret, {
+      requestTimeoutMs: 30,
+    });
+    const started = Date.now();
+    await expect(client.listPeers({ scope: "machine", cwd: "/", git_root: null })).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(500);
+  } finally {
+    stalled.stop(true);
+  }
+});
+
 test("broker rejects HTTP requests without the shared-secret header (auth regression)", async () => {
   // Codex round-C: mere localhost binding is NOT a trust boundary on
   // shared/multi-user hosts. Broker must require the X-Agent-Peers-Secret
