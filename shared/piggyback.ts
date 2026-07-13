@@ -47,7 +47,9 @@ export function formatInboxBlock(messages: LeasedMessage[]): string {
     `  - If it needs investigation: go investigate. Reply only when you have a real answer, a blocker, or a clarifying question.\n` +
     `  - If it's FYI: note it internally, don't auto-reply. Silence is fine.\n` +
     `  - If you disagree: push back with a specific reason.\n` +
-    `Do NOT auto-acknowledge. "Got it" / "on it" is noise.`;
+    `Do NOT auto-acknowledge with chat text. "Got it" / "on it" is noise.\n` +
+    `After you have actually processed these messages, explicitly confirm durable delivery with: ` +
+    `ack_messages(message_ids=[${messages.map((message) => message.id).join(", ")}]).`;
 
   const blocks = messages.map((m, i) =>
     [

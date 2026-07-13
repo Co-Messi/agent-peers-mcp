@@ -38,7 +38,7 @@ Scope: broker, both MCP adapters, CLI-facing client behavior, persistence, docum
 | Late Codex ack could confirm an expired lease and duplicate delivery | Broker returns the exact accepted tokens; Codex removes only those tokens from pending state. Expired acknowledgements remain pending until a new lease token is obtained. | late-ack and replacement-token tests |
 | Register/unregister bypassed rate limit | Short-window registration events are independent of peer rows and survive unregister. | register/unregister rate test |
 | Live PID reuse could strand a file lock | Lock ownership includes the process start identity, not PID alone. | PID-reuse lock test |
-| Seen/pending state could grow without bound | Confirmed acknowledgement state is removed, batches are bounded, and per-message queues replace older lease tokens. | delivery-state tests |
+| Delivery heuristics could acknowledge an unseen response | Only an explicit `ack_messages` call removes durable entries; acknowledgement batches are bounded. | explicit-ack and durable-inbox tests |
 | Insecure inbox mode was silently repaired/read | Existing inbox files fail closed unless mode is exactly 0600. | insecure-mode test |
 
 ## Supply-chain and operations changes
@@ -50,7 +50,7 @@ Scope: broker, both MCP adapters, CLI-facing client behavior, persistence, docum
 ## Residual risks (accepted and documented)
 
 1. This remains a same-OS-user collaboration tool, not a hostile multi-tenant boundary. A process able to read the user's broker secret or database has operator-equivalent access.
-2. MCP can prove durable receipt and a subsequent tool cycle, not that a model semantically attended to or obeyed a message.
+2. Explicit `ack_messages` is evidence that the model chose to mark IDs processed, not proof of semantic attention or correct obedience.
 3. Peer text is isolated and labelled but not sandboxed; downstream agents still have powerful tools and must follow the confirmation policy.
 4. Messages are stored locally in SQLite/inbox files with strict permissions, not end-to-end encrypted.
 5. Legacy databases permit a one-time same-name reclaim bootstrap because no prior durable reclaim credential could exist. New and already-bootstrapped identities require the credential.

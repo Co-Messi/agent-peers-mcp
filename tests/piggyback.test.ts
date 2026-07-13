@@ -41,6 +41,8 @@ test("formatInboxBlock carries sender identity, colleague framing, and reply gui
   expect(out).toContain("ping");
   // Reply action hint.
   expect(out).toContain("send_message(to_id=\"alpha\"");
+  // Durable delivery is completed only through explicit message-ID ack.
+  expect(out).toContain("ack_messages(message_ids=[42])");
 });
 
 test("formatInboxBlock includes sender summary when provided", () => {

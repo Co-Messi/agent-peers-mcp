@@ -5,6 +5,7 @@ import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 
 import type { PeerName, PeerType } from "./types.ts";
+import { withInterprocessFileLock } from "./file-lock.ts";
 
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
@@ -73,45 +74,49 @@ export async function savePeerIdentity(
   identity: StoredPeerIdentity,
   overrideRoot?: string,
   expectedReclaimToken: string | null = null,
+  expectedName?: string,
 ): Promise<boolean> {
   if (!requestedName) return false;
   const path = identityPath(peerType, requestedName, overrideRoot);
   const dir = dirname(path);
   await ensureSafeDirectory(dir);
-  const temp = `${path}.tmp.${process.pid}.${randomUUID()}`;
-  const noFollow = IS_POSIX ? fsConstants.O_NOFOLLOW : 0;
-  const handle = await open(temp, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | noFollow, FILE_MODE);
-  try {
-    await handle.writeFile(JSON.stringify(identity), "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  try {
-    if (expectedReclaimToken === null) {
-      // Atomic create-if-absent: concurrent sessions with the same requested
-      // name cannot overwrite whichever durable identity won first.
-      try {
-        await link(temp, path);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-        throw error;
-      } finally {
-        await rm(temp, { force: true });
-      }
-    } else {
-      const current = await loadPeerIdentity(peerType, requestedName, overrideRoot);
-      if (!current || current.reclaim_token !== expectedReclaimToken
-        || identity.reclaim_token !== expectedReclaimToken) {
-        await rm(temp, { force: true });
-        return false;
-      }
-      await rename(temp, path);
+  return withInterprocessFileLock(`${path}.lock`, async () => {
+    const temp = `${path}.tmp.${process.pid}.${randomUUID()}`;
+    const noFollow = IS_POSIX ? fsConstants.O_NOFOLLOW : 0;
+    const handle = await open(temp, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | noFollow, FILE_MODE);
+    try {
+      await handle.writeFile(JSON.stringify(identity), "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
     }
-    if (IS_POSIX) await chmod(path, FILE_MODE);
-    return true;
-  } catch (error) {
-    await rm(temp, { force: true });
-    throw error;
-  }
+    try {
+      if (expectedReclaimToken === null) {
+        // Atomic create-if-absent: concurrent sessions with the same requested
+        // name cannot overwrite whichever durable identity won first.
+        try {
+          await link(temp, path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+          throw error;
+        } finally {
+          await rm(temp, { force: true });
+        }
+      } else {
+        const current = await loadPeerIdentity(peerType, requestedName, overrideRoot);
+        if (!current || current.reclaim_token !== expectedReclaimToken
+          || identity.reclaim_token !== expectedReclaimToken
+          || (expectedName !== undefined && current.name !== expectedName)) {
+          await rm(temp, { force: true });
+          return false;
+        }
+        await rename(temp, path);
+      }
+      if (IS_POSIX) await chmod(path, FILE_MODE);
+      return true;
+    } catch (error) {
+      await rm(temp, { force: true });
+      throw error;
+    }
+  });
 }

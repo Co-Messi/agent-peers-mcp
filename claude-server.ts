@@ -3,11 +3,10 @@
 // MCP stdio server for Claude Code. Registers as peer_type="claude", declares
 // claude/channel, pushes inbound messages instantly via channel notifications.
 //
-// Delivery pipeline: every 1s the polling loop leases any new messages from the
-// broker, pushes each via mcp.notification(...), adds successfully-pushed
-// message_ids to an in-memory seen-set, and batches the corresponding lease
-// tokens for a single /ack-messages call. Re-deliveries (lease expired and
-// re-leased) are detected via seen-set and acked without a duplicate push.
+// Delivery pipeline: every 1s the polling loop leases messages, persists them
+// in a stable-ID durable inbox, and emits a best-effort live channel push only
+// for entries newly added to that inbox. Messages stay durable and eligible for
+// re-presentation until the model explicitly calls ack_messages with their IDs.
 //
 // Shutdown: on SIGINT/SIGTERM we clear timers and exit without unregistering.
 // Leaving the peer row lets a restart with the same PEER_NAME reclaim the UUID
@@ -42,6 +41,8 @@ import { join } from "node:path";
 import { createLogger } from "./shared/logger.ts";
 import { parsePort } from "./shared/config.ts";
 import { loadPeerIdentity, savePeerIdentity } from "./shared/peer-identity.ts";
+import { AsyncMutex } from "./shared/async-mutex.ts";
+import { acknowledgeDurableMessages, parseExplicitAckIds } from "./shared/explicit-ack.ts";
 import {
   parseListPeersToolArgs,
   parseRenameToolArgs,
@@ -54,6 +55,7 @@ const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const logger = createLogger("claude-mcp");
+const renameMutex = new AsyncMutex();
 
 function log(msg: string) {
   logger.info("status", { detail: msg });
@@ -83,7 +85,6 @@ let ownsStableIdentity = false;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 let claudeInboxStore: DurableInboxStore | null = null;
-const presentedClaudeMessages = new Set<number>();
 
 const mcp = new Server(
   { name: "agent-peers", version: "0.1.0" },
@@ -123,7 +124,12 @@ Exception: you do NOT need to call \`check_messages\` again within the
 same turn — once per turn is enough. If the user sent you a task
 right after a peer message arrived mid-task, you've already seen it
 via the live channel push, and check_messages will just re-show the
-same thing.`,
+same thing.
+
+After actually processing displayed messages, call
+\`ack_messages(message_ids=[...])\` with their exact IDs. This explicit
+call is the only durable delivery confirmation; until then, messages
+remain eligible for re-presentation.`,
   },
 );
 
@@ -170,6 +176,17 @@ const TOOLS = [
     inputSchema: { type: "object" as const, properties: {} },
   },
   {
+    name: "ack_messages",
+    description: "Explicitly acknowledge peer messages only after processing them.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        message_ids: { type: "array" as const, items: { type: "integer" as const, minimum: 1 }, minItems: 1, maxItems: MAX_ACK_TOKENS },
+      },
+      required: ["message_ids"],
+    },
+  },
+  {
     name: "rename_peer",
     description:
       "Rename YOURSELF. new_name must be 1-32 chars, matching [a-zA-Z0-9_-]. Names must be unique among active peers.",
@@ -190,12 +207,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       content: [{ type: "text" as const, text: "Not registered with broker yet" }],
       isError: true,
     };
-  }
-
-  if (presentedClaudeMessages.size > 0 && claudeInboxStore) {
-    const confirmed = [...presentedClaudeMessages];
-    await claudeInboxStore.removeByIds(confirmed);
-    presentedClaudeMessages.clear();
   }
 
   switch (name) {
@@ -239,8 +250,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "check_messages": {
       // Return messages persisted before broker acknowledgement. Entries
-      // remain durable until a later tool call confirms this response completed.
-      // Delivery is at-least-once, so message_id remains the dedupe key.
+      // remain durable until ack_messages provides explicit model evidence.
       const queued = claudeInboxStore ? await claudeInboxStore.getUnreadMessages() : [];
       const recent = selectMessagesForPresentation(queued, {
         maxMessages: MAX_PRESENTED_MESSAGES,
@@ -254,7 +264,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           }],
         };
       }
-      for (const message of recent) presentedClaudeMessages.add(message.id);
       return {
         content: [{
           type: "text" as const,
@@ -263,31 +272,54 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
 
+    case "ack_messages": {
+      if (!claudeInboxStore) throw new Error("durable inbox is unavailable");
+      const messageIds = parseExplicitAckIds(args);
+      const result = await acknowledgeDurableMessages({
+        store: claudeInboxStore,
+        messageIds,
+        maxBatchSize: MAX_ACK_TOKENS,
+        ackBroker: async (leaseTokens) => {
+          const response = await client.ackMessages({ id: myId!, session_token: mySession!, lease_tokens: leaseTokens });
+          return response.acked_tokens;
+        },
+      });
+      const missing = result.missing_ids.length > 0
+        ? ` IDs not present in the durable inbox: ${result.missing_ids.join(", ")}.`
+        : "";
+      const warning = result.broker_error
+        ? " Broker acknowledgement failed; safe duplicate delivery may occur."
+        : result.broker_acked < result.acknowledged_ids.length
+          ? " Some broker leases had expired; safe duplicate delivery may occur."
+          : "";
+      return { content: [{ type: "text" as const, text: `Acknowledged message IDs: ${result.acknowledged_ids.join(", ") || "none"}.${missing}${warning}` }] };
+    }
+
     case "rename_peer": {
-      const { new_name } = parseRenameToolArgs(args);
-      if (!isValidName(new_name)) {
-        return {
-          content: [{ type: "text" as const, text: `Invalid name: must be 1-32 chars, [a-zA-Z0-9_-] only.` }],
-          isError: true,
-        };
-      }
-      const res = await client.renamePeer({ id: myId, session_token: mySession, new_name });
-      if (!res.ok) {
-        return { content: [{ type: "text" as const, text: `Rename failed: ${res.error}` }], isError: true };
-      }
-      const oldName = myName;
-      const renamedName = res.name ?? new_name;
-      if (stableIdentityKey && myReclaimToken) {
-        if (ownsStableIdentity) {
+      return renameMutex.runExclusive(async () => {
+        const { new_name } = parseRenameToolArgs(args);
+        if (!isValidName(new_name)) {
+          return {
+            content: [{ type: "text" as const, text: `Invalid name: must be 1-32 chars, [a-zA-Z0-9_-] only.` }],
+            isError: true,
+          };
+        }
+        const res = await client.renamePeer({ id: myId!, session_token: mySession!, new_name });
+        if (!res.ok) {
+          return { content: [{ type: "text" as const, text: `Rename failed: ${res.error}` }], isError: true };
+        }
+        const oldName = myName;
+        const renamedName = res.name ?? new_name;
+        if (stableIdentityKey && myReclaimToken && ownsStableIdentity) {
           try {
             const saved = await savePeerIdentity("claude", stableIdentityKey, {
               name: renamedName,
               reclaim_token: myReclaimToken,
-            }, undefined, myReclaimToken);
+            }, undefined, myReclaimToken, oldName ?? undefined);
             if (!saved) throw new Error("stable identity changed concurrently");
           } catch {
             const rollback = oldName
-              ? await client.renamePeer({ id: myId, session_token: mySession, new_name: oldName })
+              ? await client.renamePeer({ id: myId!, session_token: mySession!, new_name: oldName })
               : { ok: false };
             if (rollback.ok) {
               return { content: [{ type: "text" as const, text: "Rename could not be persisted and was rolled back." }], isError: true };
@@ -296,10 +328,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             return { content: [{ type: "text" as const, text: "Renamed, but durable identity persistence failed; restart recovery is not safe." }], isError: true };
           }
         }
-      }
-      myName = renamedName;
-      setTabTitle(`peer:${myName}`);
-      return { content: [{ type: "text" as const, text: `Renamed to ${myName}` }] };
+        myName = renamedName;
+        setTabTitle(`peer:${myName}`);
+        return { content: [{ type: "text" as const, text: `Renamed to ${myName}` }] };
+      });
     }
 
     default:
@@ -399,13 +431,14 @@ async function main() {
     { name: reg.name, reclaim_token: reg.reclaim_token },
     undefined,
     storedIdentity?.reclaim_token ?? null,
+    storedIdentity?.name,
   );
   myId = reg.id;
   myName = reg.name;
   mySession = reg.session_token;
   myReclaimToken = reg.reclaim_token;
   claudeInboxStore = new DurableInboxStore({
-    peerId: `claude-${myName}`,
+    peerId: myId,
     rootDir: process.env.AGENT_PEERS_CLAUDE_STATE_DIR ?? join(homedir(), ".agent-peers-claude"),
   });
   await claudeInboxStore.init();
@@ -431,24 +464,19 @@ async function main() {
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
-  // In-memory dedupe: message_ids we have already pushed successfully this session.
-  // See spec §5.4 for rationale — deterministic dedupe, no model intelligence required.
-  const seen = new Set<number>();
-
   const pollAndPush = async () => {
     if (!myId || !mySession || !claudeInboxStore) return;
     try {
       const msgs = await client.pollMessages({ id: myId, session_token: mySession });
       if (msgs.length === 0) return;
 
-      // Persist before acknowledging the broker. Channel notification success
-      // is not proof of model visibility; the durable inbox is authoritative
-      // and check_messages keeps the content until a later tool call confirms
-      // that its response completed.
+      const alreadyQueued = new Set((await claudeInboxStore.getUnreadMessages()).map((message) => message.id));
+      // Persist before presentation. Broker acknowledgement is deferred until
+      // the model explicitly calls ack_messages.
       await claudeInboxStore.queueLeasedMessages(msgs);
 
       for (const m of msgs) {
-        if (seen.has(m.id)) continue;
+        if (alreadyQueued.has(m.id)) continue;
         try {
           await mcp.notification({
             method: "notifications/claude/channel",
@@ -463,7 +491,6 @@ async function main() {
               },
             },
           });
-          seen.add(m.id);
           log(`pushed channel message id=${m.id} from=${m.from_name} type=${m.from_peer_type}`);
         } catch (e) {
           // The durable inbox remains authoritative even if the live hint is
@@ -472,14 +499,6 @@ async function main() {
         }
       }
 
-      for (let i = 0; i < msgs.length; i += MAX_ACK_TOKENS) {
-        await client.ackMessages({
-          id: myId,
-          session_token: mySession,
-          lease_tokens: msgs.slice(i, i + MAX_ACK_TOKENS).map((m) => m.lease_token),
-        });
-      }
-      for (const message of msgs) seen.delete(message.id);
     } catch (e) {
       exitIfSessionExpired(e);
       log(`poll error: ${e instanceof Error ? e.message : String(e)}`);

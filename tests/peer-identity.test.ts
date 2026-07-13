@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { lstat, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { loadPeerIdentity, savePeerIdentity } from "../shared/peer-identity.ts";
@@ -39,9 +39,21 @@ test("durable identity rename uses credential compare-and-swap", async () => {
   const token = "f".repeat(36);
   await savePeerIdentity("claude", "original", { name: "original", reclaim_token: token }, root);
   expect(await savePeerIdentity(
-    "claude", "original", { name: "renamed", reclaim_token: token }, root, token,
+    "claude", "original", { name: "renamed", reclaim_token: token }, root, token, "original",
   )).toBe(true);
   expect(await loadPeerIdentity("claude", "original", root)).toEqual({ name: "renamed", reclaim_token: token });
+});
+
+test("concurrent durable renames cannot overwrite a newer name with a stale update", async () => {
+  const root = await tempRoot();
+  const token = "9".repeat(36);
+  await savePeerIdentity("codex", "stable", { name: "stable", reclaim_token: token }, root);
+  const results = await Promise.all([
+    savePeerIdentity("codex", "stable", { name: "first", reclaim_token: token }, root, token, "stable"),
+    savePeerIdentity("codex", "stable", { name: "second", reclaim_token: token }, root, token, "stable"),
+  ]);
+  expect(results.filter(Boolean)).toHaveLength(1);
+  expect(["first", "second"]).toContain((await loadPeerIdentity("codex", "stable", root))?.name ?? "");
 });
 
 test("anonymous peers do not persist a shared reclaim credential", async () => {
@@ -55,6 +67,7 @@ test("identity loader fails closed on weak permissions and symlinks", async () =
   const root = await tempRoot();
   const path = join(root, "codex-unsafe.json");
   await writeFile(path, JSON.stringify({ name: "unsafe", reclaim_token: "c".repeat(36) }), { mode: 0o644 });
+  await chmod(path, 0o644);
   await expect(loadPeerIdentity("codex", "unsafe", root)).rejects.toThrow(/mode/i);
   await rm(path);
   const target = join(root, "target.json");

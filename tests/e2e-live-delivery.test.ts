@@ -21,6 +21,7 @@ import { startBroker } from "../broker.ts";
 import { createClient } from "../shared/broker-client.ts";
 import { CodexInboxStore as DurableInboxStore } from "../shared/codex-inbox.ts";
 import { formatInboxBlock } from "../shared/piggyback.ts";
+import { acknowledgeDurableMessages } from "../shared/explicit-ack.ts";
 import { readFileSync, unlinkSync, existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -83,7 +84,7 @@ test("live broker flow: sender → broker → receiver-poll returns the message 
   expect(polled[0]!.text).toContain("bcrypt 5");
 });
 
-test("idle-arrival persists durably before broker acknowledgement", async () => {
+test("idle arrival survives restart and explicit ack clears both durable and broker state", async () => {
   const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
   const sender = await client.register({
     peer_type: "claude", pid: 2001, cwd: "/x", git_root: null, tty: null,
@@ -99,19 +100,36 @@ test("idle-arrival persists durably before broker acknowledgement", async () => 
     to_id_or_name: idleReceiver.id, text: body,
   })).ok).toBe(true);
   const polled = await client.pollMessages({ id: idleReceiver.id, session_token: idleReceiver.session_token });
-  const { store, rootDir } = await durableStore("claude-idle-receiver");
+  const { store, rootDir } = await durableStore(idleReceiver.id);
   await store.queueLeasedMessages(polled);
-  expect((await client.ackMessages({
-    id: idleReceiver.id, session_token: idleReceiver.session_token,
-    lease_tokens: polled.map((m) => m.lease_token),
-  })).acked).toBe(1);
 
-  // A fresh process can recover the body even though the broker row is acked.
-  const restarted = new DurableInboxStore({ peerId: "claude-idle-receiver", rootDir });
+  // A fresh adapter process recovers the body before any acknowledgement.
+  const restarted = new DurableInboxStore({ peerId: idleReceiver.id, rootDir });
   await restarted.init();
   const recent = await restarted.getUnreadMessages();
   expect(recent.map((m) => m.text)).toEqual([body]);
   expect(formatInboxBlock(recent)).toContain('"from_name":"idle-sender"');
+
+  const result = await acknowledgeDurableMessages({
+    store: restarted,
+    messageIds: [recent[0]!.id],
+    maxBatchSize: 100,
+    ackBroker: async (leaseTokens) => (await client.ackMessages({
+      id: idleReceiver.id,
+      session_token: idleReceiver.session_token,
+      lease_tokens: leaseTokens,
+    })).acked_tokens,
+  });
+  expect(result).toEqual({
+    acknowledged_ids: [recent[0]!.id],
+    missing_ids: [],
+    broker_acked: 1,
+  });
+  expect(await restarted.getUnreadMessages()).toEqual([]);
+  expect(await client.pollMessages({
+    id: idleReceiver.id,
+    session_token: idleReceiver.session_token,
+  })).toEqual([]);
 });
 
 test("multiple idle arrivals persist and confirm selectively", async () => {

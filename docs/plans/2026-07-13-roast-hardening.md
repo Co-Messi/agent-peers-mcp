@@ -54,7 +54,7 @@
 2. Verify each test fails for the intended missing guarantee.
 3. Version and validate the durable inbox schema; cap file size and message count; quarantine corruption instead of silently treating it as an empty inbox.
 4. Use unique exclusive no-follow temporary files, fsync file/directory, validate directory ownership/mode/type, and serialize writers with an inter-process lock.
-5. Extract and bound the confirm-on-next-call delivery state machine; never drop ack tokens because of an arbitrary in-memory cap.
+5. Require bounded, explicit message-ID acknowledgement; never infer delivery from a later unrelated tool call.
 6. Give Claude a durable recipient-side fallback and state the precise transport/durable/model-visible semantics instead of claiming unprovable delivery.
 7. Run crash/restart and full tests; commit.
 
