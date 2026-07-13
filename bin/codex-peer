@@ -217,6 +217,13 @@ ensure_daemon() {
   if ! mkdir "$DAEMON_LOCKDIR" 2>/dev/null; then
     local lock_owner=""
     lock_owner="$(cat "$DAEMON_LOCKDIR/owner" 2>/dev/null || true)"
+    if [ -z "$lock_owner" ]; then
+      # The winning process creates the directory before it can write owner;
+      # give that tiny handoff window a chance to complete before declaring
+      # the lock abandoned.
+      sleep 0.1
+      lock_owner="$(cat "$DAEMON_LOCKDIR/owner" 2>/dev/null || true)"
+    fi
     if [ -n "$lock_owner" ] && kill -0 "$lock_owner" 2>/dev/null; then
       return 0  # another live launch is already starting it
     fi
