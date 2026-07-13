@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmod, link, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir, platform } from "node:os";
 
-import { CodexInboxStore } from "../shared/codex-inbox.ts";
+import { CodexInboxStore, readCodexInboxMetadataFile } from "../shared/codex-inbox.ts";
 import type { LeasedMessage } from "../shared/types.ts";
 
 const IS_POSIX = platform() !== "win32";
@@ -75,6 +75,22 @@ test("CodexInboxStore persists unread messages across restart", async () => {
   expect(unread.map((msg) => msg.id)).toEqual([7, 8]);
 });
 
+test("CodexInboxStore init rebuilds missing wake metadata from durable unread mail", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+  const peerId = "peer-repair-meta";
+  const first = new CodexInboxStore({ peerId, rootDir: dir });
+  await first.init();
+  await first.queueLeasedMessages([message(17)]);
+  const metadataPath = join(dir, `${encodeURIComponent(peerId)}.metadata.json`);
+  await rm(metadataPath);
+
+  const restarted = new CodexInboxStore({ peerId, rootDir: dir });
+  await restarted.init();
+  const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as { unread: Array<{ id: number }> };
+  expect(metadata.unread.map((item) => item.id)).toEqual([17]);
+});
+
 test("CodexInboxStore reset clears persisted unread messages", async () => {
   const store = await makeStore();
 
@@ -117,6 +133,58 @@ test("CodexInboxStore.removeByIds persists across restart", async () => {
   const second = new CodexInboxStore({ peerId: "peer-123", rootDir: dir });
   await second.init();
   expect((await second.getUnreadMessages()).map((m) => m.id)).toEqual([1, 3]);
+});
+
+test("CodexInboxStore writes adjacent bodyless metadata without message bodies or lease tokens", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+
+  const store = new CodexInboxStore({ peerId: "peer-123", rootDir: dir });
+  await store.init();
+  await store.queueLeasedMessages([
+    message(1, { text: "SECRET MESSAGE BODY", lease_token: "SECRET LEASE TOKEN" }),
+  ]);
+
+  const metadataPath = join(dir, `${encodeURIComponent("peer-123")}.metadata.json`);
+  const raw = await readFile(metadataPath, "utf8");
+  const parsed = JSON.parse(raw) as { unread: Array<Record<string, unknown>> };
+
+  expect(raw).not.toContain("SECRET MESSAGE BODY");
+  expect(raw).not.toContain("SECRET LEASE TOKEN");
+  expect(parsed.unread).toHaveLength(1);
+  expect(parsed.unread[0]?.id).toBe(1);
+  expect(parsed.unread[0]).not.toHaveProperty("text");
+  expect(parsed.unread[0]).not.toHaveProperty("lease_token");
+  expect(parsed.unread[0]).not.toHaveProperty("from_cwd");
+  expect(parsed.unread[0]).not.toHaveProperty("from_summary");
+});
+
+test("CodexInboxStore metadata updates do not remove authoritative queued messages", async () => {
+  const store = await makeStore("peer-meta");
+  await store.queueLeasedMessages([message(1), message(2)]);
+
+  const metadata = await store.getUnreadMessageMetadata();
+  expect(metadata.map((m) => m.id)).toEqual([1, 2]);
+  expect(metadata[0]).not.toHaveProperty("text");
+  expect(metadata[0]).not.toHaveProperty("lease_token");
+
+  const unread = await store.getUnreadMessages();
+  expect(unread.map((m) => m.id)).toEqual([1, 2]);
+  expect(unread[0]?.text).toBe("message-1");
+  expect(unread[0]?.lease_token).toBe("lease-1");
+});
+
+test("bodyless metadata reader rejects a mismatched recipient and unsafe file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+  const path = join(dir, "peer-123.metadata.json");
+  await writeFile(path, JSON.stringify({
+    unread: [{ id: 1, to_id: "different-peer", sent_at: "2026-04-15T00:00:00.000Z" }],
+    updated_at: "2026-04-15T00:00:00.000Z",
+  }), { mode: 0o600 });
+  expect(await readCodexInboxMetadataFile(path, "peer-123")).toBeNull();
+  await chmod(path, 0o644);
+  expect(await readCodexInboxMetadataFile(path, "different-peer")).toBeNull();
 });
 
 test.if(IS_POSIX)("CodexInboxStore writes inbox file at 0o600 and directory at 0o700", async () => {

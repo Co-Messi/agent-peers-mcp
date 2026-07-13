@@ -25,6 +25,50 @@ interface CodexInboxState {
   unread: LeasedMessage[];
 }
 
+// Bodyless sidecar consumed by the wake daemon. Keep this deliberately minimal:
+// the daemon needs only message identity, recipient identity, and arrival time.
+export interface CodexInboxMessageMetadata {
+  id: number;
+  to_id: string;
+  sent_at: string;
+}
+
+export interface CodexInboxMetadataState {
+  unread: CodexInboxMessageMetadata[];
+  updated_at: string;
+}
+
+export async function readCodexInboxMetadataFile(
+  path: string,
+  expectedPeerId: string,
+): Promise<CodexInboxMetadataState | null> {
+  try {
+    const fileStat = await lstat(path);
+    if (fileStat.isSymbolicLink() || !fileStat.isFile() || fileStat.nlink !== 1) return null;
+    if (fileStat.size > MAX_INBOX_FILE_BYTES) return null;
+    if (IS_POSIX) {
+      const mine = (process as unknown as { getuid?: () => number }).getuid?.();
+      if (typeof mine === "number" && fileStat.uid !== mine) return null;
+      if ((fileStat.mode & 0o777) !== FILE_MODE) return null;
+    }
+    const raw = await readFile(path, "utf8");
+    const parsed = JSON.parse(raw) as Partial<CodexInboxMetadataState>;
+    if (!Array.isArray(parsed.unread) || parsed.unread.length > MAX_INBOX_MESSAGES) return null;
+    if (typeof parsed.updated_at !== "string" || !Number.isFinite(Date.parse(parsed.updated_at))) return null;
+    const valid = parsed.unread.every((value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      const message = value as Partial<CodexInboxMessageMetadata>;
+      return Number.isSafeInteger(message.id) && (message.id ?? 0) > 0
+        && message.to_id === expectedPeerId
+        && typeof message.sent_at === "string"
+        && Number.isFinite(Date.parse(message.sent_at));
+    });
+    return valid ? { unread: parsed.unread as CodexInboxMessageMetadata[], updated_at: parsed.updated_at } : null;
+  } catch {
+    return null;
+  }
+}
+
 const EMPTY_STATE: CodexInboxState = { version: 1, unread: [] };
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
@@ -79,7 +123,7 @@ async function ensureSafeDirectory(dir: string): Promise<void> {
   }
 }
 
-async function atomicWriteJson(path: string, value: CodexInboxState): Promise<void> {
+async function atomicWriteJson(path: string, value: unknown): Promise<void> {
   const dir = dirname(path);
   await ensureSafeDirectory(dir);
   const serialized = JSON.stringify(value, null, 2);
@@ -145,7 +189,10 @@ function parseState(raw: string): CodexInboxState {
 export class CodexInboxStore {
   private readonly filePath: string;
   private readonly lockPath: string;
+  private readonly metadataFilePath: string;
   private readonly persistState: (path: string, value: CodexInboxState) => Promise<void>;
+  private readonly persistMetadata: (path: string, value: CodexInboxMetadataState) => Promise<void>;
+  private readonly onMetadataError: (error: unknown) => void;
   private state: CodexInboxState = { ...EMPTY_STATE, unread: [] };
   private queue: Promise<void> = Promise.resolve();
 
@@ -153,23 +200,38 @@ export class CodexInboxStore {
     peerId: PeerId;
     rootDir?: string;
     persistState?: (path: string, value: CodexInboxState) => Promise<void>;
+    persistMetadata?: (path: string, value: CodexInboxMetadataState) => Promise<void>;
+    onMetadataError?: (error: unknown) => void;
   }) {
     const rootDir = opts.rootDir ?? process.env.AGENT_PEERS_CODEX_STATE_DIR ?? defaultRootDir();
     const safePeerId = encodeURIComponent(opts.peerId);
     this.filePath = join(rootDir, `${safePeerId}.json`);
     this.lockPath = `${this.filePath}.lock`;
+    this.metadataFilePath = join(rootDir, `${safePeerId}.metadata.json`);
     this.persistState = opts.persistState ?? atomicWriteJson;
+    this.persistMetadata = opts.persistMetadata ?? atomicWriteJson;
+    this.onMetadataError = opts.onMetadataError ?? (() => {
+      inboxLog.warn("metadata_write_failed");
+    });
   }
 
   async init(): Promise<void> {
     await this.withLock(async () => {
-      await ensureSafeDirectory(dirname(this.filePath));
-      this.state = await this.readStateFromDisk();
+      await this.withFileLock(async () => {
+        this.state = await this.readStateFromDisk();
+        // Repair a missing or stale sidecar after upgrades or a previous
+        // best-effort metadata failure without changing the authoritative inbox.
+        await this.persistMetadataBestEffort(this.state);
+      });
     });
   }
 
   async getUnreadMessages(): Promise<LeasedMessage[]> {
     return this.withLock(async () => cloneMessages(this.state.unread));
+  }
+
+  async getUnreadMessageMetadata(): Promise<CodexInboxMessageMetadata[]> {
+    return this.withLock(async () => metadataForMessages(this.state.unread));
   }
 
   async queueLeasedMessages(messages: LeasedMessage[]): Promise<void> {
@@ -212,8 +274,20 @@ export class CodexInboxStore {
         const next = await fn(current);
         await this.persistState(this.filePath, next);
         this.state = next;
+        await this.persistMetadataBestEffort(next);
       });
     });
+  }
+
+  private async persistMetadataBestEffort(state: CodexInboxState): Promise<void> {
+    try {
+      await this.persistMetadata(this.metadataFilePath, {
+        unread: metadataForMessages(state.unread),
+        updated_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      this.onMetadataError(error);
+    }
   }
 
   private async readStateFromDisk(): Promise<CodexInboxState> {
@@ -325,6 +399,14 @@ export class CodexInboxStore {
     await previous;
     try { return await fn(); } finally { release(); }
   }
+}
+
+function metadataForMessages(messages: LeasedMessage[]): CodexInboxMessageMetadata[] {
+  return messages.map((message) => ({
+    id: message.id,
+    to_id: message.to_id,
+    sent_at: message.sent_at,
+  }));
 }
 
 export { EMPTY_STATE as EMPTY_CODEX_INBOX_STATE, MAX_INBOX_MESSAGES };

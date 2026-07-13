@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE_PATH" ]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+  SOURCE_PATH="$(readlink "$SOURCE_PATH")"
+  case "$SOURCE_PATH" in /*) ;; *) SOURCE_PATH="$SOURCE_DIR/$SOURCE_PATH" ;; esac
+done
+ROOT_DIR="${AGENT_PEERS_MCP_DIR:-$(cd "$(dirname "$SOURCE_PATH")/.." && pwd -P)}"
+DEFAULT_INSTALL_PATH="${HOME}/.local/bin/codex-peer"
+DOC_PATH="${ROOT_DIR}/docs/examples/wakeable-codex-peer-demo.html"
+
+STATE_DIR="${AGENT_PEERS_CODEX_STATE_DIR:-${HOME}/.agent-peers-codex}"
+DAEMON_PIDFILE="${STATE_DIR}/wake-daemon.pid"
+DAEMON_LOGFILE="${STATE_DIR}/wake-daemon.log"
+DAEMON_LOCKDIR="${STATE_DIR}/wake-daemon.lock"
+DAEMON_INTERVAL="${CODEX_PEER_DAEMON_INTERVAL:-5}"
+# Size-based rotation for the wake-daemon log so it can never grow unbounded.
+# When the live log reaches DAEMON_LOG_MAX_BYTES it is copy-truncated to .1, .2…
+# keeping DAEMON_LOG_KEEP rotations. Copytruncate (not rename) because the
+# backgrounded daemon holds the log fd open in append mode for its whole life.
+DAEMON_LOG_MAX_BYTES="${CODEX_PEER_DAEMON_LOG_MAX_BYTES:-5242880}"  # 5 MiB
+DAEMON_LOG_KEEP="${CODEX_PEER_DAEMON_LOG_KEEP:-3}"
+
+usage() {
+  cat <<'EOF'
+codex-peer: easy launcher for wakeable Codex peers on the agent peer network
+
+Optional shell aliases you can define locally:
+  peerwake   -> codex-peer daemon
+  peerlist   -> codex-peer peers
+  peerstatus -> codex-peer live
+  peerrepair -> codex-peer repair-wake
+  peerretire -> codex-peer retire
+  peerdoc    -> codex-peer doc
+
+Usage:
+  codex-peer
+      Start wakeable Codex in the current directory.
+      Auto-names the peer from the repo, like my-service-codex.
+
+  codex-peer start <peer-name> <repo-path> [-- extra codex args]
+      Start any repo as a wakeable Codex peer with a stable peer name.
+
+  codex-peer daemon [seconds]
+      Run the wake loop in the FOREGROUND. Keep this open in one Zed terminal.
+      Default interval: 5 seconds. You normally do NOT need this — any launch
+      (`codex-peer` and `codex-peer start`) auto-start a background daemon.
+
+  codex-peer daemon-stop
+      Stop the background wake daemon.
+
+  codex-peer daemon-status
+      Report whether the background wake daemon is running.
+
+  codex-peer wake
+      Run one wake pass, then exit.
+
+  codex-peer send <peer-name-or-id> <message...>
+      Send a shell-originated peer message.
+
+  codex-peer peers
+  codex-peer status
+  codex-peer live
+  codex-peer messages
+      Inspect the peer network.
+
+  codex-peer retire <peer-name-or-id>
+      Mark a peer as intentionally gone and remove its wake pointer.
+      Use this when a closed/stuck Codex session is confusing discovery.
+
+  codex-peer repair-wake <peer-name-or-id>
+      Attach a live Codex peer to its matching wakeable app-server session.
+      Use this if live/status says wakeable=no but the session was started by codex-peer.
+
+  codex-peer doc
+      Open the illustrated HTML explainer.
+
+  codex-peer install [path]
+      Symlink this command to ~/.local/bin/codex-peer by default.
+
+Examples:
+  codex-peer
+  codex-peer daemon
+  codex-peer start api-codex ~/code/api
+  codex-peer send api-codex "Please list peers and reply."
+  codex-peer live
+  codex-peer retire api-codex-2
+  codex-peer repair-wake api-codex-2
+EOF
+}
+
+die() {
+  printf 'codex-peer: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+ensure_repo() {
+  local repo="$1"
+  [ -d "$repo" ] || die "repo path does not exist: $repo"
+}
+
+canonical_dir() {
+  local dir="$1"
+  (cd "$dir" && pwd -P)
+}
+
+repo_root_or_dir() {
+  local dir="$1"
+  git -C "$dir" rev-parse --show-toplevel 2>/dev/null || canonical_dir "$dir"
+}
+
+sanitize_peer_segment() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9_-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
+}
+
+auto_peer_name() {
+  local repo_path="$1"
+  local repo_root repo_root_canon base clean max_base
+  repo_root="$(repo_root_or_dir "$repo_path")"
+  repo_root_canon="$(canonical_dir "$repo_root")"
+
+  base="$(basename "$repo_root_canon")"
+  clean="$(sanitize_peer_segment "$base")"
+  [ -n "$clean" ] || clean="repo"
+
+  max_base=26
+  if [ "${#clean}" -gt "$max_base" ]; then
+    clean="${clean:0:$max_base}"
+    clean="$(printf '%s' "$clean" | sed -E 's/-+$//')"
+    [ -n "$clean" ] || clean="repo"
+  fi
+  printf '%s-codex\n' "$clean"
+}
+
+run_bun() {
+  need_cmd bun
+  cd "$ROOT_DIR"
+  bun "$@"
+}
+
+start_peer() {
+  local peer_name="$1"
+  local repo_path="$2"
+  shift 2
+  ensure_repo "$repo_path"
+  need_cmd codex
+  ensure_daemon
+  run_bun wakeable-codex.ts --cwd "$repo_path" --name "$peer_name" "$@"
+}
+
+start_here() {
+  local repo_path peer_name
+  repo_path="$(canonical_dir "$PWD")"
+  peer_name="$(auto_peer_name "$repo_path")"
+  printf 'codex-peer: starting wakeable Codex in %s as %s\n' "$repo_path" "$peer_name" >&2
+  start_peer "$peer_name" "$repo_path" "$@"
+}
+
+# Print the PID of a live wake daemon (and succeed) or return non-zero.
+daemon_start_identity() {
+  ps -o lstart= -o command= -p "$1" 2>/dev/null | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+process_record_alive() {
+  local record="$1" pid expected actual
+  case "$record" in *'|'*) ;; *) return 1 ;; esac
+  pid="${record%%|*}"
+  expected="${record#*|}"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$expected" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  actual="$(daemon_start_identity "$pid")"
+  [ -n "$actual" ] && [ "$actual" = "$expected" ]
+}
+
+write_daemon_pidfile() {
+  local pid="$1" identity="" attempt
+  for attempt in 1 2 3 4 5; do
+    identity="$(daemon_start_identity "$pid")"
+    [ -n "$identity" ] && break
+    sleep 0.05
+  done
+  [ -n "$identity" ] || return 1
+  printf '%s|%s\n' "$pid" "$identity" >"$DAEMON_PIDFILE"
+}
+
+daemon_pid() {
+  [ -f "$DAEMON_PIDFILE" ] || return 1
+  local record pid expected actual
+  record="$(cat "$DAEMON_PIDFILE" 2>/dev/null || true)"
+  case "$record" in
+    *'|'*) ;;
+    *)
+      # One-time migration for pid-only files from older releases. Accept it
+      # only when the live command is visibly this daemon, then rewrite with a
+      # start+command identity before returning it.
+      case "$record" in ''|*[!0-9]*) return 1 ;; esac
+      local legacy_command
+      legacy_command="$(ps -o command= -p "$record" 2>/dev/null || true)"
+      case "$legacy_command" in *'/codex-peer daemon'|*'/codex-peer daemon '*) write_daemon_pidfile "$record" || return 1 ;; *) return 1 ;; esac
+      printf '%s' "$record"
+      return 0
+      ;;
+  esac
+  process_record_alive "$record" || return 1
+  pid="${record%%|*}"
+  printf '%s' "$pid"
+}
+
+# Idempotently make sure a background wake daemon is running. Called by every
+# launch path so users do not have to remember to start the daemon — after
+# a reboot, the first `codexpeer` launch brings the waker up on its own. Safe to
+# call concurrently: an atomic lock dir ensures only one racer starts it.
+ensure_daemon() {
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  if daemon_pid >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! mkdir "$DAEMON_LOCKDIR" 2>/dev/null; then
+    local lock_owner=""
+    lock_owner="$(cat "$DAEMON_LOCKDIR/owner" 2>/dev/null || true)"
+    if [ -z "$lock_owner" ]; then
+      # The winning process creates the directory before it can write owner;
+      # give that tiny handoff window a chance to complete before declaring
+      # the lock abandoned.
+      sleep 0.1
+      lock_owner="$(cat "$DAEMON_LOCKDIR/owner" 2>/dev/null || true)"
+    fi
+    if [ -n "$lock_owner" ] && process_record_alive "$lock_owner"; then
+      local attempt
+      for attempt in {1..50}; do
+        daemon_pid >/dev/null 2>&1 && return 0
+        process_record_alive "$lock_owner" || break
+        sleep 0.1
+      done
+      process_record_alive "$lock_owner" && die "another launch is still starting the wake daemon; retry shortly"
+    fi
+    rm -rf "$DAEMON_LOCKDIR" 2>/dev/null || return 0
+    mkdir "$DAEMON_LOCKDIR" 2>/dev/null || return 0
+  fi
+  local owner_identity
+  owner_identity="$(daemon_start_identity "$$")"
+  [ -n "$owner_identity" ] || { rm -rf "$DAEMON_LOCKDIR"; die "could not identify daemon startup lock owner"; }
+  printf '%s|%s\n' "$$" "$owner_identity" >"$DAEMON_LOCKDIR/owner"
+  if daemon_pid >/dev/null 2>&1; then
+    rm -rf "$DAEMON_LOCKDIR" 2>/dev/null || true
+    return 0
+  fi
+  nohup "$ROOT_DIR/bin/codex-peer" daemon "$DAEMON_INTERVAL" >>"$DAEMON_LOGFILE" 2>&1 &
+  local dpid=$!
+  if ! write_daemon_pidfile "$dpid"; then
+    kill "$dpid" 2>/dev/null || true
+    rm -rf "$DAEMON_LOCKDIR" 2>/dev/null || true
+    die "could not record wake daemon process identity"
+  fi
+  disown 2>/dev/null || true
+  rm -rf "$DAEMON_LOCKDIR" 2>/dev/null || true
+  printf 'codex-peer: started background wake daemon (pid %s, log %s)\n' "$dpid" "$DAEMON_LOGFILE" >&2
+}
+
+daemon_stop() {
+  local pid
+  if pid="$(daemon_pid 2>/dev/null)"; then
+    kill "$pid" 2>/dev/null || true
+    rm -f "$DAEMON_PIDFILE"
+    printf 'codex-peer: stopped wake daemon (pid %s)\n' "$pid"
+  else
+    rm -f "$DAEMON_PIDFILE" 2>/dev/null || true
+    printf 'codex-peer: no running wake daemon\n'
+  fi
+}
+
+daemon_status() {
+  local pid
+  if pid="$(daemon_pid 2>/dev/null)"; then
+    printf 'codex-peer: wake daemon running (pid %s, log %s)\n' "$pid" "$DAEMON_LOGFILE"
+  else
+    printf 'codex-peer: wake daemon not running\n'
+  fi
+}
+
+# Copy-truncate the daemon log once it exceeds the size cap, keeping a bounded
+# number of rotations. Safe to call from inside the daemon loop: the daemon's
+# append-mode fd seeks to EOF on every write, so truncating the file in place
+# makes subsequent writes resume at offset 0 with no corruption (at most a line
+# or two written between the copy and the truncate is lost).
+rotate_daemon_log_if_needed() {
+  [ -f "$DAEMON_LOGFILE" ] || return 0
+  case "$DAEMON_LOG_MAX_BYTES" in ''|*[!0-9]*) return 0 ;; esac
+  case "$DAEMON_LOG_KEEP" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$DAEMON_LOG_KEEP" -ge 1 ] || return 0
+  local size
+  size="$(wc -c <"$DAEMON_LOGFILE" 2>/dev/null | tr -d '[:space:]')" || return 0
+  [ -n "$size" ] || return 0
+  [ "$size" -ge "$DAEMON_LOG_MAX_BYTES" ] || return 0
+  local i
+  for (( i=DAEMON_LOG_KEEP-1; i>=1; i-- )); do
+    [ -f "${DAEMON_LOGFILE}.$i" ] && mv -f "${DAEMON_LOGFILE}.$i" "${DAEMON_LOGFILE}.$((i+1))"
+  done
+  cp -f "$DAEMON_LOGFILE" "${DAEMON_LOGFILE}.1" 2>/dev/null || return 0
+  : >"$DAEMON_LOGFILE"
+}
+
+run_daemon() {
+  local interval="${1:-5}"
+  case "$interval" in
+    ''|*[!0-9]*) die "daemon interval must be a whole number of seconds" ;;
+  esac
+  [ "$interval" -ge 1 ] || die "daemon interval must be at least one second"
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  local existing
+  if existing="$(daemon_pid 2>/dev/null)"; then
+    if [ "$existing" != "$$" ]; then
+      die "wake daemon already running (pid $existing). Stop it with 'codex-peer daemon-stop' first."
+    fi
+  fi
+  write_daemon_pidfile "$$" || die "could not record wake daemon process identity"
+  trap 'rm -f "$DAEMON_PIDFILE"' EXIT
+  trap 'rm -f "$DAEMON_PIDFILE"; exit 130' INT TERM
+  printf '%s codex-peer: wake daemon running every %s seconds. Leave this terminal open.\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$interval"
+  printf '%s codex-peer: press Ctrl-C to stop.\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  while true; do
+    rotate_daemon_log_if_needed
+    run_bun wake-daemon.ts --quiet-noop
+    sleep "$interval"
+  done
+}
+
+install_command() {
+  local dest="${1:-$DEFAULT_INSTALL_PATH}"
+  local dest_dir
+  dest_dir="$(dirname "$dest")"
+  mkdir -p "$dest_dir"
+  ln -sfn "$ROOT_DIR/bin/codex-peer" "$dest"
+  printf 'codex-peer: installed command shim at %s\n' "$dest"
+  case ":$PATH:" in
+    *":$dest_dir:"*) ;;
+    *) printf 'codex-peer: warning: %s is not currently in PATH for this shell.\n' "$dest_dir" >&2 ;;
+  esac
+}
+
+open_doc() {
+  [ -f "$DOC_PATH" ] || die "doc not found: $DOC_PATH"
+  if command -v open >/dev/null 2>&1; then
+    open "$DOC_PATH"
+  else
+    printf '%s\n' "$DOC_PATH"
+  fi
+}
+
+cmd="${1:-here}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+case "$cmd" in
+  help|-h|--help)
+    usage
+    ;;
+  here|.)
+    start_here "$@"
+    ;;
+  start)
+    [ "$#" -ge 2 ] || die "usage: codex-peer start <peer-name> <repo-path> [-- extra codex args]"
+    peer_name="$1"
+    repo_path="$2"
+    shift 2
+    start_peer "$peer_name" "$repo_path" "$@"
+    ;;
+  daemon)
+    run_daemon "${1:-5}"
+    ;;
+  daemon-stop|stop-daemon)
+    daemon_stop
+    ;;
+  daemon-status)
+    daemon_status
+    ;;
+  ensure-daemon)
+    ensure_daemon
+    ;;
+  wake|wake-once)
+    run_bun wake-daemon.ts
+    ;;
+  send)
+    [ "$#" -ge 2 ] || die "usage: codex-peer send <peer-name-or-id> <message...>"
+    target="$1"
+    shift
+    run_bun cli.ts send "$target" "$*"
+    ;;
+  peers)
+    run_bun cli.ts peers
+    ;;
+  live|wake-status)
+    run_bun cli.ts wake-status
+    ;;
+  status)
+    run_bun cli.ts status
+    ;;
+  retire|unregister)
+    [ "$#" -eq 1 ] || die "usage: codex-peer retire <peer-name-or-id>"
+    run_bun cli.ts retire "$1"
+    ;;
+  repair-wake|attach-wake)
+    [ "$#" -eq 1 ] || die "usage: codex-peer repair-wake <peer-name-or-id>"
+    run_bun cli.ts repair-wake "$1"
+    ;;
+  messages)
+    run_bun cli.ts messages
+    ;;
+  doc|open-doc)
+    open_doc
+    ;;
+  install)
+    install_command "${1:-$DEFAULT_INSTALL_PATH}"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

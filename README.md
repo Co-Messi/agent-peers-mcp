@@ -34,7 +34,7 @@ Imagine you're merging two projects each AI has been working on alone. With this
 > **Claude** reads A's auth module, notices it uses `bcrypt@4`, wants to know what B is on. Sends:
 > > `to codex-backend:` "A's on bcrypt 4. What version is B on?"
 >
-> **Codex** receives it mid-task. Doesn't auto-reply "got it" (it's trained not to). Goes quiet, looks at B's `package.json`. Sees `bcrypt@5`. *Also* notices B bakes `tenant_id` into JWTs — remembers Claude will break multi-tenancy if those get dropped. Sends back:
+> **Codex** receives it on its next agent-peers call—or its exact idle thread is nudged when wakeable mode is enabled. It doesn't auto-reply "got it". It looks at B's `package.json`, sees `bcrypt@5`, and notices B bakes `tenant_id` into JWTs. It sends back:
 > > `to claude-frontend:` "B is on bcrypt 5, and we bake `tenant_id` into the JWT — if the merged project drops that claim, multi-tenancy in B breaks. Want me to extract the claims schema to a shared module?"
 >
 > **Claude** now has a real answer + a surfaced risk + a concrete next step. Replies:
@@ -49,12 +49,12 @@ Brief. Substantive. Initiative on both sides. No spam. That's the whole pitch.
 | | |
 |---|---|
 | 🧠 → 🧠 **Claude ↔ Claude** | Claude's native channel provides a best-effort mid-task hint; the mode-0600 durable inbox remains authoritative if the host drops or queues that hint. |
-| 🤖 → 🤖 / 🧠 → 🤖 **Claude ↔ Codex** | Current Codex CLI (v0.120, Apr 2026) has no mid-task push channel for MCP servers, so Codex picks up peer messages on the next agent-peers tool call — its shared instructions tell it to call `check_messages` at the start of every user turn, which bounds delivery latency to one user turn. Background poll (1s) and a durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600) preserve unconfirmed messages across restarts that reclaim the same stable peer identity. A signal-only `notifications/message` preview also fires per poll as future-compatible plumbing for whenever Codex CLI adds MCP log surfacing. |
+| 🤖 → 🤖 / 🧠 → 🤖 **Claude ↔ Codex** | Current Codex CLI has no model-visible mid-task push channel for MCP servers, so ordinary Codex sessions pick up peer messages on the next agent-peers tool call. Background poll (1s) and a durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600) preserve unacknowledged messages across restarts. Wakeable mode can start a bodyless app-server turn for an idle session; it is not a native MCP notification. |
 | 👥 **Colleague behavior protocol** | Shared prompt imported by both servers: don't auto-reply "got it", investigate before answering, push back on disagreement, ping proactively when you find something the other peer cares about, close every loop. |
 | 🏷️ **Friendly names** | Random `calm-fox` by default, or `PEER_NAME=frontend-tab` for a stable one. Your terminal tab renames itself so you can tell sessions apart at a glance. Peers can rename themselves mid-session. |
 | 🔍 **Scoped discovery** | `list_peers` with scope `machine` / `directory` / `repo`. Agents find relevant peers without a global cloud directory. |
 | 🔐 **Per-user auth** | Session token per peer, per-user shared secret, DB + WAL sidecars + secret file all at 0o600 with a fail-closed startup check. On supported POSIX filesystems this is designed to prevent other OS users from reading peer traffic; startup fails closed if ownership or modes drift. |
-| 📬 **Durable local delivery** | Messages are persisted before broker acknowledgement. Codex confirms model presentation on the next tool call; Claude keeps a durable fallback inbox even if its live channel hint is dropped. Delivery is at-least-once, so consumers must tolerate duplicates. |
+| 📬 **Durable local delivery** | Messages are persisted before broker acknowledgement. Both adapters retain and re-present them until the model explicitly calls `ack_messages` with the processed IDs. Delivery is at-least-once, so consumers must tolerate duplicates. |
 | ♻️ **Reclaim-safe restart** | Relaunch a dead session with the same `PEER_NAME` → its owner-only durable reclaim credential lets the broker recover the retained UUID and clear stale leases. Backlog lands on the new session's first poll. |
 
 ---
@@ -202,7 +202,7 @@ You should see the other. Then:
 What happens on the receiving side:
 
 - **Claude** normally gets a best-effort mid-task `<channel source="agent-peers">` hint. `check_messages` remains the authoritative fallback if the host queues or drops it.
-- **Codex** (v0.120, Apr 2026) has no mid-task MCP push, so peer messages land on Codex's **next agent-peers tool call**. The shared instructions tell Codex to call `check_messages` at the start of every user turn — so the worst-case lag is one of your turns, not "until Codex happens to think of it." You can also just type "check messages" to force it.
+- **Codex** has no model-visible mid-task MCP push, so ordinary sessions receive peer messages on their **next agent-peers tool call**. The shared instructions tell Codex to call `check_messages` at the start of every user turn. Wakeable mode uses app-server to start a turn; it does not add native MCP notifications.
 
 ### Step 4 — Real use
 
@@ -260,6 +260,54 @@ Read the full technical spec at [`docs/superpowers/specs/2026-04-13-agent-peers-
 
 ---
 
+## Wakeable Codex peers (idle wake, no fork)
+
+Stock Codex CLI can't be woken from idle by an MCP server — it only sees peer messages when it calls an agent-peers tool (see [Known behaviors](#known-behaviors)). **Wakeable mode** closes that gap for Codex **without forking the Codex binary**: launch Codex under a managed Codex app-server, register the live thread, and let a small background daemon nudge that exact thread to call `check_messages` when mail arrives. The nudge is a **bodyless prompt** — the message body is still only ever delivered through the normal `check_messages` tool response.
+
+### Quick start
+
+```bash
+# one-time: link the helper onto your PATH
+bun bin/codex-peer install      # symlinks ~/.local/bin/codex-peer
+
+# launch a wakeable Codex peer in the current repo (auto-names it <repo>-codex)
+codex-peer
+
+# ...or any repo, with an explicit stable name
+codex-peer start my-service ~/code/my-service
+```
+
+Every launch **auto-starts a single background wake daemon** (idempotent, pidfile-tracked, detached) — you never have to remember to run a watcher, and it comes back on its own on your next launch after a reboot.
+
+### How the wake works
+
+1. `codex-peer` starts `codex app-server --listen ws://127.0.0.1:<port>` plus a visible `codex resume --remote <url> <thread>` TUI bound to one managed thread.
+2. The agent-peers MCP child (running under the app-server) registers as a peer and, when mail arrives, writes **bodyless** metadata (sender id/name, timestamp — no body, no lease token) to `~/.agent-peers-codex/<peer>.metadata.json` next to the durable inbox.
+3. The wake daemon polls that metadata plus a durable wake registry. For each peer with unread mail whose thread is **loaded and idle**, it sends one bodyless wake prompt into the same app-server thread.
+4. Codex calls `check_messages`; the authoritative `[PEER INBOX]` block on that tool response carries the real content. Then it returns to waiting.
+
+It is the **same live instance** — same thread, same rollout, same visible TUI. It is never killed and restarted with fresh context.
+
+### What it costs
+
+- **An idle wakeable peer with no mail spends zero model tokens.** The idle TUI runs no inference; the wake daemon's poll is local-only (metadata files + local WebSocket JSON-RPC to the app-server) and never calls the model. A model turn fires only when there is real unread mail.
+- **Each wake re-bills the accumulated thread context** (turns are stateless), so wake cost grows with session age. Re-waking the *same* unread set backs off on an escalating schedule (5m → 30m → 2h) and then stops; a new message is a new signature and always wakes immediately. A deeply-thinking (active) thread is never nudged and never counted toward the cap.
+
+### Operating it
+
+| Command | What it does |
+|---|---|
+| `codex-peer` | Start a wakeable peer in the cwd (auto-name) |
+| `codex-peer start <name> <path>` | Start a wakeable peer with a stable name |
+| `codex-peer live` | Show wakeable sessions + unread counts |
+| `codex-peer daemon-status` / `daemon-stop` | Inspect / stop the background daemon |
+| `codex-peer repair-wake <name>` | Re-attach a live peer whose wake pointer was lost |
+| `codex-peer retire <name>` | Remove a stale/confusing peer from discovery |
+
+Full design, security model, and failure-mode notes: [`docs/wakeable-codex.md`](docs/wakeable-codex.md).
+
+---
+
 ## Environment variables
 
 | Var | Default | Purpose |
@@ -270,6 +318,13 @@ Read the full technical spec at [`docs/superpowers/specs/2026-04-13-agent-peers-
 | `OPENAI_API_KEY` | — | API credential used only when auto-summary is explicitly opted in |
 | `AGENT_PEERS_AUTO_SUMMARY` | `0` | Set to `1` to send redacted/coarse repository metadata to OpenAI for a one-sentence summary |
 | `AGENT_PEERS_DISABLE_TAB_TITLE` | — | Set to `1` to skip terminal tab title writing |
+| `AGENT_PEERS_CODEX_STATE_DIR` | `~/.agent-peers-codex` | Codex durable inbox + wake registry/daemon state dir |
+| `CODEX_PEER_DAEMON_INTERVAL` | `5` | Background wake daemon poll interval (seconds) |
+| `CODEX_PEER_DAEMON_LOG_MAX_BYTES` | `5242880` | Size at which `wake-daemon.log` is rotated (copy-truncate) |
+| `CODEX_PEER_DAEMON_LOG_KEEP` | `3` | Number of rotated wake-daemon logs to keep |
+
+See [docs/wake-daemon.md](docs/wake-daemon.md) for wake-daemon operations: log
+format, the wedged-peer (`systemError`) signal, and tuning.
 
 ---
 
@@ -286,16 +341,16 @@ Both Claude and Codex process peer messages **during turns**, not while idle at 
 What we do to make this as painless as possible: **both agents are instructed to call `check_messages` at the start of every user turn.** Claude additionally has the live `<channel source="agent-peers" ...>` push path for mid-turn arrivals. So the worst-case lag is "one of your own user turns" — type "hi" or "what's new" to a quiet peer and any pending messages surface in their first response.
 
 **`check_messages` works on BOTH agents and returns the same `[PEER INBOX]` framing.**
-On Codex, it drains the durable on-disk queue. On Claude, it reads the durable mode-0600 inbox populated before channel delivery is attempted. On either side, it's the reliable "give me my inbox" button. Just type "check messages" whenever you want to see what peers have sent.
+On both adapters, it reads the durable mode-0600 inbox without consuming it. Messages remain eligible for re-presentation until `ack_messages` explicitly confirms their IDs. Just type "check messages" whenever you want to see what peers have sent.
 
 **On Codex, the `notifications/message` preview is dormant.**
-[OpenAI Codex CLI v0.120 docs](https://github.com/openai/codex/blob/main/docs/config.md) list `tools` as the only supported MCP feature — resources, prompts, and `notifications/message` are not surfaced to the model. We still emit the preview every poll tick as future-compatible plumbing. When a future Codex CLI adds MCP log-notification surfacing, it'll light up automatically with no code change. Today it's a no-op you can safely ignore.
+Current Codex CLI does not surface `notifications/message` to the model. We still emit a bodyless preview as dormant future-compatible plumbing. Today it is a no-op; wakeable mode instead starts a bodyless app-server turn that calls the ordinary MCP tool path.
 
 **Tab title ("peer:calm-fox") is re-asserted every 1 second via OSC 0/1/2.**
 Most terminals (iTerm2, Terminal.app, Ghostty, Warp) track the running foreground process and periodically overwrite the tab title with the binary name ("node" / "bun"). A one-shot OSC write at startup therefore decays. The MCP server runs a lightweight keepalive that writes OSC 0 (window+icon title), OSC 1 (icon/tab title — what iTerm2 uses for tabs), and OSC 2 (window title) every 1s so `peer:<name>` stays visible. If your terminal is configured with a hardcoded title source (e.g. iTerm2 "Profile → General → Title" overriding application writes), we can't win — set `AGENT_PEERS_DISABLE_TAB_TITLE=1` to opt out of the keepalive entirely.
 
 **Closed tabs disappear from discovery within ~60 seconds, but the backlog isn't stranded.**
-When you close a tab, the shell kills the session without graceful cleanup. The peer row stays in the broker until its heartbeat goes stale (~60s). `list_peers` filters stale peers out of results immediately — you won't see ghost peers there even in that window. Stale identity rows are hidden after 60 seconds but retained for seven days. Restarting a named MCP adapter presents its persisted reclaim credential and recovers the UUID (immediately when the old PID is known dead, otherwise after staleness). The broker clears stale leases, so the new session picks up undelivered backlog on its first poll instead of waiting up to 30s for leases to expire. Codex additionally persists its durable inbox on disk, so messages sitting on a reclaimed session are replayed even if they were drawn but not yet confirmed delivered.
+When you close a tab, the shell kills the session without graceful cleanup. The peer row stays in the broker until its heartbeat goes stale (~60s). `list_peers` filters stale peers out of results immediately. Stale identity rows are retained for seven days. Restarting a named MCP adapter presents its persisted reclaim credential and recovers the UUID. The broker clears stale leases, and the durable inbox replays entries that were presented but never explicitly acknowledged.
 
 ---
 
@@ -325,7 +380,10 @@ agent-peers-mcp/
 ├── broker.ts                                  # HTTP+SQLite daemon (7900, 0o600 DB, shared-secret auth)
 ├── claude-server.ts                           # MCP server — claude/channel push delivery
 ├── codex-server.ts                            # MCP server — durable queue + signal-only preview + [PEER INBOX]
-├── cli.ts                                     # Admin / inspection CLI
+├── cli.ts                                     # Admin / inspection CLI (+ live / repair-wake / retire)
+├── bin/codex-peer                             # Wakeable Codex launcher + background wake daemon manager
+├── wakeable-codex.ts                          # Entry: launch app-server-backed wakeable Codex TUI
+├── wake-daemon.ts                             # Entry: one wake pass (the daemon loop calls this)
 ├── shared/
 │   ├── types.ts                               # API types
 │   ├── broker-client.ts                       # Typed HTTP client
@@ -334,11 +392,19 @@ agent-peers-mcp/
 │   ├── tab-title.ts                           # OSC terminal title
 │   ├── summarize.ts                           # gpt-5.4-nano auto-summary
 │   ├── piggyback.ts                           # [PEER INBOX] block + signal-only preview formatters
-│   ├── codex-inbox.ts                         # Durable on-disk inbox (~/.agent-peers-codex, 0o600)
+│   ├── codex-inbox.ts                         # Durable on-disk inbox + bodyless metadata (~/.agent-peers-codex, 0o600)
+│   ├── app-server-client.ts                   # Minimal Codex app-server JSON-RPC client (bounded timeouts)
+│   ├── wakeable-launcher.ts                   # Starts app-server + managed thread + visible TUI
+│   ├── wake-registry.ts                       # Durable peer_id -> app-server/thread registry (+ GC)
+│   ├── wake-launch-claims.ts                  # Launcher <-> MCP-child handshake (+ ambiguity-safe matching)
+│   ├── wake-daemon.ts                         # Wake engine: idle-only nudge, backoff + attempt cap + GC
+│   ├── wait-for-peer-messages.ts              # Bounded wait helper for wait_for_peer_messages
 │   ├── colleague-prompt.ts                    # COLLEAGUE_PROTOCOL string shared by both servers
 │   ├── shared-secret.ts                       # Per-user broker auth secret provisioning
 │   └── names.ts                               # adjective-noun generator
-├── tests/                                     # 84 tests — broker, migration, piggyback, client, names, codex-inbox, shared-secret
+├── tests/                                     # 200+ tests — broker, delivery, persistence, security, wake, and app-server flows
+├── docs/
+│   └── wakeable-codex.md                       # Wakeable Codex design, security model, failure modes
 ├── docs/superpowers/
 │   ├── specs/2026-04-13-agent-peers-mcp-design.md      # Full spec (post 7 review rounds + PR #2 amendments)
 │   └── plans/2026-04-13-agent-peers-mcp-implementation.md

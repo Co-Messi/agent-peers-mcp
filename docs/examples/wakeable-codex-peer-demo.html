@@ -1,0 +1,704 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wakeable Codex Peers: Plain-English Demo</title>
+  <style>
+    :root {
+      --ink: #18211f;
+      --muted: #5c6865;
+      --paper: #f7f6f1;
+      --panel: #ffffff;
+      --line: #cfd8d4;
+      --green: #0f7b61;
+      --green-soft: #dff2eb;
+      --red: #9b3a3a;
+      --red-soft: #f4e3df;
+      --gold: #8a640c;
+      --gold-soft: #f3ebcf;
+      --blue: #315f8a;
+      --blue-soft: #e0ebf4;
+      --shadow: 0 18px 50px rgba(28, 38, 36, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(1180px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 42px 0 64px;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+      gap: 28px;
+      align-items: end;
+      padding-bottom: 28px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1, h2, h3 {
+      line-height: 1.12;
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      max-width: 850px;
+      font-size: clamp(42px, 6vw, 72px);
+    }
+
+    h2 {
+      font-size: 30px;
+      margin-bottom: 16px;
+    }
+
+    h3 {
+      font-size: 19px;
+      margin-bottom: 8px;
+    }
+
+    p {
+      margin: 0 0 14px;
+    }
+
+    code {
+      background: rgba(24, 33, 31, 0.08);
+      border-radius: 4px;
+      padding: 0.1em 0.3em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      margin: 12px 0 0;
+      padding: 14px 16px;
+      overflow-x: auto;
+      color: #eff8f4;
+      background: #18211f;
+      border-radius: 8px;
+      font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre code {
+      color: inherit;
+      background: transparent;
+      padding: 0;
+      font-size: inherit;
+    }
+
+    .lede {
+      font-size: 21px;
+      color: #31413d;
+      max-width: 720px;
+    }
+
+    .truth-box {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: var(--shadow);
+    }
+
+    .truth-box strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 15px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--green);
+    }
+
+    .section {
+      margin-top: 34px;
+      padding: 28px;
+      background: rgba(255, 255, 255, 0.68);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .plain-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 18px;
+    }
+
+    .tile {
+      min-height: 150px;
+      padding: 18px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .tile.good {
+      border-color: #9bcbbd;
+      background: var(--green-soft);
+    }
+
+    .tile.warn {
+      border-color: #d2ba61;
+      background: var(--gold-soft);
+    }
+
+    .tile.no {
+      border-color: #d9aaa3;
+      background: var(--red-soft);
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      border: 1px solid currentColor;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .tag.green {
+      color: var(--green);
+      background: #eef8f4;
+    }
+
+    .tag.gold {
+      color: var(--gold);
+      background: #fff8dc;
+    }
+
+    .tag.blue {
+      color: var(--blue);
+      background: #eef5fb;
+    }
+
+    .diagram {
+      display: grid;
+      grid-template-columns: minmax(230px, 1fr) 74px minmax(240px, 1fr) 74px minmax(230px, 1fr);
+      gap: 0;
+      align-items: stretch;
+      margin-top: 20px;
+    }
+
+    .node {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 180px;
+      padding: 18px;
+      background: var(--panel);
+      border: 2px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .node h3 {
+      color: var(--ink);
+    }
+
+    .node p {
+      color: var(--muted);
+      margin-bottom: 0;
+    }
+
+    .node.green {
+      border-color: #5aa88f;
+    }
+
+    .node.blue {
+      border-color: #79a7ca;
+    }
+
+    .node.gold {
+      border-color: #c8aa43;
+    }
+
+    .connector {
+      position: relative;
+      min-height: 180px;
+    }
+
+    .connector::before {
+      content: "";
+      position: absolute;
+      top: 50%;
+      left: 10px;
+      right: 10px;
+      border-top: 3px solid #8fa19b;
+    }
+
+    .connector::after {
+      content: "";
+      position: absolute;
+      top: calc(50% - 7px);
+      right: 7px;
+      width: 14px;
+      height: 14px;
+      border-top: 3px solid #8fa19b;
+      border-right: 3px solid #8fa19b;
+      transform: rotate(45deg);
+      background: var(--paper);
+    }
+
+    .flow-list {
+      counter-reset: flow;
+      display: grid;
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .flow-step {
+      counter-increment: flow;
+      display: grid;
+      grid-template-columns: 44px minmax(0, 1fr);
+      gap: 14px;
+      padding: 16px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .flow-step::before {
+      content: counter(flow);
+      display: grid;
+      place-items: center;
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      color: #fff;
+      background: var(--green);
+      font-weight: 800;
+    }
+
+    .command-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 18px;
+    }
+
+    .command {
+      padding: 18px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .command .label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+      font-weight: 800;
+    }
+
+    .callout {
+      padding: 18px;
+      border-radius: 8px;
+      border: 1px solid #9bcbbd;
+      background: var(--green-soft);
+    }
+
+    .checklist {
+      display: grid;
+      gap: 10px;
+      padding-left: 0;
+      margin: 16px 0 0;
+      list-style: none;
+    }
+
+    .checklist li {
+      padding: 12px 14px;
+      border-left: 4px solid var(--green);
+      background: var(--panel);
+      border-radius: 0 8px 8px 0;
+    }
+
+    .mini-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      background: var(--panel);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .mini-table th,
+    .mini-table td {
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .mini-table th {
+      color: #253531;
+      background: #edf2ef;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    footer {
+      margin-top: 34px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    @media (max-width: 940px) {
+      header,
+      .plain-grid,
+      .command-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .diagram {
+        grid-template-columns: 1fr;
+        gap: 12px;
+      }
+
+      .connector {
+        min-height: 42px;
+      }
+
+      .connector::before {
+        top: 6px;
+        bottom: 6px;
+        left: 50%;
+        right: auto;
+        border-top: 0;
+        border-left: 3px solid #8fa19b;
+      }
+
+      .connector::after {
+        top: auto;
+        bottom: 5px;
+        right: auto;
+        left: calc(50% - 8px);
+        transform: rotate(135deg);
+      }
+    }
+
+    @media (max-width: 620px) {
+      main {
+        width: min(100% - 24px, 1180px);
+        padding-top: 24px;
+      }
+
+      h1 {
+        font-size: 38px;
+      }
+
+      .section {
+        padding: 18px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <span class="tag green">Agent Peers Example</span>
+        <h1>Wakeable Codex Peers, Without the Fog</h1>
+        <p class="lede">This page explains how a paused-looking Codex session can be nudged when a peer message arrives, why it needs a special launcher, and how to run the API Service plus Web App demo.</p>
+      </div>
+      <aside class="truth-box">
+        <strong>The honest version</strong>
+        <p>We did not change every Codex session on your machine. We built a managed way to start Codex so the peer network can nudge that same live session when it has unread mail.</p>
+      </aside>
+    </header>
+
+    <section class="section">
+      <h2>The Problem</h2>
+      <div class="plain-grid">
+        <article class="tile good">
+          <span class="tag green">Claude Code</span>
+          <h3>Claude can be pushed</h3>
+          <p>When a peer sends Claude a message, Claude Code has a channel that can wake the session and show the message mid-task.</p>
+        </article>
+        <article class="tile no">
+          <span class="tag gold">Stock Codex</span>
+          <h3>Codex only hears when it checks</h3>
+          <p>A normal Codex session does not show MCP push notifications to the model. If it is sitting at a prompt, it may not notice peer mail until it calls <code>check_messages</code>.</p>
+        </article>
+        <article class="tile warn">
+          <span class="tag blue">Our workaround</span>
+          <h3>Start Codex in wakeable mode</h3>
+          <p>The wakeable launcher starts Codex through its app-server. That gives the wake daemon a safe handle to nudge the exact same live thread.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>The Parts</h2>
+      <div class="diagram" aria-label="Wakeable Codex peer architecture diagram">
+        <div class="node green">
+          <div>
+            <span class="tag green">1. Peer Message</span>
+            <h3>Another peer sends mail</h3>
+          </div>
+          <p>Claude, Codex, or the shell CLI sends a message to <code>web-codex</code> or <code>api-codex</code>.</p>
+        </div>
+        <div class="connector" aria-hidden="true"></div>
+        <div class="node blue">
+          <div>
+            <span class="tag blue">2. Broker</span>
+            <h3>Local post office</h3>
+          </div>
+          <p>The broker on localhost stores the message in SQLite and leases it to the receiving peer's MCP server.</p>
+        </div>
+        <div class="connector" aria-hidden="true"></div>
+        <div class="node gold">
+          <div>
+            <span class="tag gold">3. Codex inbox metadata</span>
+            <h3>"You have mail"</h3>
+          </div>
+          <p>Codex's MCP sidecar writes tiny bodyless metadata to disk. It says unread mail exists, but it does not put the message body in the wake signal.</p>
+        </div>
+      </div>
+      <div class="diagram" aria-label="Wake daemon nudge diagram">
+        <div class="node gold">
+          <div>
+            <span class="tag gold">4. Wake daemon</span>
+            <h3>Small loop you run once</h3>
+          </div>
+          <p>The daemon sees unread metadata, checks that the target Codex thread is live and idle, then sends a nudge.</p>
+        </div>
+        <div class="connector" aria-hidden="true"></div>
+        <div class="node blue">
+          <div>
+            <span class="tag blue">5. App-server thread</span>
+            <h3>Same live Codex session</h3>
+          </div>
+          <p>The nudge is injected into the already-open Codex thread. No restart. No new blank context. No fake resumed clone.</p>
+        </div>
+        <div class="connector" aria-hidden="true"></div>
+        <div class="node green">
+          <div>
+            <span class="tag green">6. Codex checks inbox</span>
+            <h3>Real message arrives</h3>
+          </div>
+          <p>Codex calls <code>check_messages</code>. Only then does it receive the actual peer message body and respond like a normal colleague.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>In One Sentence</h2>
+      <div class="callout">
+        <p><strong>The launcher gives Codex a live app-server handle; the MCP sidecar leaves a "mail waiting" note; the daemon uses the handle to tell the same Codex thread to check its real inbox.</strong></p>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>What Works, What Does Not</h2>
+      <table class="mini-table">
+        <thead>
+          <tr>
+            <th>Situation</th>
+            <th>Expected result</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Codex was started with <code>codex-peer</code>, <code>codex-peer start api-codex ~/code/api-service</code>, or <code>codex-peer start web-codex ~/code/web-app</code></td>
+            <td>Wakeable, as long as the terminal is still alive and the wake daemon is running.</td>
+          </tr>
+          <tr>
+            <td>A normal <code>codex</code> session is already sitting at a prompt</td>
+            <td>Not wakeable by this system. It can still use the peer network when it manually checks messages.</td>
+          </tr>
+          <tr>
+            <td>The Codex process was killed, the Mac slept hard, or the terminal was closed</td>
+            <td>Not wakeable. Start the peer again.</td>
+          </tr>
+          <tr>
+            <td>Codex is actively working, waiting on approval, or asking you a question</td>
+            <td>The daemon skips the nudge. It avoids interrupting unsafe states.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="section">
+      <h2>First-Time Setup</h2>
+      <p>Install the helper once, then open a new terminal:</p>
+      <pre><code>cd /path/to/agent-peers-mcp
+bin/codex-peer install</code></pre>
+      <p>Everyday use is simple: go to any repo and type <code>codex-peer</code>. That launches wakeable Codex in that repo <strong>and auto-starts the background wake daemon if it is not already running</strong> — you no longer need to run <code>codex-peer daemon</code> by hand. Check the daemon any time with <code>codex-peer live</code> or <code>codex-peer daemon-status</code>, and stop it with <code>codex-peer daemon-stop</code>.</p>
+      <p>The underlying helper command is <code>codex-peer</code>. It lives at <code>bin/codex-peer</code> and is linked into <code>~/.local/bin</code>. If the link disappears, reinstall it with:</p>
+      <pre><code>cd /path/to/agent-peers-mcp
+bin/codex-peer install</code></pre>
+    </section>
+
+    <section class="section">
+      <h2>Demo: Two Wakeable Peers Collaborate</h2>
+      <p>Open three Zed terminals. Leave each one visible. These are the dummy-proof commands.</p>
+      <div class="command-grid">
+        <article class="command">
+          <div class="label"><span>Terminal 1</span><span class="tag gold">daemon (optional)</span></div>
+          <p>The wake daemon now <strong>auto-starts</strong> the first time you launch a peer below, so this terminal is optional. Use it only if you want to watch the wake loop in the foreground.</p>
+          <pre><code>codex-peer daemon</code></pre>
+        </article>
+        <article class="command">
+          <div class="label"><span>Terminal 2</span><span class="tag green">API</span></div>
+          <p>Starts wakeable Codex in the API Service repo with peer name <code>api-codex</code>.</p>
+          <pre><code>cd ~/code/api-service
+codex-peer</code></pre>
+        </article>
+        <article class="command">
+          <div class="label"><span>Terminal 3</span><span class="tag green">Web App</span></div>
+          <p>Starts wakeable Codex in the Web App repo with peer name <code>web-codex</code>.</p>
+          <pre><code>cd ~/code/web-app
+codex-peer</code></pre>
+        </article>
+        <article class="command">
+          <div class="label"><span>Optional Shell Test</span><span class="tag blue">send</span></div>
+          <p>Sends a message without using either Codex UI.</p>
+          <pre><code>codex-peer send web-codex "API peer test: please call check_messages and reply."</code></pre>
+        </article>
+      </div>
+
+      <div class="flow-list">
+        <div class="flow-step">
+          <div>
+            <h3>Check the roster</h3>
+            <p>Run this in any normal terminal:</p>
+            <pre><code>codex-peer live</code></pre>
+            <p>You should see <code>api-codex</code> and <code>web-codex</code> near the top under wakeable Codex sessions. If a name was already live, it may appear as <code>-2</code>.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div>
+            <h3>Make them talk from inside Codex</h3>
+            <p>In the API Codex terminal, type:</p>
+            <pre><code>List all peers on this machine. Then send web-codex a short message asking it what repo it is in.</code></pre>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div>
+            <h3>Watch the Web App terminal</h3>
+            <p>If the Web App Codex session is idle, the daemon should nudge it. Web App Codex should call <code>check_messages</code>, see the API message, and answer.</p>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div>
+            <h3>Reply the other direction</h3>
+            <p>In the Web App Codex terminal, type:</p>
+            <pre><code>Reply to api-codex and say you received the message. Include your current working directory.</code></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Command Cheat Sheet</h2>
+      <table class="mini-table">
+        <thead>
+          <tr>
+            <th>Command</th>
+            <th>Meaning</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>codex-peer</code></td>
+            <td>Start wakeable Codex in the current repo. This is the closest equivalent to <code>opus</code> for Codex.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer daemon</code></td>
+            <td>Foreground wake loop (<code>codex-peer daemon</code>). Optional — every <code>codex-peer</code> launch auto-starts a background daemon. Use <code>codex-peer daemon-status</code> / <code>daemon-stop</code> to manage it.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer start api-codex ~/code/api-service</code></td>
+            <td>Simple alias for starting the API Service wakeable Codex peer.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer start web-codex ~/code/web-app</code></td>
+            <td>Simple alias for starting the Web App wakeable Codex peer.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer peers</code></td>
+            <td>Simple alias for showing the live peer roster.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer live</code></td>
+            <td>Show which Codex peers are actually wakeable, plus unread counts.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer repair-wake web-codex-2</code></td>
+            <td>Attach an already-running wakeable Codex peer to its app-server wake pointer.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer retire web-codex-2</code></td>
+            <td>Take a closed, stale, or intentionally-finished peer off the wake/discovery board.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer doc</code></td>
+            <td>Simple alias for opening this explainer.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer daemon</code></td>
+            <td>Keep the wake loop running. This is the thing that notices unread Codex mail and nudges idle wakeable sessions.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer start name /path/to/repo</code></td>
+            <td>Start any repo with an explicit custom peer name. Usually you can just use <code>codex-peer</code>.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer send web-codex "hello"</code></td>
+            <td>Send a test message from the shell.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer peers</code></td>
+            <td>Show the live peer roster.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer live</code></td>
+            <td>Show the wakeable/non-wakeable Codex status board.</td>
+          </tr>
+          <tr>
+            <td><code>codex-peer doc</code></td>
+            <td>Open this page.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="section">
+      <h2>Troubleshooting</h2>
+      <ul class="checklist">
+        <li><strong>I sent a message and nothing woke up.</strong> Run <code>codex-peer live</code>. The target should say <code>wakeable=yes</code>. Also confirm the background daemon is up with <code>codex-peer daemon-status</code> (any <code>codex-peer</code> launch will auto-start it).</li>
+        <li><strong>The peer name is different.</strong> Run <code>codex-peer live</code>. If a name was already taken, the broker may have suffixed it.</li>
+        <li><strong>The peer says wakeable=no but I started it with codex-peer.</strong> Run <code>codex-peer repair-wake &lt;name&gt;</code>. This repairs the wake pointer without restarting the Codex context.</li>
+        <li><strong>I am done with a peer.</strong> Run <code>codex-peer retire &lt;name&gt;</code>. That removes it from discovery/wake tracking without deleting message history.</li>
+        <li><strong>The receiving Codex is working on something.</strong> The daemon skips active sessions. Let it finish or bring it back to idle.</li>
+        <li><strong>I started plain <code>codex</code>.</strong> That session can use agent peers, but it is not wakeable. Start with <code>codex-peer</code>.</li>
+        <li><strong>I closed the terminal.</strong> The live app-server handle is gone. Start that peer again.</li>
+      </ul>
+    </section>
+
+    <footer>
+      <p>Source repo: <code>/path/to/agent-peers-mcp</code>. Main helper: <code>codex-peer</code>. Helper command: <code>bin/codex-peer</code>. Low-level pieces: <code>wakeable-codex.ts</code>, <code>wake-daemon.ts</code>, <code>cli.ts</code>.</p>
+    </footer>
+  </main>
+</body>
+</html>
