@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir, platform } from "node:os";
 
@@ -175,4 +175,47 @@ test("CodexInboxStore keeps unread messages in memory when consume persistence f
 
   const unread = await store.getUnreadMessages();
   expect(unread.map((msg) => msg.id)).toEqual([11, 12]);
+});
+
+test("CodexInboxStore quarantines corrupt JSON instead of silently discarding it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+  const filePath = join(dir, "peer-corrupt.json");
+  await writeFile(filePath, "{not-json", { mode: 0o600 });
+
+  const store = new CodexInboxStore({ peerId: "peer-corrupt", rootDir: dir });
+  await store.init();
+
+  expect(await store.getUnreadMessages()).toEqual([]);
+  expect((await readdir(dir)).some((name) => name.startsWith("peer-corrupt.json.corrupt-"))).toBe(true);
+});
+
+test("CodexInboxStore quarantines schema-invalid message entries", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+  const filePath = join(dir, "peer-invalid.json");
+  await writeFile(filePath, JSON.stringify({ version: 1, unread: [{ id: "not-a-number" }] }), { mode: 0o600 });
+
+  const store = new CodexInboxStore({ peerId: "peer-invalid", rootDir: dir });
+  await store.init();
+
+  expect(await store.getUnreadMessages()).toEqual([]);
+  expect((await readdir(dir)).some((name) => name.startsWith("peer-invalid.json.corrupt-"))).toBe(true);
+});
+
+test.if(IS_POSIX)("CodexInboxStore refuses a symlinked state directory", async () => {
+  const base = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  const target = await mkdtemp(join(tmpdir(), "agent-peers-codex-target-"));
+  tempDirs.push(base, target);
+  const linked = join(base, "linked");
+  await symlink(target, linked, "dir");
+  const store = new CodexInboxStore({ peerId: "peer-link", rootDir: linked });
+  await expect(store.init()).rejects.toThrow(/symlink|directory/i);
+});
+
+test("CodexInboxStore rejects an unbounded unread queue", async () => {
+  const store = await makeStore();
+  await expect(store.queueLeasedMessages(
+    Array.from({ length: 1_001 }, (_, i) => message(i + 1)),
+  )).rejects.toThrow(/too many/i);
 });

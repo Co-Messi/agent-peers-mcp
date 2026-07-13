@@ -137,3 +137,15 @@ test("broker rejects HTTP requests without the shared-secret header (auth regres
   });
   expect(res.status).toBe(401);
 });
+
+test("broker rejects oversized HTTP request bodies before JSON parsing", async () => {
+  const res = await fetch(`http://127.0.0.1:${TEST_PORT}/register`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Agent-Peers-Secret": testSecret,
+    },
+    body: JSON.stringify({ padding: "x".repeat(70 * 1024) }),
+  });
+  expect(res.status).toBe(413);
+});

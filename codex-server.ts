@@ -78,6 +78,12 @@ import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
+import {
+  parseListPeersToolArgs,
+  parseRenameToolArgs,
+  parseSendMessageToolArgs,
+  parseSetSummaryToolArgs,
+} from "./shared/validation.ts";
 
 const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -469,10 +475,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   return withPiggyback(async () => {
     switch (name) {
       case "list_peers": {
-        const { scope, peer_type } = args as {
-          scope: "machine" | "directory" | "repo";
-          peer_type?: "claude" | "codex";
-        };
+        const { scope, peer_type } = parseListPeersToolArgs(args);
         const peers = await client.listPeers({
           scope, cwd: myCwd, git_root: myGitRoot, exclude_id: myId!, peer_type,
         });
@@ -493,7 +496,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "send_message": {
-        const { to_id, message } = args as { to_id: string; message: string };
+        const { to_id, message } = parseSendMessageToolArgs(args);
         const res = await client.sendMessage({
           from_id: myId!, session_token: mySession!, to_id_or_name: to_id, text: message,
         });
@@ -502,7 +505,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "set_summary": {
-        const { summary } = args as { summary: string };
+        const { summary } = parseSetSummaryToolArgs(args);
         await client.setSummary({ id: myId!, session_token: mySession!, summary });
         return { text: `Summary set: "${summary}"` };
       }
@@ -513,7 +516,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "rename_peer": {
-        const { new_name } = args as { new_name: string };
+        const { new_name } = parseRenameToolArgs(args);
         if (!isValidName(new_name)) {
           return { text: `Invalid name: must be 1-32 chars, [a-zA-Z0-9_-] only.`, isError: true };
         }

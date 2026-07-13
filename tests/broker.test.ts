@@ -288,6 +288,19 @@ test("sendMessage by id with valid session stores message", () => {
   expect(typeof res.message_id).toBe("number");
 });
 
+test("sendMessage rejects message bodies larger than 16 KiB", () => {
+  const from = reg({ name: "bounded-sender" });
+  const to = reg({ name: "bounded-recipient" });
+  const result = sendMessage(db, {
+    from_id: from.id,
+    session_token: from.session_token,
+    to_id_or_name: to.id,
+    text: "x".repeat(16 * 1024 + 1),
+  });
+  expect(result.ok).toBe(false);
+  expect(result.error).toMatch(/too long/i);
+});
+
 test("sendMessage by name resolves to id", () => {
   const a = reg({ name: "alpha" });
   reg({ name: "beta" });
@@ -380,6 +393,29 @@ test("pollMessages returns leased messages with enriched fields", () => {
   expect(out[0]!.from_name).toBe("alpha");
   expect(out[0]!.from_peer_type).toBe("claude");
   expect(out[0]!.lease_token).toMatch(/^[a-f0-9-]{36}$/);
+});
+
+test("pollMessages returns at most 100 messages per request", () => {
+  const from = reg({ name: "batch-sender" });
+  const to = reg({ name: "batch-recipient" });
+  for (let i = 0; i < 105; i++) {
+    expect(sendMessage(db, {
+      from_id: from.id,
+      session_token: from.session_token,
+      to_id_or_name: to.id,
+      text: `message ${i}`,
+    }).ok).toBe(true);
+  }
+  expect(pollMessages(db, to.id, to.session_token)).toHaveLength(100);
+});
+
+test("ackMessages rejects batches larger than 100 lease tokens", () => {
+  const peer = reg({ name: "batch-acker" });
+  expect(() => ackMessages(db, {
+    id: peer.id,
+    session_token: peer.session_token,
+    lease_tokens: Array.from({ length: 101 }, (_, i) => `lease-${i}`),
+  })).toThrow(/too many/i);
 });
 
 test("pollMessages twice does not re-deliver while lease active", () => {

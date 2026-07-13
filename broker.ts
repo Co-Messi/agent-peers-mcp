@@ -10,6 +10,20 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, chmodSync, openSync, closeSync, writeSync, fsyncSync, linkSync, unlinkSync, existsSync, renameSync, statSync } from "node:fs";
 import { validateSecretFilePerms } from "./shared/shared-secret.ts";
 import { createHealthProof } from "./shared/broker-auth.ts";
+import { MAX_ACK_TOKENS, MAX_HTTP_BODY_BYTES, MAX_POLL_MESSAGES } from "./shared/limits.ts";
+import {
+  ValidationError,
+  assertMessageText,
+  parseAckMessagesRequest,
+  parseHeartbeatRequest,
+  parseListPeersRequest,
+  parsePollMessagesRequest,
+  parseRegisterRequest,
+  parseRenamePeerRequest,
+  parseSendMessageRequest,
+  parseSetSummaryRequest,
+  parseUnregisterRequest,
+} from "./shared/validation.ts";
 import type {
   RegisterRequest, RegisterResponse, Peer,
   ListPeersRequest, SendMessageRequest, SendMessageResponse,
@@ -439,6 +453,11 @@ function resolveTarget(db: Database, to_id_or_name: string): Peer | null {
 }
 
 export function sendMessage(db: Database, req: SendMessageRequest): SendMessageResponse {
+  try {
+    assertMessageText(req.text);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "invalid message" };
+  }
   // Atomic sender auth + target resolution + liveness check + insert, all in
   // a single transaction so nothing can unregister or re-register between
   // steps and orphan a "successful" message (Codex round-D TOCTOU fix).
@@ -510,14 +529,18 @@ export function pollMessages(db: Database, id: string, session_token: string): L
     }
 
     const rows = db.query<
-      { id: number; from_id: string; to_id: string; text: string; sent_at: string },
+      { id: number; from_id: string; to_id: string; text: string; sent_at: string; from_name: string | null; from_peer_type: "claude" | "codex" | null; from_cwd: string | null; from_summary: string | null },
       [string, string]
     >(
-      `SELECT id, from_id, to_id, text, sent_at
-       FROM messages
-       WHERE to_id = ? AND acked = 0
-         AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at < ?)
-       ORDER BY id ASC`
+      `SELECT m.id, m.from_id, m.to_id, m.text, m.sent_at,
+              p.name AS from_name, p.peer_type AS from_peer_type,
+              p.cwd AS from_cwd, p.summary AS from_summary
+       FROM messages m
+       LEFT JOIN peers p ON p.id = m.from_id
+       WHERE m.to_id = ? AND m.acked = 0
+         AND (m.lease_token IS NULL OR m.lease_expires_at IS NULL OR m.lease_expires_at < ?)
+       ORDER BY m.id ASC
+       LIMIT ${MAX_POLL_MESSAGES}`
     ).all(id, nowStr);
 
     const result: LeasedMessage[] = [];
@@ -525,14 +548,13 @@ export function pollMessages(db: Database, id: string, session_token: string): L
       const lease = randomUUID();
       db.query("UPDATE messages SET lease_token = ?, lease_expires_at = ? WHERE id = ?")
         .run(lease, leaseUntil, row.id);
-      const sender = getPeer(db, row.from_id);
       result.push({
         id: row.id,
         from_id: row.from_id,
-        from_name: sender?.name ?? "(gone)",
-        from_peer_type: (sender?.peer_type ?? "claude") as "claude" | "codex",
-        from_cwd: sender?.cwd ?? "",
-        from_summary: sender?.summary ?? "",
+        from_name: row.from_name ?? "(gone)",
+        from_peer_type: row.from_peer_type ?? "claude",
+        from_cwd: row.from_cwd ?? "",
+        from_summary: row.from_summary ?? "",
         to_id: row.to_id,
         text: row.text,
         sent_at: row.sent_at,
@@ -548,6 +570,7 @@ export function pollMessages(db: Database, id: string, session_token: string): L
 // ----- Ack -----
 
 export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesResponse {
+  if (req.lease_tokens.length > MAX_ACK_TOKENS) throw new ValidationError("too many lease tokens");
   if (req.lease_tokens.length === 0) return { ok: true, acked: 0 };
   // Atomic auth via subquery: the UPDATE only affects messages whose to_id
   // belongs to a peer row with the matching session_token. No separate
@@ -677,7 +700,36 @@ export function listAllMessages(
 // ----- HTTP -----
 
 async function readJson<T>(req: Request): Promise<T> {
-  return (await req.json()) as T;
+  const declared = Number(req.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declared) && declared > MAX_HTTP_BODY_BYTES) {
+    throw new HttpError(413, "request body too large");
+  }
+  if (!req.body) throw new HttpError(400, "request body required");
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_HTTP_BODY_BYTES) {
+      await reader.cancel();
+      throw new HttpError(413, "request body too large");
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  try {
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as T;
+  } catch {
+    throw new HttpError(400, "invalid JSON body");
+  }
+}
+
+class HttpError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
 }
 
 function json(body: unknown, init?: ResponseInit): Response {
@@ -852,15 +904,15 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
         }
 
         switch (url.pathname) {
-          case "/register":      return json(registerPeer(db, await readJson(req)));
-          case "/heartbeat":     { const b = await readJson<{ id: string; session_token: string }>(req); heartbeatPeer(db, b.id, b.session_token); return json({ ok: true }); }
-          case "/unregister":    { const b = await readJson<{ id: string; session_token: string }>(req); unregisterPeer(db, b.id, b.session_token); return json({ ok: true }); }
-          case "/set-summary":   { const b = await readJson<{ id: string; session_token: string; summary: string }>(req); setPeerSummary(db, b.id, b.session_token, b.summary); return json({ ok: true }); }
-          case "/list-peers":    return json(listPeers(db, await readJson(req)));
-          case "/send-message":  return json(sendMessage(db, await readJson(req)));
-          case "/poll-messages": { const b = await readJson<{ id: string; session_token: string }>(req); return json({ messages: pollMessages(db, b.id, b.session_token) }); }
-          case "/ack-messages":  return json(ackMessages(db, await readJson(req)));
-          case "/rename-peer":   return json(renamePeer(db, await readJson(req)));
+          case "/register":      return json(registerPeer(db, parseRegisterRequest(await readJson(req))));
+          case "/heartbeat":     { const b = parseHeartbeatRequest(await readJson(req)); heartbeatPeer(db, b.id, b.session_token); return json({ ok: true }); }
+          case "/unregister":    { const b = parseUnregisterRequest(await readJson(req)); unregisterPeer(db, b.id, b.session_token); return json({ ok: true }); }
+          case "/set-summary":   { const b = parseSetSummaryRequest(await readJson(req)); setPeerSummary(db, b.id, b.session_token, b.summary); return json({ ok: true }); }
+          case "/list-peers":    return json(listPeers(db, parseListPeersRequest(await readJson(req))));
+          case "/send-message":  return json(sendMessage(db, parseSendMessageRequest(await readJson(req))));
+          case "/poll-messages": { const b = parsePollMessagesRequest(await readJson(req)); return json({ messages: pollMessages(db, b.id, b.session_token) }); }
+          case "/ack-messages":  return json(ackMessages(db, parseAckMessagesRequest(await readJson(req))));
+          case "/rename-peer":   return json(renamePeer(db, parseRenamePeerRequest(await readJson(req))));
           // No /admin/rename-peer over HTTP — arbitrary local processes could
           // hijack any peer's name. cli.ts 'rename' reads the target peer's
           // session_token from SQLite directly (file perms = trust boundary)
@@ -872,7 +924,9 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
         }
       } catch (e) {
         console.error("[broker] request error:", e);
-        return json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
+        if (e instanceof HttpError) return json({ error: e.message }, { status: e.status });
+        if (e instanceof ValidationError) return json({ error: e.message }, { status: 400 });
+        return json({ error: "internal broker error" }, { status: 500 });
       }
     },
   });
