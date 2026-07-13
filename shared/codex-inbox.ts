@@ -34,6 +34,20 @@ const MAX_INBOX_MESSAGES = 1_000;
 const LOCK_TIMEOUT_MS = 2_000;
 const LOCK_STALE_MS = 10_000;
 
+function processStartIdentity(pid: number): string | null {
+  try {
+    const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (result.exitCode !== 0) return null;
+    const value = result.stdout.toString().trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
 function cloneMessages(messages: LeasedMessage[]): LeasedMessage[] {
   return messages.map((message) => ({ ...message }));
 }
@@ -68,6 +82,10 @@ async function ensureSafeDirectory(dir: string): Promise<void> {
 async function atomicWriteJson(path: string, value: CodexInboxState): Promise<void> {
   const dir = dirname(path);
   await ensureSafeDirectory(dir);
+  const serialized = JSON.stringify(value, null, 2);
+  if (utf8ByteLength(serialized) > MAX_INBOX_FILE_BYTES) {
+    throw new Error("inbox state is too large");
+  }
   const tempPath = `${path}.tmp.${process.pid}.${randomUUID()}`;
   const noFollow = IS_POSIX ? fsConstants.O_NOFOLLOW : 0;
   const handle = await open(
@@ -76,7 +94,7 @@ async function atomicWriteJson(path: string, value: CodexInboxState): Promise<vo
     FILE_MODE,
   );
   try {
-    await handle.writeFile(JSON.stringify(value, null, 2), "utf8");
+    await handle.writeFile(serialized, "utf8");
     await handle.sync();
   } finally {
     await handle.close();
@@ -219,7 +237,7 @@ export class CodexInboxStore {
       }
       if ((fileStat.mode & 0o777) !== FILE_MODE) {
         inboxLog.error("insecure_file_mode");
-        return { ...EMPTY_STATE, unread: [] };
+        throw new Error("insecure inbox file mode");
       }
     }
     if (fileStat.size > MAX_INBOX_FILE_BYTES) return this.quarantine("file too large");
@@ -248,17 +266,55 @@ export class CodexInboxStore {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         try {
           const lockStat = await lstat(this.lockPath);
-          if (Date.now() - lockStat.mtimeMs > LOCK_STALE_MS) await rm(this.lockPath, { force: true });
+          let ownerAlive = false;
+          try {
+            const parsed = JSON.parse(await readFile(this.lockPath, "utf8")) as { pid?: unknown; process_start?: unknown };
+            if (Number.isSafeInteger(parsed.pid) && (parsed.pid as number) > 0) {
+              try { process.kill(parsed.pid as number, 0); ownerAlive = true; }
+              catch (probe) { ownerAlive = (probe as NodeJS.ErrnoException).code === "EPERM"; }
+              if (ownerAlive && typeof parsed.process_start === "string") {
+                const currentStart = processStartIdentity(parsed.pid as number);
+                // A live process with the same PID but a different start time
+                // is a PID-reuse collision, not the lock owner.
+                if (currentStart !== null && currentStart !== parsed.process_start) ownerAlive = false;
+              }
+              if (!ownerAlive) await rm(this.lockPath, { force: true });
+            } else if (Date.now() - lockStat.mtimeMs > LOCK_STALE_MS) {
+              await rm(this.lockPath, { force: true });
+            }
+          } catch {
+            if (Date.now() - lockStat.mtimeMs > LOCK_STALE_MS) await rm(this.lockPath, { force: true });
+          }
         } catch { /* lock disappeared; retry */ }
         if (Date.now() >= deadline) throw new Error("timed out waiting for inbox file lock");
         await Bun.sleep(10);
       }
+      if (handle) {
+        try {
+          await handle.writeFile(JSON.stringify({
+            pid: process.pid,
+            process_start: processStartIdentity(process.pid),
+            created_at: Date.now(),
+          }), "utf8");
+          await handle.sync();
+        } catch (error) {
+          await handle.close();
+          await rm(this.lockPath, { force: true });
+          throw error;
+        }
+      }
     }
+    const ownedStat = await handle.stat();
     try {
       return await fn();
     } finally {
       await handle.close();
-      await rm(this.lockPath, { force: true });
+      try {
+        const current = await lstat(this.lockPath);
+        if (current.dev === ownedStat.dev && current.ino === ownedStat.ino) {
+          await rm(this.lockPath, { force: true });
+        }
+      } catch { /* lock was already removed or replaced */ }
     }
   }
 

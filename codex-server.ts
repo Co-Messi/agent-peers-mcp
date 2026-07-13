@@ -67,7 +67,7 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { createClient } from "./shared/broker-client.ts";
+import { createClient, isSessionExpiredError } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
 import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts";
 import { canonicalizePath, getGitRoot, getTty } from "./shared/peer-context.ts";
@@ -79,10 +79,11 @@ import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
 import { sanitizeTerminalText as safe } from "./shared/safe-output.ts";
-import { PendingAckQueue } from "./shared/delivery-state.ts";
-import { MAX_ACK_TOKENS } from "./shared/limits.ts";
+import { PendingAckQueue, selectMessagesForPresentation } from "./shared/delivery-state.ts";
+import { MAX_ACK_TOKENS, MAX_PRESENTATION_BYTES, MAX_PRESENTED_MESSAGES } from "./shared/limits.ts";
 import { createLogger } from "./shared/logger.ts";
 import { parsePort } from "./shared/config.ts";
+import { loadPeerIdentity, savePeerIdentity } from "./shared/peer-identity.ts";
 import {
   parseListPeersToolArgs,
   parseRenameToolArgs,
@@ -100,6 +101,13 @@ function log(msg: string) {
   logger.info("status", { detail: msg });
 }
 
+function exitIfSessionExpired(error: unknown): void {
+  if (isSessionExpiredError(error)) {
+    logger.error("session_expired");
+    process.exit(1);
+  }
+}
+
 let client: ReturnType<typeof createClient>;
 async function isBrokerAlive(): Promise<boolean> {
   const secret = readSharedSecret();
@@ -109,6 +117,9 @@ async function isBrokerAlive(): Promise<boolean> {
 let myId: PeerId | null = null;
 let myName: string | null = null;
 let mySession: string | null = null;
+let myReclaimToken: string | null = null;
+let stableIdentityKey: string | undefined;
+let ownsStableIdentity = false;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 let inboxStore: CodexInboxStore | null = null;
@@ -247,6 +258,7 @@ async function pollBrokerIntoQueue(): Promise<void> {
     try {
       leased = await client.pollMessages({ id: myId!, session_token: mySession! });
     } catch (e) {
+      exitIfSessionExpired(e);
       log(`poll failed: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
@@ -358,19 +370,22 @@ async function withPiggyback(
   // never transitions to acked=1 (perpetually-unacked zombie row per
   // delivery invariant).
   //
-  // Tokens are removed from pendingAcks only on HTTP success; an
-  // exception leaves them for the next call to retry. HTTP success with
-  // `acked: 0` at the broker (stale tokens) still counts — the next
-  // re-lease will land new tokens in pendingAcks via the seen-branch,
-  // and this flush will eventually succeed against the current lease.
+  // Tokens are removed from pendingAcks only when the broker returns that
+  // exact token in `acked_tokens`. An exception or a successful response
+  // with a stale/expired token leaves it pending. The next re-lease replaces
+  // it by message id, and a later flush succeeds against the current lease.
   if (pendingAcks.size > 0) {
     const toFlush = pendingAcks.nextBatch();
     try {
-      await client.ackMessages({
+      const result = await client.ackMessages({
         id: myId, session_token: mySession, lease_tokens: toFlush.map((item) => item.token),
       });
-      pendingAcks.confirm(toFlush);
+      const acknowledged = new Set(result.acked_tokens);
+      const confirmed = toFlush.filter((item) => acknowledged.has(item.token));
+      pendingAcks.confirm(confirmed);
+      for (const item of confirmed) seen.delete(item.messageId);
     } catch (e) {
+      exitIfSessionExpired(e);
       log(`ack flush failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
     }
   }
@@ -390,6 +405,7 @@ async function withPiggyback(
       for (const id of confirming) {
         seen.add(id);
         presentedPendingConfirm.delete(id);
+        if (!pendingAcks.has(id)) seen.delete(id);
       }
     } catch (e) {
       log(`confirm-flush queue-prune failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
@@ -427,7 +443,7 @@ async function withPiggyback(
   // latter can happen if the previous call's confirm-flush partially
   // failed above; we want to keep showing the same items until flush
   // succeeds, not start dealing duplicates.
-  const fresh: LeasedMessage[] = [];
+  const eligible: LeasedMessage[] = [];
   for (const m of queued) {
     if (seen.has(m.id)) continue;
     if (presentedPendingConfirm.has(m.id)) {
@@ -436,8 +452,12 @@ async function withPiggyback(
       // is still the one we're waiting to confirm.
       continue;
     }
-    fresh.push(m);
+    eligible.push(m);
   }
+  const fresh = selectMessagesForPresentation(eligible, {
+    maxMessages: MAX_PRESENTED_MESSAGES,
+    maxBytes: MAX_PRESENTATION_BYTES,
+  });
 
   // Mark fresh items as "presented this call, awaiting confirm" and
   // stash their lease tokens for the NEXT call's confirm-flush. This is
@@ -519,7 +539,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         const res = await client.renamePeer({ id: myId!, session_token: mySession!, new_name });
         if (!res.ok) return { text: `Rename failed: ${res.error}`, isError: true };
-        myName = res.name ?? new_name;
+        const oldName = myName;
+        const renamedName = res.name ?? new_name;
+        if (stableIdentityKey && myReclaimToken) {
+          if (ownsStableIdentity) {
+            try {
+              const saved = await savePeerIdentity("codex", stableIdentityKey, {
+                name: renamedName,
+                reclaim_token: myReclaimToken,
+              }, undefined, myReclaimToken);
+              if (!saved) throw new Error("stable identity changed concurrently");
+            } catch {
+              const rollback = oldName
+                ? await client.renamePeer({ id: myId!, session_token: mySession!, new_name: oldName })
+                : { ok: false };
+              if (rollback.ok) return { text: "Rename could not be persisted and was rolled back.", isError: true };
+              myName = renamedName;
+              return { text: "Renamed, but durable identity persistence failed; restart recovery is not safe.", isError: true };
+            }
+          }
+        }
+        myName = renamedName;
         setTabTitle(`peer:${myName}`);
         return { text: `Renamed to ${myName}` };
       }
@@ -594,18 +634,30 @@ async function main() {
   })();
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
+  const requestedName = process.env.PEER_NAME;
+  stableIdentityKey = requestedName;
+  const storedIdentity = await loadPeerIdentity("codex", requestedName);
   const reg = await client.register({
     peer_type: "codex",
-    name: process.env.PEER_NAME,
+    name: storedIdentity?.name ?? requestedName,
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    reclaim_token: storedIdentity?.reclaim_token,
   });
+  ownsStableIdentity = await savePeerIdentity(
+    "codex",
+    requestedName,
+    { name: reg.name, reclaim_token: reg.reclaim_token },
+    undefined,
+    storedIdentity?.reclaim_token ?? null,
+  );
   myId = reg.id;
   myName = reg.name;
   mySession = reg.session_token;
+  myReclaimToken = reg.reclaim_token;
   inboxStore = new CodexInboxStore({ peerId: myId });
   await inboxStore.init();
   setTabTitle(`peer:${myName}`);
@@ -638,7 +690,8 @@ async function main() {
 
   const hb = setInterval(async () => {
     if (myId && mySession) {
-      try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
+      try { await client.heartbeat({ id: myId, session_token: mySession }); }
+      catch (e) { exitIfSessionExpired(e); }
     }
   }, HEARTBEAT_INTERVAL_MS);
 

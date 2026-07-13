@@ -1,11 +1,17 @@
 import { expect, test } from "bun:test";
-import { PendingAckQueue } from "../shared/delivery-state.ts";
+import { PendingAckQueue, selectMessagesForPresentation } from "../shared/delivery-state.ts";
 
 test("PendingAckQueue keeps only the newest lease token per message", () => {
   const queue = new PendingAckQueue(100);
   queue.enqueue(1, "old");
   queue.enqueue(1, "new");
   expect(queue.nextBatch()).toEqual([{ messageId: 1, token: "new" }]);
+});
+
+test("presentation batches are bounded by count and serialized bytes", () => {
+  const messages = Array.from({ length: 30 }, (_, id) => ({ id, text: "x".repeat(100) }));
+  expect(selectMessagesForPresentation(messages, { maxMessages: 20, maxBytes: 1_000 })).toHaveLength(8);
+  expect(selectMessagesForPresentation(messages, { maxMessages: 5, maxBytes: 100_000 })).toHaveLength(5);
 });
 
 test("PendingAckQueue batches without dropping unflushed messages", () => {

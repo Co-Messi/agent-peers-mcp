@@ -83,6 +83,7 @@ export function parseRegisterRequest(value: unknown): RegisterRequest {
     git_root: nullableString(r.git_root, "git_root", MAX_PATH_CHARS),
     tty: nullableString(r.tty, "tty", MAX_TTY_CHARS),
     summary: assertSummary(r.summary),
+    ...(r.reclaim_token === undefined ? {} : { reclaim_token: id(r.reclaim_token, "reclaim_token") }),
     ...(name ? { name } : {}),
   };
 }

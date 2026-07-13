@@ -15,16 +15,23 @@ import { parsePort } from "./shared/config.ts";
 import {
   ACKED_RETENTION_MS,
   MAX_ACK_TOKENS,
+  MAX_ACTIVE_PEERS,
   MAX_CLOCK_SKEW_MS,
   MAX_HTTP_BODY_BYTES,
   MAX_MESSAGES_PER_SENDER_PER_MINUTE,
+  MAX_MESSAGES_GLOBAL_PER_MINUTE,
+  MAX_RETAINED_MESSAGES,
+  MAX_PEERS_RETURNED,
+  MAX_RETAINED_PEERS,
+  MAX_PEER_REGISTRATIONS_PER_MINUTE,
   MAX_PENDING_MESSAGES_PER_PEER,
   MAX_POLL_MESSAGES,
   ORPHAN_RETENTION_MS,
+  PEER_RETENTION_MS,
 } from "./shared/limits.ts";
 import {
   ValidationError,
-  assertMessageText,
+  assertSummary,
   parseAckMessagesRequest,
   parseHeartbeatRequest,
   parseListPeersRequest,
@@ -47,11 +54,18 @@ export const DEFAULT_DB_PATH = resolve(homedir(), ".agent-peers.db");
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
 export const DEFAULT_PORT = parsePort(process.env.AGENT_PEERS_PORT, 7900);
 export const STALE_THRESHOLD_MS = 60_000;
-export const STALE_RECLAIM_THRESHOLD_MS = 60_000;
 export const LEASE_DURATION_MS = 30_000;
 export const GC_INTERVAL_MS = 30_000;
 export const SECRET_HEADER = "x-agent-peers-secret";
 const brokerLog = createLogger("broker");
+
+export class SessionExpiredError extends Error {
+  constructor() { super("session expired or unknown peer"); this.name = "SessionExpiredError"; }
+}
+
+class BrokerLimitError extends Error {
+  constructor(message: string) { super(message); this.name = "BrokerLimitError"; }
+}
 
 function nowIso(): string { return new Date().toISOString(); }
 
@@ -135,12 +149,24 @@ export function initDb(path: string): Database {
       tty           TEXT,
       summary       TEXT DEFAULT '',
       session_token TEXT NOT NULL,
+      reclaim_token TEXT NOT NULL,
       registered_at TEXT NOT NULL,
       last_seen     TEXT NOT NULL
     );
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_name ON peers(name);`);
+
+  // Append-only within the active one-minute window. Unlike peers.registered_at,
+  // these events survive unregister, so register/unregister loops cannot bypass
+  // the creation-rate limit.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS registration_events (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      registered_at TEXT NOT NULL
+    );
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_registration_events_at ON registration_events(registered_at);`);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS messages (
@@ -206,9 +232,20 @@ function migrate_peers_add_session_token(db: Database): void {
       // know the new tokens, so assign tokens and force every row stale. A
       // same-name registration then atomically reclaims the UUID, rotates the
       // token, clears leases, and receives its pre-upgrade backlog.
-      db.query("UPDATE peers SET session_token = ?, last_seen = ?")
-        .run(randomUUID(), "1970-01-01T00:00:00.000Z");
+      const legacyRows = db.query<{ id: string }, []>("SELECT id FROM peers").all();
+      const updateLegacy = db.query("UPDATE peers SET session_token = ?, last_seen = ? WHERE id = ?");
+      for (const row of legacyRows) {
+        updateLegacy.run(randomUUID(), "1970-01-01T00:00:00.000Z", row.id);
+      }
       db.query("UPDATE messages SET lease_token = NULL, lease_expires_at = NULL WHERE acked = 0").run();
+    }
+    const addedReclaimToken = !columnExists(db, "peers", "reclaim_token");
+    if (addedReclaimToken) {
+      db.exec(`ALTER TABLE peers ADD COLUMN reclaim_token TEXT`);
+      // Empty is an explicit one-time legacy-recovery sentinel. The first
+      // stale reclaim rotates it to a real credential; all new peers require
+      // the credential from their first registration onward.
+      db.query("UPDATE peers SET reclaim_token = '' WHERE reclaim_token IS NULL").run();
     }
     // Self-heal: any row with NULL session_token (e.g. from a crashed partial
     // migration before this transactional logic existed) gets a freshly
@@ -221,12 +258,19 @@ function migrate_peers_add_session_token(db: Database): void {
       for (const row of nulls) update.run(randomUUID(), row.id);
       brokerLog.info("migration_tokens_repaired", { count: nulls.length });
     }
+    const nullReclaim = db.query<{ id: string }, []>(
+      "SELECT id FROM peers WHERE reclaim_token IS NULL"
+    ).all();
+    if (nullReclaim.length > 0) {
+      const update = db.query("UPDATE peers SET reclaim_token = ? WHERE id = ?");
+      for (const row of nullReclaim) update.run(randomUUID(), row.id);
+    }
     // Normalize schema (schema invariant): ALTER TABLE ADD COLUMN
     // leaves session_token nullable on upgraded DBs even though fresh installs
     // declare it NOT NULL. A future writer that inserts a NULL (e.g. a bug, a
     // manual edit) would re-introduce the silent-orphan class. Rebuild the
     // table to enforce NOT NULL, matching the fresh-install invariant.
-    if (isSessionTokenNullable(db)) {
+    if (isColumnNullable(db, "session_token") || isColumnNullable(db, "reclaim_token")) {
       rebuildPeersTableWithNotNullSessionToken(db);
       brokerLog.info("migration_schema_rebuilt");
     }
@@ -237,12 +281,12 @@ function migrate_peers_add_session_token(db: Database): void {
   }
 }
 
-function isSessionTokenNullable(db: Database): boolean {
+function isColumnNullable(db: Database, column: string): boolean {
   // pragma_table_info.notnull is 0 when the column is nullable, 1 when NOT NULL.
   // Alias to a non-reserved name for portability.
-  const row = db.query<{ not_null_flag: number }, []>(
-    `SELECT "notnull" AS not_null_flag FROM pragma_table_info('peers') WHERE name = 'session_token'`
-  ).get();
+  const row = db.query<{ not_null_flag: number }, [string]>(
+    `SELECT "notnull" AS not_null_flag FROM pragma_table_info('peers') WHERE name = ?`
+  ).get(column);
   return row ? row.not_null_flag === 0 : false;
 }
 
@@ -263,15 +307,16 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
       tty           TEXT,
       summary       TEXT DEFAULT '',
       session_token TEXT NOT NULL,
+      reclaim_token TEXT NOT NULL,
       registered_at TEXT NOT NULL,
       last_seen     TEXT NOT NULL
     );
   `);
   db.exec(`
-    INSERT INTO peers_new (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
-    SELECT id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen
+    INSERT INTO peers_new (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, reclaim_token, registered_at, last_seen)
+    SELECT id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, reclaim_token, registered_at, last_seen
     FROM peers
-    WHERE session_token IS NOT NULL;
+    WHERE session_token IS NOT NULL AND reclaim_token IS NOT NULL;
   `);
   db.exec(`DROP TABLE peers;`);
   db.exec(`ALTER TABLE peers_new RENAME TO peers;`);
@@ -298,63 +343,80 @@ function* nameCandidates(requested: string | undefined): Generator<string> {
 }
 
 export function registerPeer(db: Database, req: RegisterRequest): RegisterResponse {
-  const ts = nowIso();
-  // Every register (fresh or reclaim) issues a new session_token. Reclaim
-  // rotates the token so the previous session's client (if it's still alive
-  // elsewhere) can no longer act as this peer — the token is the session
-  // boundary.
-  const session_token = randomUUID();
+  req = parseRegisterRequest(req);
+  const tx = db.transaction((): RegisterResponse => {
+    const ts = nowIso();
+    const session_token = randomUUID();
+    const activeCutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+    const activeCount = db.query<{ count: number }, [string, string]>(
+      "SELECT COUNT(*) AS count FROM peers WHERE last_seen >= ? AND last_seen <= ?"
+    ).get(activeCutoff, new Date(Date.now() + MAX_CLOCK_SKEW_MS).toISOString())?.count ?? 0;
 
-  // Reclaim fast-path: stale peer with matching name → UPDATE in place, preserve UUID.
-  if (req.name && isValidName(req.name)) {
-    const cutoff = new Date(Date.now() - STALE_RECLAIM_THRESHOLD_MS).toISOString();
-    const reclaim = db.query(
-      `UPDATE peers
-         SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
-             session_token = ?, last_seen = ?
-       WHERE name = ? AND last_seen < ?`
-    ).run(
-      req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
-      session_token, ts, req.name, cutoff,
-    );
-    if ((reclaim.changes ?? 0) > 0) {
-      const row = db.query<{ id: string }, [string]>("SELECT id FROM peers WHERE name = ?").get(req.name);
-      if (row) {
-        // Clear any stale leases on undelivered messages for this peer. The
-        // previous session died mid-delivery — its lease_tokens are now
-        // worthless (the old session_token is gone), so the broker would
-        // otherwise hold those messages for up to LEASE_DURATION_MS before
-        // re-offering them. Clearing on reclaim makes the new session's
-        // first poll return the backlog immediately. Orphan observability
-        // is unaffected (acked=0 rows still show up in cli.ts orphaned-messages
-        // if the reclaimed peer dies again before reading).
+    if (req.name) {
+      const existing = db.query<{ id: string; pid: number | null; last_seen: string; reclaim_token: string }, [string]>(
+        "SELECT id, pid, last_seen, reclaim_token FROM peers WHERE name = ?"
+      ).get(req.name);
+      const processDead = existing?.pid != null && !isProcessAlive(existing.pid);
+      const hasReclaimCredential = existing !== null && existing !== undefined
+        && (existing.reclaim_token === ""
+          || (typeof req.reclaim_token === "string" && safeSecretEqual(req.reclaim_token, existing.reclaim_token)));
+      if (existing && hasReclaimCredential && (isStale(existing.last_seen) || processDead)) {
+        const replacingVisiblePeer = !isStale(existing.last_seen);
+        if (!replacingVisiblePeer && activeCount >= MAX_ACTIVE_PEERS) {
+          throw new BrokerLimitError("active peer capacity reached");
+        }
+        const reclaim_token = existing.reclaim_token || randomUUID();
+        db.query(
+          `UPDATE peers
+             SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
+                 session_token = ?, reclaim_token = ?, last_seen = ?
+           WHERE id = ?`
+        ).run(req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
+          session_token, reclaim_token, ts, existing.id);
         db.query(
           `UPDATE messages SET lease_token = NULL, lease_expires_at = NULL
            WHERE to_id = ? AND acked = 0`
-        ).run(row.id);
-        return { id: row.id, name: req.name, session_token };
+        ).run(existing.id);
+        return { id: existing.id, name: req.name, session_token, reclaim_token };
       }
     }
-  }
 
-  // Fresh INSERT with suffix ladder.
-  const id = randomUUID();
-  const insert = db.query(
-    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-  for (const candidate of nameCandidates(req.name)) {
-    try {
-      insert.run(
-        id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
-        session_token, ts, ts,
-      );
-      return { id, name: candidate, session_token };
-    } catch (e) {
-      if (!isUniqueViolation(e)) throw e;
+    const retained = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM peers").get()?.count ?? 0;
+    if (retained >= MAX_RETAINED_PEERS) throw new BrokerLimitError("peer capacity reached");
+    if (activeCount >= MAX_ACTIVE_PEERS) throw new BrokerLimitError("active peer capacity reached");
+    const registrationCutoff = new Date(Date.now() - 60_000).toISOString();
+    db.query("DELETE FROM registration_events WHERE registered_at < ?").run(registrationCutoff);
+    const recent = db.query<{ count: number }, [string]>(
+      "SELECT COUNT(*) AS count FROM registration_events WHERE registered_at >= ?"
+    ).get(registrationCutoff)?.count ?? 0;
+    if (recent >= MAX_PEER_REGISTRATIONS_PER_MINUTE) {
+      throw new BrokerLimitError("peer registration rate limit exceeded");
     }
-  }
-  throw new Error("broker: unable to allocate unique peer name after exhaustive retry");
+
+    const id = randomUUID();
+    const reclaim_token = randomUUID();
+    const insert = db.query(
+      `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, reclaim_token, registered_at, last_seen)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    for (const candidate of nameCandidates(req.name)) {
+      try {
+        insert.run(id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty,
+          req.summary, session_token, reclaim_token, ts, ts);
+        db.query("INSERT INTO registration_events (registered_at) VALUES (?)").run(ts);
+        return { id, name: candidate, session_token, reclaim_token };
+      } catch (e) {
+        if (!isUniqueViolation(e)) throw e;
+      }
+    }
+    throw new Error("broker: unable to allocate unique peer name after exhaustive retry");
+  });
+  return tx();
+}
+
+function isProcessAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
 }
 
 // NOTE: authPeer() was removed after the authorization review. Every mutating
@@ -383,6 +445,7 @@ export function unregisterPeer(db: Database, id: string, session_token: string):
 }
 
 export function setPeerSummary(db: Database, id: string, session_token: string, summary: string): boolean {
+  try { summary = assertSummary(summary); } catch { return false; }
   const info = db.query("UPDATE peers SET summary = ?, last_seen = ? WHERE id = ? AND session_token = ?")
     .run(summary, nowIso(), id, session_token);
   return (info.changes ?? 0) > 0;
@@ -458,7 +521,8 @@ export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
   // there does not broaden disclosure.
   const cwdProjection = req.scope === "machine" ? "'' AS cwd" : "cwd";
   const sql = `SELECT id, name, peer_type, ${cwdProjection}, summary, last_seen
-               FROM peers ${where} ORDER BY last_seen DESC`;
+               FROM peers ${where} ORDER BY last_seen DESC
+               LIMIT ${MAX_PEERS_RETURNED}`;
   return db.query<Peer, typeof params>(sql).all(...params);
 }
 
@@ -478,7 +542,7 @@ function resolveTarget(db: Database, to_id_or_name: string): Peer | null {
 
 export function sendMessage(db: Database, req: SendMessageRequest): SendMessageResponse {
   try {
-    assertMessageText(req.text);
+    req = parseSendMessageRequest(req);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "invalid message" };
   }
@@ -504,6 +568,19 @@ export function sendMessage(db: Database, req: SendMessageRequest): SendMessageR
     }
 
     const rateCutoff = new Date(Date.now() - 60_000).toISOString();
+    purgeExpiredMessages(db);
+    const retainedMessages = db.query<{ count: number }, []>(
+      "SELECT COUNT(*) AS count FROM messages"
+    ).get()?.count ?? 0;
+    if (retainedMessages >= MAX_RETAINED_MESSAGES) {
+      return { ok: false, error: "global message capacity reached" };
+    }
+    const globalRecentSends = db.query<{ count: number }, [string]>(
+      "SELECT COUNT(*) AS count FROM messages WHERE sent_at >= ?"
+    ).get(rateCutoff)?.count ?? 0;
+    if (globalRecentSends >= MAX_MESSAGES_GLOBAL_PER_MINUTE) {
+      return { ok: false, error: "global rate limit exceeded" };
+    }
     const recentSends = db.query<{ count: number }, [string, string]>(
       "SELECT COUNT(*) AS count FROM messages WHERE from_id = ? AND sent_at >= ?"
     ).get(req.from_id, rateCutoff)?.count ?? 0;
@@ -567,7 +644,7 @@ export function pollMessages(db: Database, id: string, session_token: string): L
       "UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?"
     ).run(nowStr, id, session_token);
     if ((hbInfo.changes ?? 0) === 0) {
-      return [] as LeasedMessage[];
+      throw new SessionExpiredError();
     }
 
     const rows = db.query<
@@ -613,19 +690,29 @@ export function pollMessages(db: Database, id: string, session_token: string): L
 
 export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesResponse {
   if (req.lease_tokens.length > MAX_ACK_TOKENS) throw new ValidationError("too many lease tokens");
-  if (req.lease_tokens.length === 0) return { ok: true, acked: 0 };
-  // Atomic auth via subquery: the UPDATE only affects messages whose to_id
-  // belongs to a peer row with the matching session_token. No separate
-  // pre-check → no TOCTOU window across reclaim-rotation.
-  const placeholders = req.lease_tokens.map(() => "?").join(",");
-  const sql = `UPDATE messages SET acked = 1, lease_token = NULL, lease_expires_at = NULL
-               WHERE lease_token IN (${placeholders})
-                 AND to_id = (SELECT id FROM peers WHERE id = ? AND session_token = ?)
-                 AND acked = 0
-                 AND lease_expires_at IS NOT NULL
-                 AND lease_expires_at >= ?`;
-  const info = db.query(sql).run(...req.lease_tokens, req.id, req.session_token, nowIso());
-  return { ok: true, acked: info.changes ?? 0 };
+  const tx = db.transaction((): AckMessagesResponse => {
+    const owner = db.query<{ id: string }, [string, string]>(
+      "SELECT id FROM peers WHERE id = ? AND session_token = ?"
+    ).get(req.id, req.session_token);
+    if (!owner) throw new SessionExpiredError();
+    if (req.lease_tokens.length === 0) return { ok: true, acked: 0, acked_tokens: [] };
+    const placeholders = req.lease_tokens.map(() => "?").join(",");
+    const ackedTokens = db.query<{ lease_token: string }, string[]>(
+      `SELECT lease_token FROM messages
+       WHERE lease_token IN (${placeholders})
+         AND to_id = ? AND acked = 0
+         AND lease_expires_at IS NOT NULL AND lease_expires_at >= ?`
+    ).all(...req.lease_tokens, req.id, nowIso()).map((row) => row.lease_token);
+    if (ackedTokens.length === 0) return { ok: true, acked: 0, acked_tokens: [] };
+    const validPlaceholders = ackedTokens.map(() => "?").join(",");
+    const sql = `UPDATE messages SET acked = 1, lease_token = NULL, lease_expires_at = NULL
+                 WHERE lease_token IN (${validPlaceholders})
+                   AND to_id = ?
+                   AND acked = 0`;
+    const info = db.query(sql).run(...ackedTokens, req.id);
+    return { ok: true, acked: info.changes ?? 0, acked_tokens: ackedTokens };
+  });
+  return tx();
 }
 
 // ----- Rename -----
@@ -659,7 +746,9 @@ export function renamePeer(db: Database, req: RenamePeerRequest): RenamePeerResp
 // ----- GC -----
 
 export function gcStalePeers(db: Database): number {
-  const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+  // Discovery hides peers after STALE_THRESHOLD_MS, but their identity row is
+  // retained longer so a stable-name restart can reclaim the UUID and mailbox.
+  const cutoff = new Date(Date.now() - PEER_RETENTION_MS).toISOString();
   const info = db.query("DELETE FROM peers WHERE last_seen < ?").run(cutoff);
   purgeExpiredMessages(db);
   return info.changes ?? 0;
@@ -974,6 +1063,14 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
         if (e instanceof ValidationError) {
           brokerLog.warn("request_invalid", { request_id: requestId, status: 400, route: url.pathname });
           return json({ error: e.message }, { status: 400 });
+        }
+        if (e instanceof SessionExpiredError) {
+          brokerLog.warn("session_expired", { request_id: requestId, status: 401, route: url.pathname });
+          return json({ error: "session expired" }, { status: 401 });
+        }
+        if (e instanceof BrokerLimitError) {
+          brokerLog.warn("broker_limit", { request_id: requestId, status: 429, route: url.pathname });
+          return json({ error: e.message }, { status: 429 });
         }
         brokerLog.error("request_failed", { request_id: requestId, status: 500, route: url.pathname });
         return json({ error: "internal broker error" }, { status: 500 });

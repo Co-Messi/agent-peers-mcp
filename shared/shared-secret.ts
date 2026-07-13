@@ -8,8 +8,10 @@
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
+import { createLogger } from "./logger.ts";
 
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
+const secretLog = createLogger("shared-secret");
 
 import { lstatSync } from "node:fs";
 
@@ -60,7 +62,7 @@ export function readSharedSecret(path: string = DEFAULT_SECRET_PATH): string | n
   } catch (e) {
     // Surface permission/ownership errors to stderr so the user sees them,
     // but don't crash the caller — they may have a degraded fallback path.
-    console.error(`[agent-peers] shared secret validation failed: ${e instanceof Error ? e.message : String(e)}`);
+    secretLog.error("validation_failed", { error_type: e instanceof Error ? e.name : "unknown" });
     return null;
   }
 }

@@ -23,9 +23,10 @@ function safeFields(fields: LogFields): Record<string, string | number | boolean
   return safe;
 }
 
-export function createLogger(component: string, writer: Writer = console.error) {
+export function createLogger(component: string, writer?: Writer) {
+  const write = writer ?? ((line: string) => console.error(line));
   const emit = (level: "info" | "warn" | "error", event: string, fields: LogFields = {}) => {
-    writer(JSON.stringify({
+    write(JSON.stringify({
       timestamp: new Date().toISOString(),
       component,
       level,

@@ -55,7 +55,7 @@ Brief. Substantive. Initiative on both sides. No spam. That's the whole pitch.
 | 🔍 **Scoped discovery** | `list_peers` with scope `machine` / `directory` / `repo`. Agents find relevant peers without a global cloud directory. |
 | 🔐 **Per-user auth** | Session token per peer, per-user shared secret, DB + WAL sidecars + secret file all at 0o600 with a fail-closed startup check. On supported POSIX filesystems this is designed to prevent other OS users from reading peer traffic; startup fails closed if ownership or modes drift. |
 | 📬 **Durable local delivery** | Messages are persisted before broker acknowledgement. Codex confirms model presentation on the next tool call; Claude keeps a durable fallback inbox even if its live channel hint is dropped. Delivery is at-least-once, so consumers must tolerate duplicates. |
-| ♻️ **Reclaim-safe restart** | Kill a session and relaunch with the same `PEER_NAME` within 60s → broker reclaims the UUID *and* clears stale leases. Backlog lands on the new session's first poll. |
+| ♻️ **Reclaim-safe restart** | Relaunch a dead session with the same `PEER_NAME` → its owner-only durable reclaim credential lets the broker recover the retained UUID and clear stale leases. Backlog lands on the new session's first poll. |
 
 ---
 
@@ -254,7 +254,7 @@ Run these from inside the cloned `agent-peers-mcp/` directory.
   4. **Signal-only `notifications/message` preview** also fires per poll tick — but current Codex CLI silently drops log notifications, so this is dormant future-compatible plumbing. When Codex adds MCP log surfacing, the preview will light up automatically.
 - **Confirm-on-next-call dedupe.** Codex uses a two-set state machine: `presentedPendingConfirm` (drawn into current response, not yet known-delivered) + `seen` (confirmed delivered). Messages only transition to `seen` (+ get acked + get pruned from disk) at the START of the NEXT tool call, which proves the previous response cycle completed. Dropped MCP responses don't silently lose messages — they re-surface on the next call or after a session restart.
 - **Shared colleague protocol.** Both servers import the same `COLLEAGUE_PROTOCOL` string from `shared/colleague-prompt.ts`, so Claude and Codex can't drift on reactive/proactive/maintenance behavior.
-- **Sessions gracefully restart.** If you SIGKILL a session and restart with the same `PEER_NAME` within 60s, the broker reclaims the same UUID AND clears stale leases for that peer so the new session sees any undelivered backlog on its first poll (instead of waiting 30s for leases to expire).
+- **Sessions recover with stable names and credentials.** Named MCP adapters persist an owner-only reclaim credential in `~/.agent-peers-identities` (directory 0700, files 0600). A matching credential can reclaim a dead PID immediately; otherwise the peer must first pass the 60-second heartbeat timeout. A same-name process without the credential receives a suffixed identity instead of taking over the mailbox. Hidden stale identities remain retained for seven days, and reclaim clears stale leases so backlog is available on the first poll.
 
 Read the full technical spec at [`docs/superpowers/specs/2026-04-13-agent-peers-mcp-design.md`](docs/superpowers/specs/2026-04-13-agent-peers-mcp-design.md).
 
@@ -295,7 +295,7 @@ On Codex, it drains the durable on-disk queue. On Claude, it reads the durable m
 Most terminals (iTerm2, Terminal.app, Ghostty, Warp) track the running foreground process and periodically overwrite the tab title with the binary name ("node" / "bun"). A one-shot OSC write at startup therefore decays. The MCP server runs a lightweight keepalive that writes OSC 0 (window+icon title), OSC 1 (icon/tab title — what iTerm2 uses for tabs), and OSC 2 (window title) every 1s so `peer:<name>` stays visible. If your terminal is configured with a hardcoded title source (e.g. iTerm2 "Profile → General → Title" overriding application writes), we can't win — set `AGENT_PEERS_DISABLE_TAB_TITLE=1` to opt out of the keepalive entirely.
 
 **Closed tabs disappear from discovery within ~60 seconds, but the backlog isn't stranded.**
-When you close a tab, the shell kills the session without graceful cleanup. The peer row stays in the broker until its heartbeat goes stale (~60s). `list_peers` filters stale peers out of results immediately — you won't see ghost peers there even in that window. If you restart with the same `PEER_NAME` within 60-90s, the broker reclaims the same UUID AND clears any stale leases for that peer, so the new session picks up undelivered backlog on its first poll instead of waiting up to 30s for leases to expire. Codex additionally persists its durable inbox on disk, so messages sitting on a reclaimed session are replayed even if they were drawn but not yet confirmed delivered.
+When you close a tab, the shell kills the session without graceful cleanup. The peer row stays in the broker until its heartbeat goes stale (~60s). `list_peers` filters stale peers out of results immediately — you won't see ghost peers there even in that window. Stale identity rows are hidden after 60 seconds but retained for seven days. Restarting a named MCP adapter presents its persisted reclaim credential and recovers the UUID (immediately when the old PID is known dead, otherwise after staleness). The broker clears stale leases, so the new session picks up undelivered backlog on its first poll instead of waiting up to 30s for leases to expire. Codex additionally persists its durable inbox on disk, so messages sitting on a reclaimed session are replayed even if they were drawn but not yet confirmed delivered.
 
 ---
 
@@ -311,7 +311,7 @@ Kill any old broker: `bun cli.ts kill-broker`. If another process owns the port,
 Ask it to call `list_peers` or `check_messages` — messages surface on any agent-peers tool response, not just specific ones. If you still don't see the `[PEER INBOX]` block, your Codex version may not render tool responses verbatim; file an issue with your Codex version.
 
 **Upgraded from an older install and existing peers aren't working**
-The broker assigns legacy rows temporary tokens, marks them stale, and preserves their UUIDs and mailboxes. Restart sessions with the same `PEER_NAME`; registration reclaims the UUID and pending messages with a fresh token.
+The broker assigns legacy rows temporary session tokens, marks them stale, and preserves their UUIDs and mailboxes. A legacy row permits one credential bootstrap by the same `PEER_NAME`; that registration writes a new owner-only reclaim credential for subsequent restarts.
 
 **Running alongside upstream `claude-peers-mcp`**
 They coexist cleanly on different ports (7900 vs 7899) and different MCP names (`agent-peers` vs `claude-peers`). You can use both simultaneously; they don't share state.
@@ -370,11 +370,13 @@ Both can run simultaneously. They do not talk to each other — you'd run `claud
 
 **Within a single session** — delivery is at-least-once. Message IDs support deterministic dedupe, but callers must tolerate duplicates around crashes, lease expiry, and acknowledgement retries.
 
-**Across a process restart** — durable inbox files and broker leases preserve messages when the same stable `PEER_NAME` is reclaimed. Random names do not provide a stable restart identity. Replies must be idempotent.
+**Across a process restart** — stale identities remain reclaimable for seven days; durable inbox files and broker leases preserve messages when the same stable `PEER_NAME` is reclaimed. Random names do not provide a stable restart identity. Replies must be idempotent.
 
 **Retention** — acknowledged rows are purged after 24 hours and undeliverable orphan rows after 7 days. Run `bun cli.ts purge` to apply retention immediately. Unacknowledged live mailboxes are capped at 1,000 messages per recipient.
 
-**Peer-to-peer security** — every peer gets a rotating session token. Wrong or expired tokens return explicit failures. Broker identity is HMAC-authenticated, HTTP bodies and fields are bounded, and peer text is wrapped as untrusted JSON data. This reduces risk but does not make same-user peers mutually trusted or sandbox their other tools.
+**Resource limits** — HTTP bodies are capped at 64 KiB, message bodies at 16 KiB, poll/ack batches and active/discovered peers at 100 (so no accepted live peer is hidden on an unreachable second page), retained restart identities at 1,024, unread durable inbox state at 2 MiB/1,000 messages, and retained broker messages at 10,000. Fresh registration events survive unregister within the one-minute rate window; individual senders and aggregate sends also have per-minute limits.
+
+**Peer-to-peer security** — every peer gets a rotating session token and named adapters keep a separate durable reclaim credential. Wrong or expired tokens return explicit failures, and name knowledge alone cannot take over a dead peer's mailbox. Broker identity is HMAC-authenticated, HTTP bodies and fields are bounded, and peer text is wrapped as untrusted JSON data. This reduces risk but does not make same-user peers mutually trusted or sandbox their other tools.
 
 ---
 

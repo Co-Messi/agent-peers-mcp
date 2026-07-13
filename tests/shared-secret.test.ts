@@ -98,7 +98,7 @@ describe("readSharedSecret", () => {
     console.error = (...args: unknown[]) => { errs.push(args.map(String).join(" ")); };
     try {
       expect(readSharedSecret(p)).toBeNull();
-      expect(errs.some((e) => /shared secret validation failed/.test(e))).toBe(true);
+      expect(errs.some((e) => /validation_failed/.test(e))).toBe(true);
     } finally {
       console.error = origErr;
     }

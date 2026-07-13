@@ -2,7 +2,7 @@
 
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { startBroker } from "../broker.ts";
-import { createClient } from "../shared/broker-client.ts";
+import { BrokerHttpError, createClient } from "../shared/broker-client.ts";
 import { readFileSync, unlinkSync, existsSync } from "node:fs";
 
 const TEST_DB = "/tmp/agent-peers-e2e-" + Date.now() + ".db";
@@ -93,16 +93,20 @@ test("broker-client isAlive returns true for live broker, false for wrong port",
 });
 
 test("broker-client rejects an unauthenticated service that only mimics /health", async () => {
+  let capturedSecret = false;
   const impostor = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
-    fetch() {
+    fetch(req) {
+      if (req.headers.has("X-Agent-Peers-Secret")) capturedSecret = true;
       return Response.json({ ok: true, pid: 12345 });
     },
   });
   try {
     const client = createClient(`http://127.0.0.1:${impostor.port}`, testSecret);
     expect(await client.isAlive()).toBe(false);
+    await expect(client.listPeers({ scope: "machine", cwd: "/", git_root: null })).rejects.toThrow(/identity/i);
+    expect(capturedSecret).toBe(false);
   } finally {
     impostor.stop(true);
   }
@@ -152,4 +156,15 @@ test("broker rejects oversized HTTP request bodies before JSON parsing", async (
     body: JSON.stringify({ padding: "x".repeat(70 * 1024) }),
   });
   expect(res.status).toBe(413);
+});
+
+test("broker-client exposes expired poll sessions as HTTP 401 errors", async () => {
+  const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
+  try {
+    await client.pollMessages({ id: "missing", session_token: "missing" });
+    throw new Error("expected poll to fail");
+  } catch (error) {
+    expect(error).toBeInstanceOf(BrokerHttpError);
+    expect((error as BrokerHttpError).status).toBe(401);
+  }
 });

@@ -133,7 +133,7 @@ test.if(IS_POSIX)("CodexInboxStore writes inbox file at 0o600 and directory at 0
   expect(dirStat.mode & 0o777).toBe(0o700);
 });
 
-test.if(IS_POSIX)("CodexInboxStore refuses to load an inbox file with too-wide perms", async () => {
+test.if(IS_POSIX)("CodexInboxStore fails closed on an inbox file with too-wide perms", async () => {
   const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
   tempDirs.push(dir);
 
@@ -146,11 +146,7 @@ test.if(IS_POSIX)("CodexInboxStore refuses to load an inbox file with too-wide p
   await chmod(filePath, 0o644); // too wide
 
   const store = new CodexInboxStore({ peerId, rootDir: dir });
-  await store.init();
-  const unread = await store.getUnreadMessages();
-
-  // Fail-closed: we got an empty inbox instead of the attacker-controlled payload.
-  expect(unread).toEqual([]);
+  await expect(store.init()).rejects.toThrow(/mode|insecure/i);
 });
 
 test("CodexInboxStore keeps unread messages in memory when consume persistence fails", async () => {
@@ -163,8 +159,8 @@ test("CodexInboxStore keeps unread messages in memory when consume persistence f
     rootDir: dir,
     persistState: async (path, value) => {
       if (shouldFail) throw new Error("disk full");
-      const writer = Bun.file(path);
-      await Bun.write(writer, JSON.stringify(value, null, 2));
+      await writeFile(path, JSON.stringify(value, null, 2), { mode: 0o600 });
+      await chmod(path, 0o600);
     },
   });
   await store.init();
@@ -229,4 +225,41 @@ test("CodexInboxStore rejects an unbounded unread queue", async () => {
   await expect(store.queueLeasedMessages(
     Array.from({ length: 1_001 }, (_, i) => message(i + 1)),
   )).rejects.toThrow(/too many/i);
+});
+
+test("CodexInboxStore rejects state whose serialized bytes exceed the file limit", async () => {
+  const store = await makeStore();
+  const large = Array.from({ length: 140 }, (_, i) => message(i + 1, { text: "x".repeat(16 * 1024) }));
+  await expect(store.queueLeasedMessages(large)).rejects.toThrow(/inbox.*large|state.*large/i);
+  expect(await store.getUnreadMessages()).toEqual([]);
+});
+
+test("two store instances serialize updates and merge against durable state", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+  const first = new CodexInboxStore({ peerId: "shared-peer", rootDir: dir });
+  const second = new CodexInboxStore({ peerId: "shared-peer", rootDir: dir });
+  await Promise.all([first.init(), second.init()]);
+  await Promise.all([
+    first.queueLeasedMessages([message(1)]),
+    second.queueLeasedMessages([message(2)]),
+  ]);
+  const restarted = new CodexInboxStore({ peerId: "shared-peer", rootDir: dir });
+  await restarted.init();
+  expect((await restarted.getUnreadMessages()).map((m) => m.id)).toEqual([1, 2]);
+});
+
+test("file lock recovers when a live PID has been reused by another process", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(rootDir);
+  const store = new CodexInboxStore({ peerId: "pid-reuse", rootDir });
+  await store.init();
+  const lockPath = join(rootDir, "pid-reuse.json.lock");
+  await writeFile(lockPath, JSON.stringify({
+    pid: process.pid,
+    process_start: "definitely-not-this-process",
+    created_at: Date.now() - 60_000,
+  }), { mode: 0o600 });
+  await store.queueLeasedMessages([message(901, { text: "recovered" })]);
+  expect((await store.getUnreadMessages()).map((item) => item.text)).toEqual(["recovered"]);
 });

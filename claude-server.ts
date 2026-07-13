@@ -23,7 +23,7 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { createClient } from "./shared/broker-client.ts";
+import { createClient, isSessionExpiredError } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
 import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts";
 import { canonicalizePath, getGitRoot, getTty } from "./shared/peer-context.ts";
@@ -35,11 +35,13 @@ import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId } from "./shared/types.ts";
 import { sanitizeTerminalText as safe } from "./shared/safe-output.ts";
-import { MAX_ACK_TOKENS } from "./shared/limits.ts";
+import { MAX_ACK_TOKENS, MAX_PRESENTATION_BYTES, MAX_PRESENTED_MESSAGES } from "./shared/limits.ts";
+import { selectMessagesForPresentation } from "./shared/delivery-state.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "./shared/logger.ts";
 import { parsePort } from "./shared/config.ts";
+import { loadPeerIdentity, savePeerIdentity } from "./shared/peer-identity.ts";
 import {
   parseListPeersToolArgs,
   parseRenameToolArgs,
@@ -57,6 +59,13 @@ function log(msg: string) {
   logger.info("status", { detail: msg });
 }
 
+function exitIfSessionExpired(error: unknown): void {
+  if (isSessionExpiredError(error)) {
+    logger.error("session_expired");
+    process.exit(1);
+  }
+}
+
 // The shared secret is only known after the broker has provisioned it, so
 // we defer client construction until main() can read the secret file.
 let client: ReturnType<typeof createClient>;
@@ -68,14 +77,13 @@ async function isBrokerAlive(): Promise<boolean> {
 let myId: PeerId | null = null;
 let myName: string | null = null;
 let mySession: string | null = null;
+let myReclaimToken: string | null = null;
+let stableIdentityKey: string | undefined;
+let ownsStableIdentity = false;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 let claudeInboxStore: DurableInboxStore | null = null;
 const presentedClaudeMessages = new Set<number>();
-
-// The recent-delivered ring buffer is the backfill surface for check_messages.
-// See shared/recent-delivered.ts for the full rationale. Extracted out of this
-// file so the behavior (retention, TTL, cap) is unit-testable in isolation.
 
 const mcp = new Server(
   { name: "agent-peers", version: "0.1.0" },
@@ -102,8 +110,8 @@ to use both:
      prompt, Claude Code queues the channel push — the model doesn't
      see it until the next turn begins, and it may not render
      visibly even then. Calling \`check_messages\` returns a
-     [PEER INBOX] block containing every peer message received in
-     the last 15 minutes, so nothing gets lost to idle-queue silence.
+     [PEER INBOX] block containing every unconfirmed peer message in
+     the durable local inbox, so nothing gets lost to idle-queue silence.
 
 RULE: Call \`check_messages\` as the FIRST thing you do at the START of
 every user turn. This is the same rule Codex uses. It's one cheap
@@ -158,7 +166,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Surface peer messages received in the last 15 minutes. Call this at the START of every user turn — it is the only reliable way to see messages that arrived while this session was idle at the prompt (Claude Code's channel push silently queues idle deliveries). One cheap call. Without this habit, peer DMs sent while you were idle wait invisibly until something else triggers a redraw.",
+      "Surface unconfirmed messages from the durable local inbox. Call this at the START of every user turn; the live channel is best effort and may queue or drop idle deliveries.",
     inputSchema: { type: "object" as const, properties: {} },
   },
   {
@@ -230,26 +238,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "check_messages": {
-      // BACKFILL: return whatever the background poll has recorded in the
-      // ring buffer. This is Claude's equivalent of Codex's [PEER INBOX]
-      // piggyback — the single reliable surface for "what peer messages
-      // have I received recently?" We keep the buffer independent of the
-      // broker (broker already acked those messages) so the user can
-      // always retrieve recent peer activity even when Claude Code's
-      // channel push was silently queued (which happens when the
-      // session was idle at the prompt).
-      //
-      // Dedupe is the model's job: each entry includes message_id, and
-      // the colleague protocol says "don't re-reply to something you
-      // already replied to." So repeated check_messages calls within
-      // the 15-min TTL window are safe — they show the same messages,
-      // Claude just won't re-respond to ones it already handled.
-      const recent = claudeInboxStore ? await claudeInboxStore.getUnreadMessages() : [];
+      // Return messages persisted before broker acknowledgement. Entries
+      // remain durable until a later tool call confirms this response completed.
+      // Delivery is at-least-once, so message_id remains the dedupe key.
+      const queued = claudeInboxStore ? await claudeInboxStore.getUnreadMessages() : [];
+      const recent = selectMessagesForPresentation(queued, {
+        maxMessages: MAX_PRESENTED_MESSAGES,
+        maxBytes: MAX_PRESENTATION_BYTES,
+      });
       if (recent.length === 0) {
         return {
           content: [{
             type: "text" as const,
-            text: "No peer messages in the last 15 minutes. (Messages also arrive live mid-turn via the agent-peers channel when a peer sends something while you're active — this tool is the fallback for messages that arrived while this session was idle at the prompt.)",
+            text: "No unconfirmed peer messages in the durable inbox. (Messages also arrive live mid-turn via the agent-peers channel when a peer sends something while you're active — this tool is the fallback for messages that arrived while this session was idle at the prompt.)",
           }],
         };
       }
@@ -274,7 +275,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (!res.ok) {
         return { content: [{ type: "text" as const, text: `Rename failed: ${res.error}` }], isError: true };
       }
-      myName = res.name ?? new_name;
+      const oldName = myName;
+      const renamedName = res.name ?? new_name;
+      if (stableIdentityKey && myReclaimToken) {
+        if (ownsStableIdentity) {
+          try {
+            const saved = await savePeerIdentity("claude", stableIdentityKey, {
+              name: renamedName,
+              reclaim_token: myReclaimToken,
+            }, undefined, myReclaimToken);
+            if (!saved) throw new Error("stable identity changed concurrently");
+          } catch {
+            const rollback = oldName
+              ? await client.renamePeer({ id: myId, session_token: mySession, new_name: oldName })
+              : { ok: false };
+            if (rollback.ok) {
+              return { content: [{ type: "text" as const, text: "Rename could not be persisted and was rolled back." }], isError: true };
+            }
+            myName = renamedName;
+            return { content: [{ type: "text" as const, text: "Renamed, but durable identity persistence failed; restart recovery is not safe." }], isError: true };
+          }
+        }
+      }
+      myName = renamedName;
       setTabTitle(`peer:${myName}`);
       return { content: [{ type: "text" as const, text: `Renamed to ${myName}` }] };
     }
@@ -357,18 +380,30 @@ async function main() {
   })();
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
+  const requestedName = process.env.PEER_NAME;
+  stableIdentityKey = requestedName;
+  const storedIdentity = await loadPeerIdentity("claude", requestedName);
   const reg = await client.register({
     peer_type: "claude",
-    name: process.env.PEER_NAME,
+    name: storedIdentity?.name ?? requestedName,
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    reclaim_token: storedIdentity?.reclaim_token,
   });
+  ownsStableIdentity = await savePeerIdentity(
+    "claude",
+    requestedName,
+    { name: reg.name, reclaim_token: reg.reclaim_token },
+    undefined,
+    storedIdentity?.reclaim_token ?? null,
+  );
   myId = reg.id;
   myName = reg.name;
   mySession = reg.session_token;
+  myReclaimToken = reg.reclaim_token;
   claudeInboxStore = new DurableInboxStore({
     peerId: `claude-${myName}`,
     rootDir: process.env.AGENT_PEERS_CLAUDE_STATE_DIR ?? join(homedir(), ".agent-peers-claude"),
@@ -444,7 +479,9 @@ async function main() {
           lease_tokens: msgs.slice(i, i + MAX_ACK_TOKENS).map((m) => m.lease_token),
         });
       }
+      for (const message of msgs) seen.delete(message.id);
     } catch (e) {
+      exitIfSessionExpired(e);
       log(`poll error: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
@@ -467,7 +504,8 @@ async function main() {
 
   const hb = setInterval(async () => {
     if (myId && mySession) {
-      try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
+      try { await client.heartbeat({ id: myId, session_token: mySession }); }
+      catch (e) { exitIfSessionExpired(e); }
     }
   }, HEARTBEAT_INTERVAL_MS);
 

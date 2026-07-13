@@ -19,29 +19,38 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { startBroker } from "../broker.ts";
 import { createClient } from "../shared/broker-client.ts";
-import {
-  recordDelivered,
-  getRecentDelivered,
-  __resetRecentDeliveredForTest,
-} from "../shared/recent-delivered.ts";
+import { CodexInboxStore as DurableInboxStore } from "../shared/codex-inbox.ts";
 import { formatInboxBlock } from "../shared/piggyback.ts";
 import { readFileSync, unlinkSync, existsSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const TEST_DB = "/tmp/agent-peers-e2e-live-" + Date.now() + ".db";
 const TEST_SECRET = "/tmp/agent-peers-e2e-live-secret-" + Date.now();
 const TEST_PORT = 7921;
 let handle: ReturnType<typeof startBroker>;
 let testSecret: string;
+const stateDirs: string[] = [];
+
+async function durableStore(peerId: string) {
+  const rootDir = await mkdtemp(join(tmpdir(), "agent-peers-e2e-inbox-"));
+  stateDirs.push(rootDir);
+  const store = new DurableInboxStore({ peerId, rootDir });
+  await store.init();
+  return { store, rootDir };
+}
 
 beforeAll(() => {
   handle = startBroker(TEST_PORT, TEST_DB, TEST_SECRET);
   testSecret = readFileSync(TEST_SECRET, "utf8").trim();
 });
-afterAll(() => {
+afterAll(async () => {
   clearInterval(handle.gcTimer);
   handle.server.stop(true);
   handle.db.close();
   for (const p of [TEST_DB, TEST_SECRET]) if (existsSync(p)) unlinkSync(p);
+  await Promise.all(stateDirs.map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
 test("live broker flow: sender → broker → receiver-poll returns the message with sender identity intact", async () => {
@@ -74,28 +83,8 @@ test("live broker flow: sender → broker → receiver-poll returns the message 
   expect(polled[0]!.text).toContain("bcrypt 5");
 });
 
-test("idle-arrival simulation for Claude's check_messages backfill path", async () => {
-  // This is the exact scenario from the user's live report:
-  //   1. Receiver's session is up and has an MCP background poll loop
-  //      running (simulated here by the explicit pollMessages call).
-  //   2. Sender sends a message while receiver is idle at the prompt.
-  //   3. The poll loop picks up the message and would push via
-  //      `notifications/claude/channel` — but because the session is
-  //      idle, Claude Code silently queues the push (does not surface
-  //      to the model until the next user turn begins).
-  //   4. We simulate the push-loop side effect on our in-memory ring
-  //      buffer (which the real claude-server.ts populates inline with
-  //      the channel-push notification call).
-  //   5. Receiver broker-acks the message (push succeeded at transport
-  //      level, broker forgets it).
-  //   6. User later asks receiver "check messages". The broker would
-  //      return nothing (message already acked), BUT the ring buffer
-  //      still has it — so check_messages surfaces it as a [PEER INBOX]
-  //      block. No silent loss.
-
-  __resetRecentDeliveredForTest();
+test("idle-arrival persists durably before broker acknowledgement", async () => {
   const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
-
   const sender = await client.register({
     peer_type: "claude", pid: 2001, cwd: "/x", git_root: null, tty: null,
     summary: "", name: "idle-sender",
@@ -104,60 +93,29 @@ test("idle-arrival simulation for Claude's check_messages backfill path", async 
     peer_type: "claude", pid: 2002, cwd: "/x", git_root: null, tty: null,
     summary: "", name: "idle-receiver",
   });
-
-  // Sender sends while receiver is "idle at prompt" (no active turn).
   const body = "did you see the auth change in PR #42?";
-  const sent = await client.sendMessage({
+  expect((await client.sendMessage({
     from_id: sender.id, session_token: sender.session_token,
-    to_id_or_name: "idle-receiver", text: body,
-  });
-  expect(sent.ok).toBe(true);
-
-  // Receiver's pollAndPush loop runs 1s later.
-  const polled = await client.pollMessages({
+    to_id_or_name: idleReceiver.id, text: body,
+  })).ok).toBe(true);
+  const polled = await client.pollMessages({ id: idleReceiver.id, session_token: idleReceiver.session_token });
+  const { store, rootDir } = await durableStore("claude-idle-receiver");
+  await store.queueLeasedMessages(polled);
+  expect((await client.ackMessages({
     id: idleReceiver.id, session_token: idleReceiver.session_token,
-  });
-  expect(polled.length).toBe(1);
+    lease_tokens: polled.map((m) => m.lease_token),
+  })).acked).toBe(1);
 
-  // Simulate the push-loop side effect: mcp.notification() resolves (bytes
-  // written to transport) → we record-delivered into the ring buffer + ack
-  // the broker. Whether Claude Code renders the push to the model is
-  // opaque to us at this point; the ring buffer is the fallback so we
-  // don't care.
-  const msg = polled[0]!;
-  recordDelivered(msg);
-  const acked = await client.ackMessages({
-    id: idleReceiver.id, session_token: idleReceiver.session_token,
-    lease_tokens: [msg.lease_token],
-  });
-  expect(acked.ok).toBe(true);
-  expect(acked.acked).toBe(1);
-
-  // Broker now has nothing more for idle-receiver — message is done.
-  const emptyPoll = await client.pollMessages({
-    id: idleReceiver.id, session_token: idleReceiver.session_token,
-  });
-  expect(emptyPoll).toEqual([]);
-
-  // User later asks "check messages" → claude-server's check_messages
-  // handler returns getRecentDelivered() formatted as a [PEER INBOX]
-  // block. This is the critical property: the message is retrievable
-  // even though the broker forgot about it.
-  const recent = getRecentDelivered();
-  expect(recent.length).toBe(1);
-  expect(recent[0]!.text).toBe(body);
-  expect(recent[0]!.from_name).toBe("idle-sender");
-
-  const inbox = formatInboxBlock(recent);
-  expect(inbox).toContain("PEER INBOX");
-  expect(inbox).toContain('"from_name":"idle-sender"');
-  expect(inbox).toContain(body);
+  // A fresh process can recover the body even though the broker row is acked.
+  const restarted = new DurableInboxStore({ peerId: "claude-idle-receiver", rootDir });
+  await restarted.init();
+  const recent = await restarted.getUnreadMessages();
+  expect(recent.map((m) => m.text)).toEqual([body]);
+  expect(formatInboxBlock(recent)).toContain('"from_name":"idle-sender"');
 });
 
-test("multiple idle-arrivals accumulate and all surface via check_messages backfill", async () => {
-  __resetRecentDeliveredForTest();
+test("multiple idle arrivals persist and confirm selectively", async () => {
   const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
-
   const sender = await client.register({
     peer_type: "claude", pid: 3001, cwd: "/x", git_root: null, tty: null,
     summary: "", name: "multi-sender",
@@ -166,45 +124,20 @@ test("multiple idle-arrivals accumulate and all surface via check_messages backf
     peer_type: "claude", pid: 3002, cwd: "/x", git_root: null, tty: null,
     summary: "", name: "multi-receiver",
   });
-
-  // Three messages arrive while receiver is idle.
   for (const text of ["question one", "question two", "question three"]) {
-    const r = await client.sendMessage({
+    expect((await client.sendMessage({
       from_id: sender.id, session_token: sender.session_token,
-      to_id_or_name: "multi-receiver", text,
-    });
-    expect(r.ok).toBe(true);
+      to_id_or_name: receiver.id, text,
+    })).ok).toBe(true);
   }
-
-  // Single poll drains all three.
-  const polled = await client.pollMessages({
-    id: receiver.id, session_token: receiver.session_token,
-  });
-  expect(polled.length).toBe(3);
-
-  // Simulate push-loop recording each + acking batched.
-  for (const m of polled) recordDelivered(m);
-  await client.ackMessages({
-    id: receiver.id, session_token: receiver.session_token,
-    lease_tokens: polled.map((m) => m.lease_token),
-  });
-
-  // check_messages backfill surfaces all three.
-  const recent = getRecentDelivered();
-  expect(recent.length).toBe(3);
-  expect(recent.map((m) => m.text)).toEqual([
-    "question one", "question two", "question three",
-  ]);
-
-  const inbox = formatInboxBlock(recent);
-  expect(inbox).toContain("3 unread message(s)");
-  expect(inbox).toContain("question one");
-  expect(inbox).toContain("question two");
-  expect(inbox).toContain("question three");
+  const polled = await client.pollMessages({ id: receiver.id, session_token: receiver.session_token });
+  const { store } = await durableStore("claude-multi-receiver");
+  await store.queueLeasedMessages(polled);
+  await store.removeByIds([polled[0]!.id]);
+  expect((await store.getUnreadMessages()).map((m) => m.text)).toEqual(["question two", "question three"]);
 });
 
 test("reclaim-safe backlog: peer dies mid-lease, restarts with same name, backlog surfaces on first poll", async () => {
-  __resetRecentDeliveredForTest();
   const client = createClient(`http://127.0.0.1:${TEST_PORT}`, testSecret);
 
   const sender = await client.register({
@@ -237,7 +170,7 @@ test("reclaim-safe backlog: peer dies mid-lease, restarts with same name, backlo
   // New session reclaims the name.
   const reclaimed = await client.register({
     peer_type: "codex", pid: 4003, cwd: "/x", git_root: null, tty: null,
-    summary: "", name: "doomed-receiver",
+    summary: "", name: "doomed-receiver", reclaim_token: victim.reclaim_token,
   });
   expect(reclaimed.id).toBe(victim.id); // same UUID
   expect(reclaimed.session_token).not.toBe(victim.session_token); // rotated

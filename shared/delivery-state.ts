@@ -12,6 +12,8 @@ export class PendingAckQueue {
 
   get size(): number { return this.byMessageId.size; }
 
+  has(messageId: number): boolean { return this.byMessageId.has(messageId); }
+
   enqueue(messageId: number, token: string): void {
     this.byMessageId.set(messageId, token);
   }
@@ -26,4 +28,21 @@ export class PendingAckQueue {
       if (this.byMessageId.get(item.messageId) === item.token) this.byMessageId.delete(item.messageId);
     }
   }
+}
+
+export function selectMessagesForPresentation<T>(
+  messages: T[],
+  limits: { maxMessages: number; maxBytes: number },
+): T[] {
+  const selected: T[] = [];
+  let bytes = 0;
+  const encoder = new TextEncoder();
+  for (const message of messages) {
+    if (selected.length >= limits.maxMessages) break;
+    const size = encoder.encode(JSON.stringify(message)).byteLength;
+    if (bytes + size > limits.maxBytes) break;
+    selected.push(message);
+    bytes += size;
+  }
+  return selected;
 }
