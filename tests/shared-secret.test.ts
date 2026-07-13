@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   rmSync,
   symlinkSync,
+  linkSync,
   existsSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -68,6 +69,15 @@ describe("validateSecretFilePerms", () => {
     symlinkSync(real, link);
     expect(() => validateSecretFilePerms(link)).toThrow(/symlink/);
   });
+
+  test("rejects a multiply-linked secret file", () => {
+    const dir = mkScratch();
+    const target = join(dir, "target-hardlink");
+    const linked = join(dir, "secret-hardlink");
+    writeFileSync(target, "x".repeat(64), { mode: 0o600 });
+    linkSync(target, linked);
+    expect(() => validateSecretFilePerms(linked)).toThrow(/hard link|links/i);
+  });
 });
 
 describe("readSharedSecret", () => {
@@ -88,7 +98,7 @@ describe("readSharedSecret", () => {
     console.error = (...args: unknown[]) => { errs.push(args.map(String).join(" ")); };
     try {
       expect(readSharedSecret(p)).toBeNull();
-      expect(errs.some((e) => /shared secret validation failed/.test(e))).toBe(true);
+      expect(errs.some((e) => /validation_failed/.test(e))).toBe(true);
     } finally {
       console.error = origErr;
     }

@@ -4,8 +4,10 @@
 
 import { createClient } from "./shared/broker-client.ts";
 import { readSharedSecret } from "./shared/shared-secret.ts";
+import { sanitizeTerminalText as safe } from "./shared/safe-output.ts";
+import { parsePort } from "./shared/config.ts";
 
-const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
+const BROKER_PORT = parsePort(process.env.AGENT_PEERS_PORT, 7900);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 
 // Read the shared secret. Commands that hit the broker's HTTP API (status,
@@ -22,6 +24,12 @@ async function cmdStatus() {
     process.exit(1);
   }
   console.log(`broker: running on ${BROKER_URL}`);
+  const diagnostics = await client.diagnostics();
+  console.log(
+    `queues: peers=${diagnostics.peers} pending=${diagnostics.pending_messages} ` +
+    `leased=${diagnostics.leased_messages} acked-retained=${diagnostics.acknowledged_messages} ` +
+    `orphans=${diagnostics.orphaned_messages}`,
+  );
   await cmdPeers();
 }
 
@@ -34,16 +42,16 @@ async function cmdPeers() {
     return;
   }
   for (const p of peers) {
-    console.log(`${p.name}  (${p.peer_type})  id=${p.id}`);
-    console.log(`  cwd=${p.cwd}${p.tty ? `  tty=${p.tty}` : ""}`);
-    if (p.summary) console.log(`  summary: ${p.summary}`);
+    console.log(`${safe(p.name, 32)}  (${p.peer_type})  id=${safe(p.id, 128)}`);
+    console.log(`  cwd=${safe(p.cwd)}${p.tty ? `  tty=${safe(p.tty, 256)}` : ""}`);
+    if (p.summary) console.log(`  summary: ${safe(p.summary, 1024)}`);
     console.log(`  last_seen=${p.last_seen}`);
   }
 }
 
 async function cmdSend(targetNameOrId: string, message: string) {
   // The broker now requires from_id to resolve to a registered, live peer
-  // (code review round-1 fix). Register a short-lived operator peer for this
+  // (current lifecycle invariant). Register a short-lived operator peer for this
   // send, then unregister it. Name is unique via PID suffix.
   const operatorName = `cli-operator-${process.pid}`;
   const reg = await client.register({
@@ -55,7 +63,7 @@ async function cmdSend(targetNameOrId: string, message: string) {
     tty: null,
     summary: "local CLI operator",
   });
-  // Code review round-2 fix: do NOT call process.exit() inside the try — that
+  // Lifecycle invariant: do NOT call process.exit() inside the try — that
   // terminates the process before finally runs and leaves the operator peer
   // registered. Capture the exit status, always unregister, then exit.
   let exitCode = 0;
@@ -88,7 +96,7 @@ async function cmdSend(targetNameOrId: string, message: string) {
 async function cmdRename(target: string, newName: string) {
   // Read the target peer's session_token from the SQLite file directly — the
   // operator trust boundary is OS file permissions on ~/.agent-peers.db,
-  // NOT an unauthenticated HTTP admin endpoint. Round-B audit removed the
+  // NOT an unauthenticated HTTP admin endpoint. The security model excludes the
   // /admin/rename-peer HTTP endpoint because any local process could have
   // hijacked peer identities.
   const { Database } = await import("bun:sqlite");
@@ -124,7 +132,7 @@ async function cmdMessages() {
   // Read the SQLite DB directly so OS file permissions remain the trust
   // boundary. The broker deliberately does NOT expose message bodies over an
   // unauthenticated HTTP endpoint (any local process can reach 127.0.0.1).
-  // Round-A security fix.
+  // The filesystem is the trust boundary.
   const { Database } = await import("bun:sqlite");
   const { resolve } = await import("node:path");
   const { homedir } = await import("node:os");
@@ -178,7 +186,7 @@ async function cmdMessages() {
       const preview = m.text.length > 80 ? m.text.slice(0, 77) + "..." : m.text;
       console.log(`#${m.id}  ${status}  from=${from}  to=${to}  sent=${m.sent_at}`);
       if (m.active_lease && m.lease_expires_at) console.log(`  lease_expires=${m.lease_expires_at}`);
-      console.log(`  ${preview}`);
+      console.log(`  ${safe(preview, 80)}`);
       console.log("");
     }
   } finally {
@@ -188,7 +196,7 @@ async function cmdMessages() {
 
 async function cmdOrphans() {
   // Read the SQLite DB directly — OS file permissions are the trust boundary.
-  // Round-B fix: removed the /orphaned-messages HTTP endpoint because it
+  // The security model excludes the /orphaned-messages HTTP endpoint because it
   // leaked message bodies to any local process on 127.0.0.1.
   const { Database } = await import("bun:sqlite");
   const { resolve } = await import("node:path");
@@ -211,7 +219,7 @@ async function cmdOrphans() {
     for (const m of rows) {
       const preview = m.text.length > 80 ? m.text.slice(0, 77) + "..." : m.text;
       console.log(`#${m.id}  from=${m.from_id}  to=${m.to_id}  sent=${m.sent_at}`);
-      console.log(`  ${preview}`);
+      console.log(`  ${safe(preview, 80)}`);
     }
   } finally {
     db.close();
@@ -219,22 +227,37 @@ async function cmdOrphans() {
 }
 
 async function cmdKillBroker() {
-  const proc = Bun.spawn(["lsof", "-t", "-i", `:${BROKER_PORT}`], {
-    stdout: "pipe", stderr: "ignore",
-  });
-  const out = (await new Response(proc.stdout).text()).trim();
-  await proc.exited;
-  if (!out) {
+  if (!sharedSecret) {
+    console.error("cannot authenticate broker: shared secret is unavailable");
+    process.exitCode = 1;
+    return;
+  }
+  const health = await client.health();
+  if (!health) {
     console.log("broker not running");
     return;
   }
-  for (const pid of out.split("\n")) {
-    try {
-      process.kill(Number(pid), "SIGTERM");
-      console.log(`killed pid=${pid}`);
-    } catch (e) {
-      console.error(`kill ${pid} failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
+  try {
+    process.kill(health.pid, "SIGTERM");
+    console.log(`killed authenticated broker pid=${health.pid}`);
+  } catch (e) {
+    console.error(`kill ${health.pid} failed: ${e instanceof Error ? e.message : String(e)}`);
+    process.exitCode = 1;
+  }
+}
+
+async function cmdPurge() {
+  const { Database } = await import("bun:sqlite");
+  const { resolve } = await import("node:path");
+  const { homedir } = await import("node:os");
+  const { purgeExpiredMessages } = await import("./broker.ts");
+  const dbPath = process.env.AGENT_PEERS_DB || resolve(homedir(), ".agent-peers.db");
+  const db = new Database(dbPath);
+  try {
+    const result = purgeExpiredMessages(db);
+    console.log(`purged acknowledged=${result.acked} orphaned=${result.orphaned}`);
+  } finally {
+    db.close();
   }
 }
 
@@ -269,6 +292,9 @@ switch (sub) {
   case "kill-broker":
     await cmdKillBroker();
     break;
+  case "purge":
+    await cmdPurge();
+    break;
   default:
     console.log(`usage:
   bun cli.ts status
@@ -277,6 +303,7 @@ switch (sub) {
   bun cli.ts rename <name-or-id> <new-name>
   bun cli.ts messages
   bun cli.ts orphaned-messages
+  bun cli.ts purge
   bun cli.ts kill-broker`);
     process.exit(sub ? 2 : 0);
 }

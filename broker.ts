@@ -7,24 +7,65 @@ import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, chmodSync, openSync, closeSync, writeSync, fsyncSync, linkSync, unlinkSync, existsSync, renameSync, statSync } from "node:fs";
+import { readFileSync, chmodSync, openSync, closeSync, writeSync, fsyncSync, linkSync, unlinkSync, existsSync, lstatSync } from "node:fs";
 import { validateSecretFilePerms } from "./shared/shared-secret.ts";
+import { createHealthProof, safeSecretEqual } from "./shared/broker-auth.ts";
+import { createLogger } from "./shared/logger.ts";
+import { parsePort } from "./shared/config.ts";
+import {
+  ACKED_RETENTION_MS,
+  MAX_ACK_TOKENS,
+  MAX_ACTIVE_PEERS,
+  MAX_CLOCK_SKEW_MS,
+  MAX_HTTP_BODY_BYTES,
+  MAX_MESSAGES_PER_SENDER_PER_MINUTE,
+  MAX_MESSAGES_GLOBAL_PER_MINUTE,
+  MAX_RETAINED_MESSAGES,
+  MAX_PEERS_RETURNED,
+  MAX_RETAINED_PEERS,
+  MAX_PEER_REGISTRATIONS_PER_MINUTE,
+  MAX_PENDING_MESSAGES_PER_PEER,
+  MAX_POLL_MESSAGES,
+  ORPHAN_RETENTION_MS,
+  PEER_RETENTION_MS,
+} from "./shared/limits.ts";
+import {
+  ValidationError,
+  assertSummary,
+  parseAckMessagesRequest,
+  parseHeartbeatRequest,
+  parseListPeersRequest,
+  parsePollMessagesRequest,
+  parseRegisterRequest,
+  parseRenamePeerRequest,
+  parseSendMessageRequest,
+  parseSetSummaryRequest,
+  parseUnregisterRequest,
+} from "./shared/validation.ts";
 import type {
   RegisterRequest, RegisterResponse, Peer,
   ListPeersRequest, SendMessageRequest, SendMessageResponse,
   LeasedMessage, AckMessagesRequest, AckMessagesResponse,
-  RenamePeerRequest, RenamePeerResponse,
+  RenamePeerRequest, RenamePeerResponse, BrokerDiagnostics,
 } from "./shared/types.ts";
 import { generateName, isValidName, NAME_MAX_LEN, NAME_REGEX } from "./shared/names.ts";
 
 export const DEFAULT_DB_PATH = resolve(homedir(), ".agent-peers.db");
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
-export const DEFAULT_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
+export const DEFAULT_PORT = parsePort(process.env.AGENT_PEERS_PORT, 7900);
 export const STALE_THRESHOLD_MS = 60_000;
-export const STALE_RECLAIM_THRESHOLD_MS = 60_000;
 export const LEASE_DURATION_MS = 30_000;
 export const GC_INTERVAL_MS = 30_000;
 export const SECRET_HEADER = "x-agent-peers-secret";
+const brokerLog = createLogger("broker");
+
+export class SessionExpiredError extends Error {
+  constructor() { super("session expired or unknown peer"); this.name = "SessionExpiredError"; }
+}
+
+class BrokerLimitError extends Error {
+  constructor(message: string) { super(message); this.name = "BrokerLimitError"; }
+}
 
 function nowIso(): string { return new Date().toISOString(); }
 
@@ -38,7 +79,7 @@ function chmodIfExists(p: string, mode: number): void {
   try { chmodSync(p, mode); } catch { /* file may not exist yet, or no POSIX perms — best effort */ }
 }
 
-// Fail-closed permission check (Codex round-G): after every chmod pass on
+// Fail-closed permission check (Security invariant): after every chmod pass on
 // the DB + WAL/SHM sidecars, re-stat and verify owner + mode match what we
 // expect. If anything is wrong — wrong uid, world/group readable, not a
 // regular file — abort broker startup rather than silently serving with a
@@ -50,9 +91,15 @@ function enforceDbFilePerms(path: string, required: string[]): void {
   const mine = (process as unknown as { getuid: () => number }).getuid();
   for (const p of required) {
     if (!existsSync(p)) continue; // sidecars may legitimately not exist yet
-    const st = statSync(p);
+    const st = lstatSync(p);
+    if (st.isSymbolicLink()) {
+      throw new Error(`broker: ${p} is a symlink — refusing to start`);
+    }
     if (!st.isFile()) {
       throw new Error(`broker: ${p} is not a regular file — refusing to start`);
+    }
+    if (st.nlink !== 1) {
+      throw new Error(`broker: ${p} has ${st.nlink} hard links — refusing to start`);
     }
     if (st.uid !== mine) {
       throw new Error(`broker: ${p} owned by uid ${st.uid}, not current user (${mine}) — refusing to start`);
@@ -67,7 +114,7 @@ function enforceDbFilePerms(path: string, required: string[]): void {
 }
 
 export function initDb(path: string): Database {
-  // Tighten umask BEFORE opening SQLite (Codex round-I). SQLite and any
+  // Tighten umask BEFORE opening SQLite (Security invariant). SQLite and any
   // checkpoint-driven re-creation of the -wal / -shm sidecars uses the
   // process umask. 0o077 forces every file SQLite touches to default to
   // 0600, which closes the window between runtime WAL recreation and the
@@ -75,10 +122,14 @@ export function initDb(path: string): Database {
   // as a fail-closed backstop in case a non-default umask was set earlier.
   try { process.umask(0o077); } catch { /* not all runtimes expose umask */ }
 
+  // Validate an existing path before SQLite opens it. Opening first would
+  // follow a symlink and could corrupt or disclose an attacker-selected file.
+  enforceDbFilePerms(path, [path]);
+
   const db = new Database(path);
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");
-  // Harden filesystem permissions on the DB + its WAL sidecars. Codex round-E
+  // Harden filesystem permissions on the DB + its WAL sidecars. Security invariant
   // flagged that SQLite creates files with the process umask (typically 022,
   // world-readable), which would expose session_tokens + message bodies to
   // any local user. cli.ts 'messages' / 'rename' treat the DB's file perms
@@ -98,12 +149,24 @@ export function initDb(path: string): Database {
       tty           TEXT,
       summary       TEXT DEFAULT '',
       session_token TEXT NOT NULL,
+      reclaim_token TEXT NOT NULL,
       registered_at TEXT NOT NULL,
       last_seen     TEXT NOT NULL
     );
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_peers_name ON peers(name);`);
+
+  // Append-only within the active one-minute window. Unlike peers.registered_at,
+  // these events survive unregister, so register/unregister loops cannot bypass
+  // the creation-rate limit.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS registration_events (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      registered_at TEXT NOT NULL
+    );
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_registration_events_at ON registration_events(registered_at);`);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS messages (
@@ -134,7 +197,7 @@ export function initDb(path: string): Database {
   chmodIfExists(path + "-wal", 0o600);
   chmodIfExists(path + "-shm", 0o600);
 
-  // Fail-closed validation (Codex round-G): stat and verify every file
+  // Fail-closed validation (Security invariant): stat and verify every file
   // matches the trust-boundary invariant. A broken chmod, alien owner, or
   // unusual filesystem that ignores mode bits now aborts startup with a
   // clear error instead of quietly serving readable session tokens.
@@ -156,30 +219,33 @@ function columnExists(db: Database, table: string, column: string): boolean {
 
 function migrate_peers_add_session_token(db: Database): void {
   // Wrapped in BEGIN IMMEDIATE so concurrent broker startups serialize the
-  // schema check + mutation (code review round-4 fix). Without this, process A
+  // schema check + mutation (migration concurrency invariant). Without this, process A
   // can run ALTER TABLE while process B races past the columnExists check and
   // proceeds against a half-migrated DB.
   db.exec("BEGIN IMMEDIATE");
   try {
-    if (!columnExists(db, "peers", "session_token")) {
+    const addedSessionToken = !columnExists(db, "peers", "session_token");
+    if (addedSessionToken) {
       // First-time upgrade from a pre-session_token schema.
       db.exec(`ALTER TABLE peers ADD COLUMN session_token TEXT`);
-      // Drop all pre-upgrade peer rows (round-4 fix for "migrated legacy peers
-      // can silently receive undeliverable messages"). Pre-upgrade clients
-      // don't know the new session_token scheme, so they cannot authenticate.
-      // Leaving their rows in place would make them addressable via
-      // sendMessage but unpollable — messages would orphan silently. Deleting
-      // forces a clean reconnect: clients get "unknown peer" on their next
-      // heartbeat/send and re-register. Any in-flight messages for these
-      // peers become orphans, observable via cli.ts orphaned-messages.
-      const dropped = db.query("DELETE FROM peers").run();
-      if ((dropped.changes ?? 0) > 0) {
-        console.error(
-          `[broker] migration: dropped ${dropped.changes} pre-upgrade peer(s); ` +
-          `they will re-register on reconnect. In-flight messages to them are visible ` +
-          `via 'bun cli.ts orphaned-messages'.`
-        );
+      // Preserve peer UUIDs and pending mailbox routing. Legacy clients cannot
+      // know the new tokens, so assign tokens and force every row stale. A
+      // same-name registration then atomically reclaims the UUID, rotates the
+      // token, clears leases, and receives its pre-upgrade backlog.
+      const legacyRows = db.query<{ id: string }, []>("SELECT id FROM peers").all();
+      const updateLegacy = db.query("UPDATE peers SET session_token = ?, last_seen = ? WHERE id = ?");
+      for (const row of legacyRows) {
+        updateLegacy.run(randomUUID(), "1970-01-01T00:00:00.000Z", row.id);
       }
+      db.query("UPDATE messages SET lease_token = NULL, lease_expires_at = NULL WHERE acked = 0").run();
+    }
+    const addedReclaimToken = !columnExists(db, "peers", "reclaim_token");
+    if (addedReclaimToken) {
+      db.exec(`ALTER TABLE peers ADD COLUMN reclaim_token TEXT`);
+      // Empty is an explicit one-time legacy-recovery sentinel. The first
+      // stale reclaim rotates it to a real credential; all new peers require
+      // the credential from their first registration onward.
+      db.query("UPDATE peers SET reclaim_token = '' WHERE reclaim_token IS NULL").run();
     }
     // Self-heal: any row with NULL session_token (e.g. from a crashed partial
     // migration before this transactional logic existed) gets a freshly
@@ -190,16 +256,23 @@ function migrate_peers_add_session_token(db: Database): void {
     if (nulls.length > 0) {
       const update = db.query("UPDATE peers SET session_token = ? WHERE id = ?");
       for (const row of nulls) update.run(randomUUID(), row.id);
-      console.error(`[broker] migration: self-healed ${nulls.length} NULL session_token(s)`);
+      brokerLog.info("migration_tokens_repaired", { count: nulls.length });
     }
-    // Normalize schema (code review round-5 fix): ALTER TABLE ADD COLUMN
+    const nullReclaim = db.query<{ id: string }, []>(
+      "SELECT id FROM peers WHERE reclaim_token IS NULL"
+    ).all();
+    if (nullReclaim.length > 0) {
+      const update = db.query("UPDATE peers SET reclaim_token = ? WHERE id = ?");
+      for (const row of nullReclaim) update.run(randomUUID(), row.id);
+    }
+    // Normalize schema (schema invariant): ALTER TABLE ADD COLUMN
     // leaves session_token nullable on upgraded DBs even though fresh installs
     // declare it NOT NULL. A future writer that inserts a NULL (e.g. a bug, a
     // manual edit) would re-introduce the silent-orphan class. Rebuild the
     // table to enforce NOT NULL, matching the fresh-install invariant.
-    if (isSessionTokenNullable(db)) {
+    if (isColumnNullable(db, "session_token") || isColumnNullable(db, "reclaim_token")) {
       rebuildPeersTableWithNotNullSessionToken(db);
-      console.error(`[broker] migration: rebuilt peers table with NOT NULL session_token`);
+      brokerLog.info("migration_schema_rebuilt");
     }
     db.exec("COMMIT");
   } catch (e) {
@@ -208,12 +281,12 @@ function migrate_peers_add_session_token(db: Database): void {
   }
 }
 
-function isSessionTokenNullable(db: Database): boolean {
+function isColumnNullable(db: Database, column: string): boolean {
   // pragma_table_info.notnull is 0 when the column is nullable, 1 when NOT NULL.
   // Alias to a non-reserved name for portability.
-  const row = db.query<{ not_null_flag: number }, []>(
-    `SELECT "notnull" AS not_null_flag FROM pragma_table_info('peers') WHERE name = 'session_token'`
-  ).get();
+  const row = db.query<{ not_null_flag: number }, [string]>(
+    `SELECT "notnull" AS not_null_flag FROM pragma_table_info('peers') WHERE name = ?`
+  ).get(column);
   return row ? row.not_null_flag === 0 : false;
 }
 
@@ -234,15 +307,16 @@ function rebuildPeersTableWithNotNullSessionToken(db: Database): void {
       tty           TEXT,
       summary       TEXT DEFAULT '',
       session_token TEXT NOT NULL,
+      reclaim_token TEXT NOT NULL,
       registered_at TEXT NOT NULL,
       last_seen     TEXT NOT NULL
     );
   `);
   db.exec(`
-    INSERT INTO peers_new (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
-    SELECT id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen
+    INSERT INTO peers_new (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, reclaim_token, registered_at, last_seen)
+    SELECT id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, reclaim_token, registered_at, last_seen
     FROM peers
-    WHERE session_token IS NOT NULL;
+    WHERE session_token IS NOT NULL AND reclaim_token IS NOT NULL;
   `);
   db.exec(`DROP TABLE peers;`);
   db.exec(`ALTER TABLE peers_new RENAME TO peers;`);
@@ -269,66 +343,83 @@ function* nameCandidates(requested: string | undefined): Generator<string> {
 }
 
 export function registerPeer(db: Database, req: RegisterRequest): RegisterResponse {
-  const ts = nowIso();
-  // Every register (fresh or reclaim) issues a new session_token. Reclaim
-  // rotates the token so the previous session's client (if it's still alive
-  // elsewhere) can no longer act as this peer — the token is the session
-  // boundary.
-  const session_token = randomUUID();
+  req = parseRegisterRequest(req);
+  const tx = db.transaction((): RegisterResponse => {
+    const ts = nowIso();
+    const session_token = randomUUID();
+    const activeCutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+    const activeCount = db.query<{ count: number }, [string, string]>(
+      "SELECT COUNT(*) AS count FROM peers WHERE last_seen >= ? AND last_seen <= ?"
+    ).get(activeCutoff, new Date(Date.now() + MAX_CLOCK_SKEW_MS).toISOString())?.count ?? 0;
 
-  // Reclaim fast-path: stale peer with matching name → UPDATE in place, preserve UUID.
-  if (req.name && isValidName(req.name)) {
-    const cutoff = new Date(Date.now() - STALE_RECLAIM_THRESHOLD_MS).toISOString();
-    const reclaim = db.query(
-      `UPDATE peers
-         SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
-             session_token = ?, last_seen = ?
-       WHERE name = ? AND last_seen < ?`
-    ).run(
-      req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
-      session_token, ts, req.name, cutoff,
-    );
-    if ((reclaim.changes ?? 0) > 0) {
-      const row = db.query<{ id: string }, [string]>("SELECT id FROM peers WHERE name = ?").get(req.name);
-      if (row) {
-        // Clear any stale leases on undelivered messages for this peer. The
-        // previous session died mid-delivery — its lease_tokens are now
-        // worthless (the old session_token is gone), so the broker would
-        // otherwise hold those messages for up to LEASE_DURATION_MS before
-        // re-offering them. Clearing on reclaim makes the new session's
-        // first poll return the backlog immediately. Orphan observability
-        // is unaffected (acked=0 rows still show up in cli.ts orphaned-messages
-        // if the reclaimed peer dies again before reading).
+    if (req.name) {
+      const existing = db.query<{ id: string; pid: number | null; last_seen: string; reclaim_token: string }, [string]>(
+        "SELECT id, pid, last_seen, reclaim_token FROM peers WHERE name = ?"
+      ).get(req.name);
+      const processDead = existing?.pid != null && !isProcessAlive(existing.pid);
+      const hasReclaimCredential = existing !== null && existing !== undefined
+        && (existing.reclaim_token === ""
+          || (typeof req.reclaim_token === "string" && safeSecretEqual(req.reclaim_token, existing.reclaim_token)));
+      if (existing && hasReclaimCredential && (isStale(existing.last_seen) || processDead)) {
+        const replacingVisiblePeer = !isStale(existing.last_seen);
+        if (!replacingVisiblePeer && activeCount >= MAX_ACTIVE_PEERS) {
+          throw new BrokerLimitError("active peer capacity reached");
+        }
+        const reclaim_token = existing.reclaim_token || randomUUID();
+        db.query(
+          `UPDATE peers
+             SET peer_type = ?, pid = ?, cwd = ?, git_root = ?, tty = ?, summary = ?,
+                 session_token = ?, reclaim_token = ?, last_seen = ?
+           WHERE id = ?`
+        ).run(req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
+          session_token, reclaim_token, ts, existing.id);
         db.query(
           `UPDATE messages SET lease_token = NULL, lease_expires_at = NULL
            WHERE to_id = ? AND acked = 0`
-        ).run(row.id);
-        return { id: row.id, name: req.name, session_token };
+        ).run(existing.id);
+        return { id: existing.id, name: req.name, session_token, reclaim_token };
       }
     }
-  }
 
-  // Fresh INSERT with suffix ladder.
-  const id = randomUUID();
-  const insert = db.query(
-    `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, registered_at, last_seen)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-  for (const candidate of nameCandidates(req.name)) {
-    try {
-      insert.run(
-        id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty, req.summary,
-        session_token, ts, ts,
-      );
-      return { id, name: candidate, session_token };
-    } catch (e) {
-      if (!isUniqueViolation(e)) throw e;
+    const retained = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM peers").get()?.count ?? 0;
+    if (retained >= MAX_RETAINED_PEERS) throw new BrokerLimitError("peer capacity reached");
+    if (activeCount >= MAX_ACTIVE_PEERS) throw new BrokerLimitError("active peer capacity reached");
+    const registrationCutoff = new Date(Date.now() - 60_000).toISOString();
+    db.query("DELETE FROM registration_events WHERE registered_at < ?").run(registrationCutoff);
+    const recent = db.query<{ count: number }, [string]>(
+      "SELECT COUNT(*) AS count FROM registration_events WHERE registered_at >= ?"
+    ).get(registrationCutoff)?.count ?? 0;
+    if (recent >= MAX_PEER_REGISTRATIONS_PER_MINUTE) {
+      throw new BrokerLimitError("peer registration rate limit exceeded");
     }
-  }
-  throw new Error("broker: unable to allocate unique peer name after exhaustive retry");
+
+    const id = randomUUID();
+    const reclaim_token = randomUUID();
+    const insert = db.query(
+      `INSERT INTO peers (id, name, peer_type, pid, cwd, git_root, tty, summary, session_token, reclaim_token, registered_at, last_seen)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    for (const candidate of nameCandidates(req.name)) {
+      try {
+        insert.run(id, candidate, req.peer_type, req.pid, req.cwd, req.git_root, req.tty,
+          req.summary, session_token, reclaim_token, ts, ts);
+        db.query("INSERT INTO registration_events (registered_at) VALUES (?)").run(ts);
+        return { id, name: candidate, session_token, reclaim_token };
+      } catch (e) {
+        if (!isUniqueViolation(e)) throw e;
+      }
+    }
+    throw new Error("broker: unable to allocate unique peer name after exhaustive retry");
+  });
+  return tx();
 }
 
-// NOTE: authPeer() was removed after Codex round-C audit. Every mutating
+function isProcessAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+// NOTE: authPeer() was removed after the authorization review. Every mutating
 // operation now binds `session_token` directly in its SQL WHERE clause so
 // auth and mutation are one atomic statement — eliminating the TOCTOU
 // window that allowed a stale session to mutate a reclaim-rotated peer.
@@ -340,20 +431,24 @@ export function registerPeer(db: Database, req: RegisterRequest): RegisterRespon
 // the check and the mutation, letting an old session mutate the reclaimed
 // peer's row. Binding the token in WHERE closes that race.
 
-export function heartbeatPeer(db: Database, id: string, session_token: string): void {
-  db.query("UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?")
+export function heartbeatPeer(db: Database, id: string, session_token: string): boolean {
+  const info = db.query("UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?")
     .run(nowIso(), id, session_token);
+  return (info.changes ?? 0) > 0;
 }
 
-export function unregisterPeer(db: Database, id: string, session_token: string): void {
+export function unregisterPeer(db: Database, id: string, session_token: string): boolean {
   // Messages stay as orphans (spec §5.1).
-  db.query("DELETE FROM peers WHERE id = ? AND session_token = ?")
+  const info = db.query("DELETE FROM peers WHERE id = ? AND session_token = ?")
     .run(id, session_token);
+  return (info.changes ?? 0) > 0;
 }
 
-export function setPeerSummary(db: Database, id: string, session_token: string, summary: string): void {
-  db.query("UPDATE peers SET summary = ?, last_seen = ? WHERE id = ? AND session_token = ?")
+export function setPeerSummary(db: Database, id: string, session_token: string, summary: string): boolean {
+  try { summary = assertSummary(summary); } catch { return false; }
+  const info = db.query("UPDATE peers SET summary = ?, last_seen = ? WHERE id = ? AND session_token = ?")
     .run(summary, nowIso(), id, session_token);
+  return (info.changes ?? 0) > 0;
 }
 
 // Both getters deliberately use explicit column projection (NOT `SELECT *`)
@@ -390,6 +485,8 @@ export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
   const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
   clauses.push("last_seen >= ?");
   params.push(cutoff);
+  clauses.push("last_seen <= ?");
+  params.push(new Date(Date.now() + MAX_CLOCK_SKEW_MS).toISOString());
 
   if (req.scope === "directory") {
     clauses.push("cwd = ?");
@@ -418,9 +515,14 @@ export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
   // could impersonate them). Whitelist the safe columns here and keep
   // `session_token` out of every client-facing payload.
   const where = `WHERE ${clauses.join(" AND ")}`;
-  const sql = `SELECT id, name, peer_type, pid, cwd, git_root, tty, summary,
-                      registered_at, last_seen
-               FROM peers ${where} ORDER BY last_seen DESC`;
+  // Machine-wide discovery reveals identity and self-authored summary, not
+  // process IDs, TTYs, repository roots, or absolute local paths. Directory
+  // and repo callers already supplied the matching location, so returning cwd
+  // there does not broaden disclosure.
+  const cwdProjection = req.scope === "machine" ? "'' AS cwd" : "cwd";
+  const sql = `SELECT id, name, peer_type, ${cwdProjection}, summary, last_seen
+               FROM peers ${where} ORDER BY last_seen DESC
+               LIMIT ${MAX_PEERS_RETURNED}`;
   return db.query<Peer, typeof params>(sql).all(...params);
 }
 
@@ -428,7 +530,8 @@ export function listPeers(db: Database, req: ListPeersRequest): Peer[] {
 
 function isStale(last_seen_iso: string): boolean {
   const t = Date.parse(last_seen_iso);
-  return !Number.isFinite(t) || (Date.now() - t) > STALE_THRESHOLD_MS;
+  const age = Date.now() - t;
+  return !Number.isFinite(t) || age > STALE_THRESHOLD_MS || age < -MAX_CLOCK_SKEW_MS;
 }
 
 function resolveTarget(db: Database, to_id_or_name: string): Peer | null {
@@ -438,17 +541,23 @@ function resolveTarget(db: Database, to_id_or_name: string): Peer | null {
 }
 
 export function sendMessage(db: Database, req: SendMessageRequest): SendMessageResponse {
+  try {
+    req = parseSendMessageRequest(req);
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "invalid message" };
+  }
   // Atomic sender auth + target resolution + liveness check + insert, all in
   // a single transaction so nothing can unregister or re-register between
-  // steps and orphan a "successful" message (Codex round-D TOCTOU fix).
+  // steps and orphan a "successful" message (the atomic delivery invariant).
   const nowStr = nowIso();
   const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+  const futureCutoff = new Date(Date.now() + MAX_CLOCK_SKEW_MS).toISOString();
 
   const tx = db.transaction((): SendMessageResponse => {
     // 1. Sender auth (atomic: id + session_token + live)
-    const sender = db.query<{ name: string }, [string, string, string]>(
-      "SELECT name FROM peers WHERE id = ? AND session_token = ? AND last_seen >= ?"
-    ).get(req.from_id, req.session_token, staleCutoff);
+    const sender = db.query<{ name: string }, [string, string, string, string]>(
+      "SELECT name FROM peers WHERE id = ? AND session_token = ? AND last_seen >= ? AND last_seen <= ?"
+    ).get(req.from_id, req.session_token, staleCutoff, futureCutoff);
     if (!sender) {
       // Distinguish unauthorized vs stale for a better error message.
       const row = db.query<{ last_seen: string; name: string }, [string, string]>(
@@ -458,6 +567,27 @@ export function sendMessage(db: Database, req: SendMessageRequest): SendMessageR
       return { ok: false, error: `sender stale: ${row.name}` };
     }
 
+    const rateCutoff = new Date(Date.now() - 60_000).toISOString();
+    purgeExpiredMessages(db);
+    const retainedMessages = db.query<{ count: number }, []>(
+      "SELECT COUNT(*) AS count FROM messages"
+    ).get()?.count ?? 0;
+    if (retainedMessages >= MAX_RETAINED_MESSAGES) {
+      return { ok: false, error: "global message capacity reached" };
+    }
+    const globalRecentSends = db.query<{ count: number }, [string]>(
+      "SELECT COUNT(*) AS count FROM messages WHERE sent_at >= ?"
+    ).get(rateCutoff)?.count ?? 0;
+    if (globalRecentSends >= MAX_MESSAGES_GLOBAL_PER_MINUTE) {
+      return { ok: false, error: "global rate limit exceeded" };
+    }
+    const recentSends = db.query<{ count: number }, [string, string]>(
+      "SELECT COUNT(*) AS count FROM messages WHERE from_id = ? AND sent_at >= ?"
+    ).get(req.from_id, rateCutoff)?.count ?? 0;
+    if (recentSends >= MAX_MESSAGES_PER_SENDER_PER_MINUTE) {
+      return { ok: false, error: "sender rate limit exceeded" };
+    }
+
     // 2. Target resolution + liveness + insert in ONE statement. The insert
     //    only succeeds if the target resolves to a LIVE peer row. If the
     //    target is unregistered or goes stale between the sender check and
@@ -465,22 +595,31 @@ export function sendMessage(db: Database, req: SendMessageRequest): SendMessageR
     //    orphan.
     const inserted = db.query<
       { id: number; to_id: string },
-      [string, string, string, string, string, string]
+      [string, string, string, string, string, string, string]
     >(
       `INSERT INTO messages (from_id, to_id, text, sent_at)
        SELECT ?, p.id, ?, ?
        FROM peers p
        WHERE (p.id = ? OR p.name = ?)
          AND p.last_seen >= ?
+         AND p.last_seen <= ?
+         AND (SELECT COUNT(*) FROM messages queued WHERE queued.to_id = p.id AND queued.acked = 0) < ${MAX_PENDING_MESSAGES_PER_PEER}
        RETURNING id, to_id`
-    ).get(req.from_id, req.text, nowStr, req.to_id_or_name, req.to_id_or_name, staleCutoff);
+    ).get(req.from_id, req.text, nowStr, req.to_id_or_name, req.to_id_or_name, staleCutoff, futureCutoff);
 
     if (!inserted) {
       // Either no peer matches the id-or-name, or the matched peer is stale.
       // Distinguish for a better error.
       const target = resolveTarget(db, req.to_id_or_name);
       if (!target) return { ok: false, error: `unknown peer: ${req.to_id_or_name}` };
-      return { ok: false, error: `target peer stale: ${target.name}` };
+      if (isStale(target.last_seen)) return { ok: false, error: `target peer stale: ${target.name}` };
+      const pending = db.query<{ count: number }, [string]>(
+        "SELECT COUNT(*) AS count FROM messages WHERE to_id = ? AND acked = 0"
+      ).get(target.id)?.count ?? 0;
+      if (pending >= MAX_PENDING_MESSAGES_PER_PEER) {
+        return { ok: false, error: `target mailbox full: ${target.name}` };
+      }
+      return { ok: false, error: `target unavailable: ${target.name}` };
     }
     return { ok: true, message_id: inserted.id };
   });
@@ -505,18 +644,22 @@ export function pollMessages(db: Database, id: string, session_token: string): L
       "UPDATE peers SET last_seen = ? WHERE id = ? AND session_token = ?"
     ).run(nowStr, id, session_token);
     if ((hbInfo.changes ?? 0) === 0) {
-      return [] as LeasedMessage[];
+      throw new SessionExpiredError();
     }
 
     const rows = db.query<
-      { id: number; from_id: string; to_id: string; text: string; sent_at: string },
+      { id: number; from_id: string; to_id: string; text: string; sent_at: string; from_name: string | null; from_peer_type: "claude" | "codex" | null; from_cwd: string | null; from_summary: string | null },
       [string, string]
     >(
-      `SELECT id, from_id, to_id, text, sent_at
-       FROM messages
-       WHERE to_id = ? AND acked = 0
-         AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at < ?)
-       ORDER BY id ASC`
+      `SELECT m.id, m.from_id, m.to_id, m.text, m.sent_at,
+              p.name AS from_name, p.peer_type AS from_peer_type,
+              p.cwd AS from_cwd, p.summary AS from_summary
+       FROM messages m
+       LEFT JOIN peers p ON p.id = m.from_id
+       WHERE m.to_id = ? AND m.acked = 0
+         AND (m.lease_token IS NULL OR m.lease_expires_at IS NULL OR m.lease_expires_at < ?)
+       ORDER BY m.id ASC
+       LIMIT ${MAX_POLL_MESSAGES}`
     ).all(id, nowStr);
 
     const result: LeasedMessage[] = [];
@@ -524,14 +667,13 @@ export function pollMessages(db: Database, id: string, session_token: string): L
       const lease = randomUUID();
       db.query("UPDATE messages SET lease_token = ?, lease_expires_at = ? WHERE id = ?")
         .run(lease, leaseUntil, row.id);
-      const sender = getPeer(db, row.from_id);
       result.push({
         id: row.id,
         from_id: row.from_id,
-        from_name: sender?.name ?? "(gone)",
-        from_peer_type: (sender?.peer_type ?? "claude") as "claude" | "codex",
-        from_cwd: sender?.cwd ?? "",
-        from_summary: sender?.summary ?? "",
+        from_name: row.from_name ?? "(gone)",
+        from_peer_type: row.from_peer_type ?? "claude",
+        from_cwd: row.from_cwd ?? "",
+        from_summary: row.from_summary ?? "",
         to_id: row.to_id,
         text: row.text,
         sent_at: row.sent_at,
@@ -547,19 +689,30 @@ export function pollMessages(db: Database, id: string, session_token: string): L
 // ----- Ack -----
 
 export function ackMessages(db: Database, req: AckMessagesRequest): AckMessagesResponse {
-  if (req.lease_tokens.length === 0) return { ok: true, acked: 0 };
-  // Atomic auth via subquery: the UPDATE only affects messages whose to_id
-  // belongs to a peer row with the matching session_token. No separate
-  // pre-check → no TOCTOU window across reclaim-rotation.
-  const placeholders = req.lease_tokens.map(() => "?").join(",");
-  const sql = `UPDATE messages SET acked = 1, lease_token = NULL, lease_expires_at = NULL
-               WHERE lease_token IN (${placeholders})
-                 AND to_id = (SELECT id FROM peers WHERE id = ? AND session_token = ?)
-                 AND acked = 0
-                 AND lease_expires_at IS NOT NULL
-                 AND lease_expires_at >= ?`;
-  const info = db.query(sql).run(...req.lease_tokens, req.id, req.session_token, nowIso());
-  return { ok: true, acked: info.changes ?? 0 };
+  if (req.lease_tokens.length > MAX_ACK_TOKENS) throw new ValidationError("too many lease tokens");
+  const tx = db.transaction((): AckMessagesResponse => {
+    const owner = db.query<{ id: string }, [string, string]>(
+      "SELECT id FROM peers WHERE id = ? AND session_token = ?"
+    ).get(req.id, req.session_token);
+    if (!owner) throw new SessionExpiredError();
+    if (req.lease_tokens.length === 0) return { ok: true, acked: 0, acked_tokens: [] };
+    const placeholders = req.lease_tokens.map(() => "?").join(",");
+    const ackedTokens = db.query<{ lease_token: string }, string[]>(
+      `SELECT lease_token FROM messages
+       WHERE lease_token IN (${placeholders})
+         AND to_id = ? AND acked = 0
+         AND lease_expires_at IS NOT NULL AND lease_expires_at >= ?`
+    ).all(...req.lease_tokens, req.id, nowIso()).map((row) => row.lease_token);
+    if (ackedTokens.length === 0) return { ok: true, acked: 0, acked_tokens: [] };
+    const validPlaceholders = ackedTokens.map(() => "?").join(",");
+    const sql = `UPDATE messages SET acked = 1, lease_token = NULL, lease_expires_at = NULL
+                 WHERE lease_token IN (${validPlaceholders})
+                   AND to_id = ?
+                   AND acked = 0`;
+    const info = db.query(sql).run(...ackedTokens, req.id);
+    return { ok: true, acked: info.changes ?? 0, acked_tokens: ackedTokens };
+  });
+  return tx();
 }
 
 // ----- Rename -----
@@ -593,9 +746,24 @@ export function renamePeer(db: Database, req: RenamePeerRequest): RenamePeerResp
 // ----- GC -----
 
 export function gcStalePeers(db: Database): number {
-  const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+  // Discovery hides peers after STALE_THRESHOLD_MS, but their identity row is
+  // retained longer so a stable-name restart can reclaim the UUID and mailbox.
+  const cutoff = new Date(Date.now() - PEER_RETENTION_MS).toISOString();
   const info = db.query("DELETE FROM peers WHERE last_seen < ?").run(cutoff);
+  purgeExpiredMessages(db);
   return info.changes ?? 0;
+}
+
+export function purgeExpiredMessages(db: Database): { acked: number; orphaned: number } {
+  const ackedCutoff = new Date(Date.now() - ACKED_RETENTION_MS).toISOString();
+  const acked = db.query("DELETE FROM messages WHERE acked = 1 AND sent_at < ?").run(ackedCutoff);
+  const orphanCutoff = new Date(Date.now() - ORPHAN_RETENTION_MS).toISOString();
+  const orphaned = db.query(
+    `DELETE FROM messages
+     WHERE acked = 0 AND sent_at < ?
+       AND NOT EXISTS (SELECT 1 FROM peers WHERE peers.id = messages.to_id)`
+  ).run(orphanCutoff);
+  return { acked: acked.changes ?? 0, orphaned: orphaned.changes ?? 0 };
 }
 
 // ----- Orphans -----
@@ -673,10 +841,55 @@ export function listAllMessages(
   return { messages: rows, truncated: rows.length < total, total_rows: total };
 }
 
+export function getBrokerDiagnostics(db: Database): BrokerDiagnostics {
+  const now = nowIso();
+  const count = (where: string, params: string[] = []) =>
+    db.query<{ count: number }, string[]>(`SELECT COUNT(*) AS count FROM messages ${where}`).get(...params)?.count ?? 0;
+  return {
+    peers: db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM peers").get()?.count ?? 0,
+    pending_messages: count("WHERE acked = 0"),
+    leased_messages: count("WHERE acked = 0 AND lease_token IS NOT NULL AND lease_expires_at >= ?", [now]),
+    acknowledged_messages: count("WHERE acked = 1"),
+    orphaned_messages: db.query<{ count: number }, []>(
+      `SELECT COUNT(*) AS count FROM messages m
+       WHERE m.acked = 0 AND NOT EXISTS (SELECT 1 FROM peers p WHERE p.id = m.to_id)`
+    ).get()?.count ?? 0,
+  };
+}
+
 // ----- HTTP -----
 
 async function readJson<T>(req: Request): Promise<T> {
-  return (await req.json()) as T;
+  const declared = Number(req.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declared) && declared > MAX_HTTP_BODY_BYTES) {
+    throw new HttpError(413, "request body too large");
+  }
+  if (!req.body) throw new HttpError(400, "request body required");
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_HTTP_BODY_BYTES) {
+      await reader.cancel();
+      throw new HttpError(413, "request body too large");
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  try {
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as T;
+  } catch {
+    throw new HttpError(400, "invalid JSON body");
+  }
+}
+
+class HttpError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
 }
 
 function json(body: unknown, init?: ResponseInit): Response {
@@ -694,7 +907,7 @@ function json(body: unknown, init?: ResponseInit): Response {
 // messages" gap that mere localhost binding does not solve on shared or
 // multi-user hosts.
 export function ensureSharedSecret(path: string): string {
-  // Crash-safe atomic provisioning (Codex round-E fix for "ensureSharedSecret
+  // Crash-safe atomic provisioning (Security invariant fix for "ensureSharedSecret
   // bricks startup after a crash between create and write"):
   //
   //   1. If path already exists, validate its perms (same checks as client),
@@ -736,11 +949,8 @@ export function ensureSharedSecret(path: string): string {
 
   // Try atomic link: succeeds only if `path` doesn't exist yet. This gives
   // us exclusive-create semantics without the torn-write window of O_EXCL.
-  // On filesystems without hard-link support (FAT/exFAT/some network fs)
-  // linkSync fails with ENOTSUP/EPERM — fall back to openSync('wx') on the
-  // target path (Codex round-F fix). That's still race-safe because O_EXCL
-  // is atomic; the only property we lose is crash-resilience against torn
-  // writes. Rare + non-fatal.
+  // Filesystems without atomic hard-link publication are rejected rather
+  // than using a check-then-rename fallback with a credential-clobber race.
   let linked = false;
   try {
     linkSync(tmp, path);
@@ -749,34 +959,6 @@ export function ensureSharedSecret(path: string): string {
     const msg = e instanceof Error ? e.message : String(e);
     if (/EEXIST/.test(msg)) {
       // Someone else linked first. Fall through to read their content.
-    } else if (/ENOTSUP|EPERM|EOPNOTSUPP/i.test(msg)) {
-      // Hard links not supported on this filesystem — fall back to an
-      // atomic rename publish. The tmp file already has fully-written,
-      // fsync'd content. renameSync atomically replaces the target (or
-      // creates it if absent); the target is never visible in a partial
-      // state, so a crash in the middle of this fallback cannot leave a
-      // short/empty file at `path` (Codex round-G fix).
-      //
-      // Check existsSync(path) first to avoid clobbering a concurrent
-      // broker's already-published secret. Race remains possible (exists
-      // → rename is not atomic), but that race is exceedingly narrow on
-      // the already-rare class of filesystems this fallback targets.
-      if (!existsSync(path)) {
-        try {
-          renameSync(tmp, path);
-          linked = true;
-        } catch (e2: unknown) {
-          const msg2 = e2 instanceof Error ? e2.message : String(e2);
-          // If rename failed because path appeared in the race window,
-          // treat as EEXIST and fall through to read.
-          if (!/EEXIST|ENOTEMPTY/.test(msg2)) {
-            try { unlinkSync(tmp); } catch { /* best effort */ }
-            throw e2;
-          }
-        }
-      }
-      // else: someone else already published. Fall through to read their
-      // content and unlink our tmp below.
     } else {
       try { unlinkSync(tmp); } catch { /* best effort */ }
       throw e;
@@ -805,20 +987,20 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
   const sharedSecret = ensureSharedSecret(secretPath);
 
   const gcTimer = setInterval(() => {
-    try { gcStalePeers(db); } catch (e) { console.error("[broker] GC error:", e); }
+    try { gcStalePeers(db); } catch { brokerLog.error("gc_failed"); }
     // Re-enforce 0600 on WAL/SHM sidecars — SQLite may recreate them on
     // checkpoint, and they'd come back with default umask-controlled perms.
     // We also set umask(0o077) at startup so freshly created sidecars start
     // at 0600, but the chmod sweep is a belt-and-suspenders backstop.
     chmodIfExists(dbPath + "-wal", 0o600);
     chmodIfExists(dbPath + "-shm", 0o600);
-    // Fail-closed verification on every tick (Codex round-I): if any sidecar
+    // Fail-closed verification on every tick (Security invariant): if any sidecar
     // has drifted off 0600 or off the correct owner, crash the broker with
     // a clear error rather than keep serving with readable session tokens.
     try {
       enforceDbFilePerms(dbPath, [dbPath, dbPath + "-wal", dbPath + "-shm"]);
     } catch (e) {
-      console.error("[broker] FATAL: DB file permissions drifted during runtime:", e);
+      brokerLog.error("db_permission_drift");
       process.exit(1);
     }
   }, GC_INTERVAL_MS);
@@ -826,30 +1008,44 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
   const server = Bun.serve({
     port,
     hostname: "127.0.0.1",
+    idleTimeout: 10,
+    maxRequestBodySize: MAX_HTTP_BODY_BYTES,
     async fetch(req) {
       const url = new URL(req.url);
+      const requestId = randomUUID();
       try {
         if (req.method === "GET" && url.pathname === "/health") {
-          return json({ ok: true, pid: process.pid });
+          const nonce = url.searchParams.get("nonce") ?? "";
+          try {
+            return json({
+              ok: true,
+              pid: process.pid,
+              nonce,
+              proof: createHealthProof(sharedSecret, nonce, process.pid),
+            });
+          } catch {
+            return json({ error: "invalid health challenge" }, { status: 400 });
+          }
         }
         if (req.method !== "POST") return json({ error: "method not allowed" }, { status: 405 });
 
         // Shared-secret gate for every non-/health request.
         const presented = req.headers.get(SECRET_HEADER);
-        if (presented !== sharedSecret) {
+        if (!safeSecretEqual(presented, sharedSecret)) {
           return json({ error: "missing or invalid " + SECRET_HEADER }, { status: 401 });
         }
 
         switch (url.pathname) {
-          case "/register":      return json(registerPeer(db, await readJson(req)));
-          case "/heartbeat":     { const b = await readJson<{ id: string; session_token: string }>(req); heartbeatPeer(db, b.id, b.session_token); return json({ ok: true }); }
-          case "/unregister":    { const b = await readJson<{ id: string; session_token: string }>(req); unregisterPeer(db, b.id, b.session_token); return json({ ok: true }); }
-          case "/set-summary":   { const b = await readJson<{ id: string; session_token: string; summary: string }>(req); setPeerSummary(db, b.id, b.session_token, b.summary); return json({ ok: true }); }
-          case "/list-peers":    return json(listPeers(db, await readJson(req)));
-          case "/send-message":  return json(sendMessage(db, await readJson(req)));
-          case "/poll-messages": { const b = await readJson<{ id: string; session_token: string }>(req); return json({ messages: pollMessages(db, b.id, b.session_token) }); }
-          case "/ack-messages":  return json(ackMessages(db, await readJson(req)));
-          case "/rename-peer":   return json(renamePeer(db, await readJson(req)));
+          case "/register":      return json(registerPeer(db, parseRegisterRequest(await readJson(req))));
+          case "/heartbeat":     { const b = parseHeartbeatRequest(await readJson(req)); return heartbeatPeer(db, b.id, b.session_token) ? json({ ok: true }) : json({ error: "session expired" }, { status: 401 }); }
+          case "/unregister":    { const b = parseUnregisterRequest(await readJson(req)); return unregisterPeer(db, b.id, b.session_token) ? json({ ok: true }) : json({ error: "session expired" }, { status: 401 }); }
+          case "/set-summary":   { const b = parseSetSummaryRequest(await readJson(req)); return setPeerSummary(db, b.id, b.session_token, b.summary) ? json({ ok: true }) : json({ error: "session expired" }, { status: 401 }); }
+          case "/list-peers":    return json(listPeers(db, parseListPeersRequest(await readJson(req))));
+          case "/send-message":  return json(sendMessage(db, parseSendMessageRequest(await readJson(req))));
+          case "/poll-messages": { const b = parsePollMessagesRequest(await readJson(req)); return json({ messages: pollMessages(db, b.id, b.session_token) }); }
+          case "/ack-messages":  return json(ackMessages(db, parseAckMessagesRequest(await readJson(req))));
+          case "/rename-peer":   return json(renamePeer(db, parseRenamePeerRequest(await readJson(req))));
+          case "/diagnostics":   return json(getBrokerDiagnostics(db));
           // No /admin/rename-peer over HTTP — arbitrary local processes could
           // hijack any peer's name. cli.ts 'rename' reads the target peer's
           // session_token from SQLite directly (file perms = trust boundary)
@@ -860,8 +1056,24 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
           default: return json({ error: "not found" }, { status: 404 });
         }
       } catch (e) {
-        console.error("[broker] request error:", e);
-        return json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
+        if (e instanceof HttpError) {
+          brokerLog.warn("request_rejected", { request_id: requestId, status: e.status, route: url.pathname });
+          return json({ error: e.message }, { status: e.status });
+        }
+        if (e instanceof ValidationError) {
+          brokerLog.warn("request_invalid", { request_id: requestId, status: 400, route: url.pathname });
+          return json({ error: e.message }, { status: 400 });
+        }
+        if (e instanceof SessionExpiredError) {
+          brokerLog.warn("session_expired", { request_id: requestId, status: 401, route: url.pathname });
+          return json({ error: "session expired" }, { status: 401 });
+        }
+        if (e instanceof BrokerLimitError) {
+          brokerLog.warn("broker_limit", { request_id: requestId, status: 429, route: url.pathname });
+          return json({ error: e.message }, { status: 429 });
+        }
+        brokerLog.error("request_failed", { request_id: requestId, status: 500, route: url.pathname });
+        return json({ error: "internal broker error" }, { status: 500 });
       }
     },
   });
@@ -875,7 +1087,7 @@ export function startBroker(port: number, dbPath: string, secretPath = DEFAULT_S
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
 
-  console.error(`[broker] listening on http://127.0.0.1:${port}, db=${dbPath}, pid=${process.pid}`);
+  brokerLog.info("listening", { port, pid: process.pid });
   return { server, db, gcTimer };
 }
 

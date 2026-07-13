@@ -6,11 +6,31 @@
 
 ---
 
+## 2026-07-13 DELIVERY AMENDMENT (PR #12)
+
+This amendment supersedes every confirm-on-next-call, `seen`, `pendingAcks`, and
+presentation-implies-delivery statement below. Returning an MCP response—or
+observing a later tool request—is not evidence that the model processed the
+inbox.
+
+Both adapters now persist leased messages in an owner-only durable inbox keyed
+by immutable peer ID. They may present an unacknowledged message repeatedly.
+Only the model's explicit `ack_messages(message_ids=[...])` invocation removes
+matching local entries and acknowledges their current broker lease tokens.
+Unknown IDs are reported without affecting other entries. If broker
+acknowledgement fails or a lease has expired, the broker may later re-deliver a
+safe duplicate; the implementation never converts that failure into silent
+loss. Claude's channel remains a best-effort live presentation surface, while
+Codex remains pull-only because current Codex clients do not surface MCP log
+notifications to the model.
+
+---
+
 ## 2026-04-15 AMENDMENTS (PR #2 — "fix message delivery")
 
 The body of this spec remains the original Phase 1 design. Four deltas landed via PR #2 after adversarial review from `chatgpt-codex-connector[bot]` and a competing `feat/codex-conversation-flow` branch. Treat the bullets below as overriding any earlier text they contradict.
 
-### A. Codex delivery: two-layer pipeline with confirm-on-next-call dedupe
+### A. Codex delivery: durable pipeline (confirmation rules superseded by the 2026-07-13 amendment)
 
 The original §5.5 piggyback design gated delivery on an in-memory `seen` set populated at the moment a message was drawn into a tool response. Adversarial review showed this could silently lose messages when the MCP stdio response was dropped or aborted before reaching Codex's model. The amended design:
 
@@ -28,13 +48,9 @@ The original §5.5 piggyback design gated delivery on an in-memory `seen` set po
 
 3. **Layer 3 — Authoritative `[PEER INBOX]` block** on every agent-peers tool response.
    - Single source of truth: full body, sender metadata, sender summary, reply_action hint.
-   - Drawn from the durable queue via `getUnreadMessages()` (NOT `consumeUnreadMessages()`) — items stay on disk until the NEXT call confirms delivery.
+   - Drawn from the durable queue via `getUnreadMessages()` (NOT `consumeUnreadMessages()`) — items stay on disk until an explicit `ack_messages` call confirms their IDs.
 
-4. **Confirm-on-next-call state machine** splits the single `seen` set from the original design into two sets:
-   - `presentedPendingConfirm: Set<number>` — messages drawn into the CURRENT response's `[PEER INBOX]`. Populated just before return.
-   - `seen: Set<number>` — messages known to have reached the model. Only populated at the START of the NEXT tool call (Codex calling us again is the evidence the previous response cycle landed), and only after (a) broker ack succeeded and (b) durable-queue prune succeeded. Partial failures leave items in `presentedPendingConfirm` for retry.
-   - `pollBrokerIntoQueue` has a three-branch triage: `seen.has` → close stuck lease; `presentedPendingConfirm.has` → stash new lease token but do NOT re-queue; else → write to durable queue.
-   - Unconditional `pendingAcks` flush at call entry (NOT gated on `presentedPendingConfirm` being non-empty) so seen-branch re-lease tokens can never accumulate into perpetually-unacked zombie rows at the broker.
+4. **Explicit acknowledgement** keeps every durable entry eligible for presentation until the model calls `ack_messages` with that message ID. A re-leased copy refreshes the stored lease token without duplicating the durable entry.
 
 ### B. Broker: clear stale leases on reclaim
 
@@ -61,7 +77,7 @@ Test suite grew from 59 → 84. New coverage:
 
 ### E. Superseded text in this document
 
-- §5.4 "in-memory seen-set" — Codex path now uses two sets (`presentedPendingConfirm` + `seen`). Claude path is unchanged.
+- §5.4 "in-memory seen-set" — superseded by durable inboxes and explicit acknowledgement for both adapters.
 - §5.5 "piggyback" — replaced by the three-layer pipeline above.
 - §7.1 "RESPOND IMMEDIATELY" Claude prompt — replaced by `COLLEAGUE_PROTOCOL`.
 - §7.2 Codex prompt — replaced by `COLLEAGUE_PROTOCOL` + delivery note.
@@ -204,7 +220,7 @@ HTTP daemon on `127.0.0.1:7900`. Uses `Bun.serve()` and `bun:sqlite`.
 *Leased delivery (Phase 1 primitive):*
 - On `/poll-messages`, broker selects all messages for the peer where `acked=0 AND (lease_token IS NULL OR lease_expires_at IS NULL OR lease_expires_at < now())`. In the same SQL transaction, each selected row gets a fresh `lease_token = crypto.randomUUID()` and `lease_expires_at = now() + 30s`. Response includes each message's `lease_token`.
 - On `/ack-messages`, broker marks rows with matching `lease_tokens` as `acked=1` **only if** `lease_expires_at >= now()` at the time of ack (stale acks explicitly ignored — addresses Codex review-2 finding). If the ack arrives late, the `UPDATE` matches zero rows and the broker's response reports `acked: 0`; the message will be re-leased on the next poll and re-delivered.
-- If the client never acks at all (crash, MCP transport failure), the lease expires and the same message is returned on the next poll. The client is responsible for deduplication via the immutable `message_id` (see §5.4 and §5.5 "seen-set" patterns).
+- If the client never explicitly acknowledges an ID (crash or MCP transport failure), the lease expires and the same message is returned on a later poll. Durable inbox upsert uses immutable `message_id` as its key (see §5.4 and §5.5).
 
 *Atomic name allocation with stale-peer reclaim (addresses Codex reviews round-2 and round-5):*
 - `/register` flow (atomic):
@@ -297,241 +313,50 @@ Same rule applies everywhere we derive a filesystem path from `import.meta.url` 
 
 ### 5.4 `claude-server.ts`
 
-Behavior identical to existing `claude-peers-mcp/server.ts`, with these differences:
-- Uses `shared/broker-client.ts` instead of inline fetch
-- Connects to broker on port 7900
-- Registers with `peer_type: "claude"`
-- MCP server `name` is `"agent-peers"` (so it's distinct in client's MCP list)
-- `instructions` field uses the new naming (see exact text below)
+The Claude adapter registers with `peer_type: "claude"`, polls once per second,
+and persists every leased message in an owner-only durable inbox keyed by the
+immutable peer ID. For a newly persisted ID it also emits a best-effort
+`notifications/claude/channel` event. Channel delivery is a presentation hint,
+not acknowledgement evidence.
 
-Tools: `list_peers`, `send_message`, `set_summary`, `check_messages`, `rename_peer`.
-Polling: every 1s, push via `notifications/claude/channel`. **Deterministic dedupe via in-memory seen-set**: the server keeps a `Set<number>` of `message_id`s it has already pushed successfully in this session. On each poll tick:
-1. For each leased message `m`, check `seen.has(m.id)`.
-   - If yes → this is a re-delivery due to a lost ack. Skip `mcp.notification()`, but still include `m.lease_token` in the ack batch so the broker's stuck lease can finally close.
-   - If no → call `mcp.notification()`. On success, `seen.add(m.id)` THEN queue `m.lease_token` for the ack batch. On failure, leave `seen` alone and skip the ack so the lease expires cleanly and gets retried.
-2. After the per-message loop, issue a single `/ack-messages` call for all collected tokens. Ack failure is fine — next poll will re-attempt.
+`check_messages` reads (without consuming) a bounded set from the durable inbox.
+After processing messages, Claude calls `ack_messages(message_ids=[...])`.
+Matching entries are removed locally and their current lease tokens are
+acknowledged at the broker. Re-leases refresh the token for an existing ID and
+do not generate duplicate live pushes while that ID remains queued.
 
-**Dedupe scope: within-session only (Phase 1 contract).** The seen-set is in-memory and resets on process restart. Combined with the round-5 reclaim-by-name mechanism that preserves the UUID across restarts, this means **delivery is at-least-once, not exactly-once, across restart boundaries**: if an old session polled message 42 and died before its ack round-tripped, the new session with the reclaimed UUID starts with an empty seen-set, re-leases message 42 from the broker, and re-pushes/re-injects it. Users see the same peer message twice.
+The adapter retains its peer row on shutdown so a named restart can reclaim the
+same UUID and the same durable inbox. Rename operations are serialized and the
+identity file update uses credential-and-expected-name compare-and-swap; a
+failed persistence update triggers a broker rename rollback.
 
-This is an intentional Phase 1 trade-off: duplicate-free delivery across restart would require either persistent client-side dedupe state (keyed by `(peer_id, message_id)`) or broker-side per-recipient "already-delivered" tracking. Both are deferred to Phase 2. Callers are expected to treat peer messages as idempotent — replying twice to the same message is a minor UX annoyance, not a correctness bug.
-
-Heartbeat: every 15s.
-
-**Claude `instructions` field (exact text):**
-```
-You are connected to the agent-peers network. Other AI agents on this 
-machine (Claude Code or Codex CLI sessions) can see you and send you 
-messages.
-
-IMPORTANT: When you receive a <channel source="agent-peers" ...> message, 
-RESPOND IMMEDIATELY. Do not wait until your current task is finished. 
-Pause what you are doing, reply to the message using send_message, then 
-resume your work. Treat incoming peer messages like a coworker tapping 
-you on the shoulder — answer right away, even if you are in the middle 
-of something.
-
-Read the from_id, from_peer_type, from_summary, and from_cwd attributes 
-to understand who sent the message. Reply by calling send_message with 
-their from_id.
-
-On startup, proactively call set_summary to describe what you are 
-working on. This helps other peers understand your context.
-
-Available tools:
-- list_peers (scope: machine|directory|repo, optional peer_type filter)
-- send_message (to_id, message)
-- set_summary (summary)
-- check_messages (manual inbox check; not normally needed because 
-  messages are pushed via channel)
-```
-
-The channel notification payload `meta` field includes **both** `from_peer_type` (claude/codex) AND `from_name` (human label) alongside the existing `from_id`, `from_summary`, `from_cwd`, `sent_at`. The receiving Claude can therefore see e.g. "message from frontend-tab (claude)" without any extra lookup.
+Tools: `list_peers`, `send_message`, `set_summary`, `check_messages`,
+`ack_messages`, `rename_peer`.
 
 ### 5.5 `codex-server.ts`
 
-Same MCP server skeleton, **without** `claude/channel` capability. Differences from claude-server.ts:
-- Capabilities: `{ tools: {} }` only
-- **Piggyback delivery on every tool handler** with **ack-on-next-call** (revised per Codex review-2 to avoid "ack before transport confirmation" silent-loss).
-- Registers with `peer_type: "codex"`
-- Heartbeat still runs every 15s (independent of messaging)
-- `instructions` field is informational only — design does not depend on Codex honoring it (see §6)
+The Codex adapter registers with `peer_type: "codex"` and has no model-visible
+mid-turn MCP push. Its one-second background poll persists leased messages in an
+owner-only durable inbox keyed by immutable peer ID. It may emit a bodyless
+`notifications/message` preview, but current Codex clients do not surface that
+notification to the model; it is dormant future-compatible plumbing.
 
-**Ack-on-next-call pattern (revised after Codex review round-3):**
+Every agent-peers tool call performs an immediate poll, reads a bounded set of
+unacknowledged entries, and prepends them as the authoritative `[PEER INBOX]`
+block. Entries are read rather than consumed, so a lost tool response does not
+lose the message. The model must call `ack_messages(message_ids=[...])` after it
+has processed those IDs. The acknowledgement response suppresses inbox
+piggybacking so just-acknowledged content is not echoed again.
 
-The codex-server holds a module-level `pendingAcks: string[]` (lease tokens from the previous tool call) and a `seen: Set<number>` of message IDs it has already polled in this session.
+The explicit acknowledgement invocation is the delivery evidence. Local removal
+happens before the broker request; if the broker request fails or a lease has
+expired, the unacknowledged broker row becomes pollable again and produces a
+safe duplicate. Unknown IDs are reported and do not affect other entries.
+Shutdown clears timers but neither acknowledges entries nor unregisters the
+peer, preserving restart recovery.
 
-Every tool handler does, in order:
-1. **Flush the previous call's pending acks** — if `pendingAcks.length > 0`, call `/ack-messages`. A subsequent request arriving IS a strong heuristic that the previous response cycle completed (Codex's MCP client is alive and issuing new requests). It is **not a cryptographic proof** — a prior response could in theory be lost after handler return while the same Codex process keeps issuing requests, and in that narrow case an ack would fire without the message ever reaching the model. See "Residual limitations" below.
-2. **Poll for new messages**. For each polled message: if `seen.has(m.id)` this is a re-delivery due to a lost ack; queue its lease_token for next-call ack, do not re-inject. Else `seen.add(m.id)`, queue its lease_token in `pendingAcks`, and include it in this call's inbox block.
-3. **Run the tool's own logic**.
-4. **Return response with inbox block prepended**.
-
-**On clean shutdown (SIGINT/SIGTERM), `pendingAcks` is NOT flushed AND the peer is NOT unregistered.** Those pending ack tokens belong to the most recent response whose delivery we cannot confirm — flushing them on exit would re-introduce silent loss. And unregistering would remove the peer row immediately, defeating the round-5 reclaim-by-name mechanism that lets a restart with the same `PEER_NAME` preserve the UUID (§5.1). Instead the cleanup path only clears timers and exits. The broker's timer-driven GC reaps the peer row 60-90s after heartbeat stops; if a restart happens within that window, `/register` reclaims the row via atomic UPDATE and inherits the UUID, making undelivered messages route correctly. Leases expire 30s later and are re-leased on the restored session's first poll (with at-least-once semantics across the restart — see dedupe scope note).
-
-**On transport failure (stdout write error, Codex MCP client disconnect)**: if Codex's MCP client abandons the connection, the session is effectively dead — no more tool calls means no more flushes, leases expire, next session re-delivers. If Codex's MCP client stays alive and merely drops one malformed response, the narrow silent-loss window below applies.
-
-**Residual limitations (Phase 1 accepts these, Phase 2 may address):**
-- `seen.add` happens at poll time, not at proven-delivery time. A message injected into a response that fails to reach the model is marked as seen in the server's memory and as acked in the broker as soon as a subsequent tool call fires. Recovery requires the Codex session to die (fresh process, fresh seen-set) or the user to re-send.
-- The only way to close this fully is an explicit client receipt — a tool call from Codex echoing the `message_id` after the model has acted on it. That would reintroduce prompt-obedience dependence. Phase 2 will explore this as an opt-in stricter mode.
-- The operator-visible safety net is `cli.ts orphaned-messages`, which shows all undelivered messages when their recipient disappears.
-
-The Phase 1 contract is therefore: **best-effort delivery with observability for the observable failure modes (recipient-death-after-accept, broker crash).** Silent loss is possible only in the narrow window where the Codex MCP client remains live and responsive but loses a specific response mid-transport. This is a substantially narrower failure surface than any of the prior designs.
-
-Tools: `list_peers`, `send_message`, `set_summary`, `check_messages`, `rename_peer` (same names as claude-server for consistency — peers don't need to know what type they're talking to).
-
-`check_messages` becomes effectively equivalent to "no-op tool that causes a poll" — it exists so a user can explicitly ask "check now" without needing another tool call. Since every tool call already polls, invoking `list_peers` would show pending messages too. That is intentional redundancy: whatever tool Codex calls, inbox is delivered.
-
-**Piggyback block format (exact template — self-contained, no dependence on separate instructions):**
-
-When the inbox is empty, the response is whatever the tool normally returns, unchanged.
-
-When there are N pending messages, the response text is prefixed with:
-
-```
-[PEER INBOX] 2 new peer message(s) — respond to each via send_message(to_id=<from_name>, message="...")
-
---- msg 1 of 2 ---
-message_id: 42
-from: frontend-tab (claude, cwd=/Users/.../openhedge-web)
-sent_at: 2026-04-13T22:14:07Z
-text:
-<message body here, preserved verbatim>
-
---- msg 2 of 2 ---
-message_id: 43
-from: backend-codex (codex, cwd=/Users/.../openhedge-api)
-sent_at: 2026-04-13T22:14:11Z
-text:
-<message body here>
-
---- end peer inbox ---
-```
-
-The `message_id` is the broker's monotonic autoincrement row id — stable and globally unique within this broker's DB. Codex can use it to detect duplicates on re-delivery (if ack was lost and the message gets re-leased on the next poll).
-
-The reply hint (`respond via send_message(...)`) is inlined in every block so Codex learns the protocol from the tool output itself, not from the `instructions` field or any external file. This removes the load-bearing prompt-obedience assumption Codex's adversarial review flagged.
-
-**`list_peers` tool schema adds optional `peer_type` filter** to match the broker's capability:
-```json
-{
-  "scope": { "enum": ["machine", "directory", "repo"] },
-  "peer_type": { "enum": ["claude", "codex"], "optional": true }
-}
-```
-When omitted, returns peers of all types. `list_peers` output shows `peer_type` for each peer on its own line.
-
-### 5.6 `cli.ts`
-
-Reused from existing pattern, repointed at port 7900. Subcommands:
-- `bun cli.ts status` — broker health + peer list with peer_type and name columns
-- `bun cli.ts peers` — peer list only (shows `name` prominently, id as secondary)
-- `bun cli.ts send <name-or-id> <message>` — inject a message into a session (accepts name OR UUID)
-- `bun cli.ts rename <name-or-id> <new-name>` — admin rename a peer
-- `bun cli.ts orphaned-messages` — list messages whose `to_id` no longer matches any active peer (from recipient-death-after-accept). Shows `id, from_id, to_id, sent_at, text preview`. Phase 2 may add an option to re-route or purge.
-- `bun cli.ts kill-broker` — stop daemon
-
-### 5.7 Identity & naming (rationale, schema, tools, flows)
-
-**Problem.** When a user has N Claude/Codex sessions open, they cannot tell them apart — `cwd`/`git_root` collide when multiple tabs share a repo, UUIDs are unreadable, model-written `summary` is descriptive not canonical. We need a stable human-friendly handle that is also first-class in the messaging API.
-
-**Design.** Two columns side by side:
-- `id` (UUID) — **immutable, broker-canonical identity**. Never changes. Used internally for routing.
-- `name` — **mutable human-readable label**. Every peer has one at all times. Unique across active peers. Used in all user-facing surfaces (`list_peers` output, `send_message` target, CLI).
-
-This separation is the classic primary-key vs display-label pattern. Renaming a peer never breaks routing because message rows reference `id`, not `name`.
-
-**Name provisioning (in priority order, top wins):**
-1. **Explicit user override at launch:** `PEER_NAME=frontend-tab agentpeers` — server reads `process.env.PEER_NAME` and passes it to `/register`. If taken, broker appends `-2`, `-3`, ...
-2. **Auto-generated friendly name:** if `PEER_NAME` is unset, broker picks a random `<adjective>-<noun>` from a wordlist (≥ 50 adj × 50 noun = 2500 combos; collision re-draws up to 10 times then appends numeric suffix). Examples: `calm-fox`, `swift-panda`, `loud-otter`.
-
-Wordlist lives at `shared/names.ts`. Keep it tight and PG — avoid anything embarrassing to paste into logs.
-
-**Terminal tab title (zero-effort glance identification):**
-After successful register, the MCP server writes the OSC-0 escape sequence to `/dev/tty`:
-```
-\x1b]0;peer:<name>\x07
-```
-The terminal emulator (iTerm2, Terminal.app, Ghostty, kitty, alacritty, wezterm) renders this as the tab title, so the user sees e.g. `peer:calm-fox` on the tab header. No action required.
-
-Implementation detail: open `/dev/tty` for write via `Bun.file("/dev/tty").writer()` or `fs.openSync("/dev/tty", "w")`. Wrap the entire write in a try/catch — any error (no controlling TTY, permission denied, closed pty, unknown OS) must be swallowed and logged to stderr. Terminal title is a cosmetic affordance; failing it must never crash the MCP server. Gate the feature behind env var `AGENT_PEERS_DISABLE_TAB_TITLE=1` as an escape hatch in case a terminal emulator mishandles the escape.
-
-On rename, re-emit the escape sequence so the tab title updates live.
-
-**Lookup in `send_message`:**
-The broker's `/send-message` endpoint accepts `to_id` as either a UUID or a name. Resolution order:
-1. If `to_id` matches a `peers.id`, use it directly.
-2. Else try `SELECT id FROM peers WHERE name = ?`. If found, use that id.
-3. Else return `{ ok: false, error: "unknown peer: <input>" }`.
-
-This means `send_message(to="frontend-tab", text=...)` just works. UUID still works too (defensively).
-
-**`rename_peer` tool schema — self-rename only in Phase 1 (per Codex adversarial review):**
-```json
-{
-  "name": "rename_peer",
-  "description": "Rename YOURSELF (the calling peer). Takes a single argument new_name. Admin rename of other peers is intentionally not exposed as an MCP tool to prevent one peer from impersonating another; if you need to rename another peer, use `bun cli.ts rename <name-or-id> <new_name>` from a terminal (operator action).",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "new_name": { "type": "string" }
-    },
-    "required": ["new_name"]
-  }
-}
-```
-
-Broker endpoint `/rename-peer` handles this:
-- Validates `new_name` (non-empty, **≤ 32 chars**, matches `^[a-zA-Z0-9_-]+$` — URL-safe chars only for shell-friendliness). The 32-char cap deliberately excludes UUID format (36 chars) so `send_message` cannot route ambiguously between a name and an id.
-- Rejects duplicates with `{ ok: false, error: "name taken" }`
-- On success, returns new name and updates `last_seen` in the same transaction (prevents GC racing a live session that just renamed)
-
-After rename, the renaming peer re-emits the terminal tab title escape to reflect the new name.
-
-**CLI admin rename stays available locally only:**
-`bun cli.ts rename <name-or-id> <new_name>` talks to the same `/rename-peer` endpoint but identifies the target directly by name or id (not by caller session). This is an operator-initiated action on the local machine — it carries no cross-peer trust boundary because it's a human at the keyboard on the same host, not a remote peer.
-
-**Ping/identify tool — deferred to Phase 2.** For the rare case where user cannot tell sessions apart even with tab titles (e.g. minimized windows), Phase 2 will add an `identify_peer(target_id)` tool that sends the target a short "IDENTIFY: you are peer <name>" message and a terminal bell. Phase 1 does not include this — auto-names + tab titles solve the common case.
-
-**`list_peers` output format (updated):**
-```
-Found 3 peer(s) (scope: machine):
-
-Peer frontend-tab (claude)
-  ID: 7b1a...f44c
-  CWD: /Users/.../openhedge-web
-  TTY: /dev/ttys002
-  Summary: Wiring the landing page hero
-  Last seen: 3s ago
-
-Peer calm-fox (claude)
-  ID: 9c2d...8e1a
-  CWD: /Users/.../openhedge-web
-  TTY: /dev/ttys005
-  Summary: Running vitest in watch mode
-  Last seen: 1s ago
-
-Peer backend-codex (codex)
-  ID: 2a4b...112e
-  CWD: /Users/.../openhedge-api
-  TTY: /dev/ttys007
-  Summary: Refactoring the order book matcher
-  Last seen: 12s ago
-```
-
-Name prints first on each entry so the user scans it at a glance.
-
-**Channel push metadata carries name too:** when claude-server pushes a channel notification, meta includes `from_name` alongside `from_id`, so the receiving Claude sees "message from frontend-tab" without a separate lookup.
-
-**API deltas summary:**
-| Endpoint | Change |
-|---|---|
-| `/register` | Accepts optional `name` field (from `PEER_NAME` env); broker generates one if missing. Response returns `{ id, name }`. |
-| `/list-peers` | Response peer objects include `name`. |
-| `/send-message` | `to_id` field accepts name OR UUID. |
-| `/rename-peer` *(new)* | `{ id, new_name }` → `{ ok, error?, name? }` |
-| `/poll-messages` | Message objects include `from_name` for convenience. |
-
----
+Tools: `list_peers`, `send_message`, `set_summary`, `check_messages`,
+`ack_messages`, `rename_peer`.
 
 ## 6. Codex `instructions` field — informational only after piggyback
 
@@ -591,43 +416,29 @@ TOOLS:
 All four flows use the same lease + ack primitive. Differences are only in *how* the recipient-side server delivers the message to its agent (channel push for Claude, piggyback for Codex).
 
 ### 7.1 Claude → Claude
-1. Claude A calls `send_message(to="frontend-tab", text="…")`
-2. claude-server A → `/send-message` (after broker liveness-checks target; rejects if stale)
-3. claude-server B's 1s polling loop → `/poll-messages` → broker leases the row (lease_token set, 30s expiry)
-4. claude-server B → `mcp.notification("notifications/claude/channel", ...)` — Claude B sees it mid-task
-5. On notification resolve, claude-server B → `/ack-messages` → broker marks acked
-
-If step 4 throws or step 5 fails, the lease expires → next poll re-delivers. Claude dedupes by `message_id` in `meta`.
+1. Claude A calls `send_message` and the broker stores the row.
+2. Claude B polls, leases, and durably persists it before presentation.
+3. For a newly queued ID, Claude B receives a best-effort channel presentation.
+4. The message remains available through `check_messages` until Claude B calls
+   `ack_messages` with its ID.
 
 ### 7.2 Claude → Codex
-1. Claude A calls `send_message(to="backend-codex", text="…")`
-2. claude-server A → `/send-message` (same liveness check)
-3. codex-server X's 1s background loop calls `/poll-messages` and writes unread messages into the local Codex inbox queue.
-   - If `seen.has(m.id)`, queue the fresh lease token in `pendingAcks` and do NOT re-queue the message.
-   - Otherwise, upsert the unread message in the local queue so the newest lease token survives while Codex stays busy.
-4. Next time Codex calls **any** tool on this MCP (`list_peers`, `send_message`, `set_summary`, `check_messages`, `rename_peer`):
-   - **Flush previous call's acks first** — if `pendingAcks` is non-empty, call `/ack-messages` now.
-   - Do one best-effort immediate poll into the local queue for freshness.
-   - Drain unread messages from the local queue, prepend them to the tool response as `[PEER INBOX]`, and push their lease tokens into `pendingAcks`.
-   - Run the tool's own logic.
-   - Return response with the inbox block prepended.
-   - **Do NOT ack inside this handler.** The tokens in `pendingAcks` will be flushed by the NEXT tool call.
-5. Codex sees the `[PEER INBOX]` block in the tool output and replies only when it has a substantive update or a clarifying question.
-
-Latency: broker pickup is bounded by the 1s background poll. Visible delivery is bounded by the next agent-peers response. If Codex is idle, messages wait in the local queue instead of only at the broker. If Codex crashes before visible delivery, unread queue state and lease expiry allow re-delivery without silent loss.
+1. Claude sends; the broker stores the row.
+2. Codex's background poll leases and durably persists it.
+3. Codex sees the authoritative `[PEER INBOX]` block on its next agent-peers tool
+   response. There is no native model-visible MCP wake notification.
+4. After processing it, Codex calls `ack_messages`; until then every eligible
+   agent-peers response may re-present it.
 
 ### 7.3 Codex → Claude
-1. Codex calls `send_message(to="frontend-tab", text="…")`
-   - codex-server's send_message handler first polls and pipes any pending inbox for Codex itself into the response (piggyback applies to all tools uniformly)
-   - then posts `/send-message` to broker, which liveness-checks Claude A
-2. claude-server A's 1s polling loop picks up the message → channel push → ack (as §7.1)
-
-Instant from Claude's perspective. `send_message` response that Codex sees confirms the send plus surfaces any incoming inbox that happened to be pending.
+The sender path is identical. Claude durably persists the leased row, may see a
+live channel presentation, and explicitly acknowledges it after processing.
 
 ### 7.4 Codex → Codex
-Same as 7.2 but recipient is also Codex (background-polled into its local queue, then surfaced on the next agent-peers response).
-
----
+The receiver's background poll persists the row. The next agent-peers tool
+response presents it, and explicit acknowledgement completes delivery. If the
+receiver is idle, the message waits durably; the separate app-server wake design
+is outside this Phase 1 delivery contract.
 
 ## 8. Install (README contents, no script)
 
@@ -683,9 +494,9 @@ codex   # Codex auto-loads MCP from config.toml
 |---|---|
 | Broker not running on first server start | `ensureBroker()` spawns it; throws after 6s if cannot start |
 | Broker dies during session | All broker calls fail → MCP tool returns error message → user/agent sees the failure → restart session to recover (Phase 2 will add reconnect). Messages already leased but not acked survive broker restart (they're in SQLite, lease expires in 30s, next poll re-delivers). |
-| Client polled a message but crashed before ack | Lease expires after 30s → message re-polled on next request → retry transparent to sender. Dedupe is **session-local only**: within the same process, the in-memory seen-set prevents duplicate injection. Across a process restart (including reclaim-by-name where the UUID is preserved), the seen-set resets and the same message may be delivered again — at-least-once semantics, see §5.4. Acceptable Phase 1 behavior. |
-| `mcp.notification()` throws on Claude push | Server does NOT add to seen-set and does NOT ack. Lease expires → next poll re-pushes. Claude dedupes. |
-| Codex tool response fails to reach Codex (transport error) | `pendingAcks` never flushed → leases expire → next poll re-leases and re-injects (seen-set caught up when previous inject succeeded, but since the transport failed the whole session may be gone too). |
+| Client persisted a message but crashed before explicit ack | Durable inbox survives restart under the reclaimed peer ID; the broker lease expires and re-poll refreshes the stored token. Delivery remains at-least-once. |
+| `mcp.notification()` throws on Claude push | Durable inbox remains authoritative; `check_messages` can still present the message and no implicit ack occurs. |
+| Codex tool response fails to reach Codex | No explicit ack occurs; the durable entry remains and is re-presented on a later agent-peers response or after restart. |
 | Stale `/ack-messages` arrives after lease expiry | Broker's `lease_expires_at >= now()` predicate rejects it (`acked: 0` returned) → message stays pollable → next poll re-delivers. |
 | Two peers concurrently register with identical `PEER_NAME` | Broker's atomic INSERT + UNIQUE-violation retry ladder assigns `name`, `name-2`, `name-3`, ... deterministically. No 500-class errors. |
 | Two peers concurrently rename to the same `new_name` | Broker's atomic UPDATE + UNIQUE-violation catch returns `{ ok: false, error: "name taken" }` to the loser. Winner keeps new name. |

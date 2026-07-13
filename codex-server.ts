@@ -20,8 +20,8 @@
 //   ------------------------------------------------------------------
 //   withPiggyback is the ONLY path that surfaces message CONTENT + reply
 //   cues to the model. It reads (not consumes) from the durable queue,
-//   filters out messages already confirmed delivered, and prepends what's
-//   left as a [PEER INBOX] block in the tool response.
+//   prepends unacknowledged messages as a [PEER INBOX] block in the tool
+//   response. Only an explicit ack_messages call removes durable entries.
 //
 //   Signal-only preview push (notifications/message)
 //   ------------------------------------------------------------------
@@ -31,32 +31,18 @@
 //   reply_action. This gives recent Codex CLI versions a "new message
 //   from X arrived, look at your inbox" signal in the live transcript
 //   without duplicating the authoritative delivery. It does NOT update
-//   any dedupe state — the [PEER INBOX] block (Layer 2) is the one and
-//   only "this was shown to the model" trigger.
+//   any delivery state — only an explicit ack_messages call confirms IDs.
 //
-// DEDUPE STATE MACHINE (two sets, confirm-on-next-call):
+// DELIVERY CONFIRMATION:
 //
-//   - `presentedPendingConfirm` — message_ids included in the CURRENT
-//     tool response's [PEER INBOX] block but not yet known-delivered.
-//     Populated inside withPiggyback just before return.
+//   Returning a tool response, or merely receiving the next tool call, is not
+//   proof that the model processed the inbox. Messages therefore stay in the
+//   durable queue and are re-presented until the model explicitly invokes
+//   ack_messages with their IDs. This gives at-least-once delivery across
+//   dropped responses, process restarts, and expired broker leases.
 //
-//   - `seen` — message_ids we're SURE reached the model. Populated at
-//     the START of the NEXT tool call (Codex calling us again is the
-//     evidence that the previous response cycle landed). Once a message
-//     is `seen`, we ack its lease, prune it from the durable queue, and
-//     ignore any future re-delivery of the same id.
-//
-// This splits what was previously a single `seen` set that conflated
-// "about to be shown" with "known shown." The earlier code could ack +
-// prune a message whose response was aborted before reaching Codex —
-// silent loss. The split closes that race: a dropped response leaves the
-// message in the durable queue AND outside the `seen` set, so on the
-// next tool call (or the next session after a restart) it re-surfaces.
-// At-least-once per spec §5.4.
-//
-// Shutdown: clear timers and exit. Deliberately do NOT flush pendingAcks
-// (those messages may not have reached Codex yet — flushing on exit would
-// be silent loss). Deliberately do NOT unregister (preserves
+// Shutdown: clear timers and exit. Deliberately do NOT acknowledge durable
+// inbox entries and do NOT unregister (preserves
 // reclaim-by-name). Durable queue stays on disk so a restart within the
 // 60s reclaim window picks up exactly where this session left off.
 
@@ -67,10 +53,10 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { createClient } from "./shared/broker-client.ts";
+import { createClient, isSessionExpiredError } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
-import { waitForSharedSecret } from "./shared/shared-secret.ts";
-import { getGitRoot, getTty } from "./shared/peer-context.ts";
+import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts";
+import { canonicalizePath, getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
 import { formatInboxBlock, formatInboxPreview } from "./shared/piggyback.ts";
@@ -78,27 +64,51 @@ import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
+import { sanitizeTerminalText as safe } from "./shared/safe-output.ts";
+import { selectMessagesForPresentation } from "./shared/delivery-state.ts";
+import { MAX_ACK_TOKENS, MAX_PRESENTATION_BYTES, MAX_PRESENTED_MESSAGES } from "./shared/limits.ts";
+import { createLogger } from "./shared/logger.ts";
+import { parsePort } from "./shared/config.ts";
+import { loadPeerIdentity, savePeerIdentity } from "./shared/peer-identity.ts";
+import { AsyncMutex } from "./shared/async-mutex.ts";
+import { acknowledgeDurableMessages, parseExplicitAckIds } from "./shared/explicit-ack.ts";
+import {
+  parseListPeersToolArgs,
+  parseRenameToolArgs,
+  parseSendMessageToolArgs,
+  parseSetSummaryToolArgs,
+} from "./shared/validation.ts";
 
-const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
+const BROKER_PORT = parsePort(process.env.AGENT_PEERS_PORT, 7900);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
+const logger = createLogger("codex-mcp");
+const renameMutex = new AsyncMutex();
 
 function log(msg: string) {
-  console.error(`[agent-peers/codex] ${msg}`);
+  logger.info("status", { detail: msg });
+}
+
+function exitIfSessionExpired(error: unknown): void {
+  if (isSessionExpiredError(error)) {
+    logger.error("session_expired");
+    process.exit(1);
+  }
 }
 
 let client: ReturnType<typeof createClient>;
 async function isBrokerAlive(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-    return res.ok;
-  } catch { return false; }
+  const secret = readSharedSecret();
+  return secret ? createClient(BROKER_URL, secret).isAlive() : false;
 }
 
 let myId: PeerId | null = null;
 let myName: string | null = null;
 let mySession: string | null = null;
+let myReclaimToken: string | null = null;
+let stableIdentityKey: string | undefined;
+let ownsStableIdentity = false;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 let inboxStore: CodexInboxStore | null = null;
@@ -154,7 +164,12 @@ DELIVERY CHANNELS:
   2. A best-effort MCP \`notifications/message\` log push also fires
      on each background poll tick, but current Codex CLI does not
      expose these to the model. Treat the [PEER INBOX] block as your
-     only input. Path (2) is future-compatible plumbing.`,
+     only input. Path (2) is future-compatible plumbing.
+
+After actually processing displayed messages, call
+\`ack_messages(message_ids=[...])\` with their exact IDs. This explicit
+call is the only durable delivery confirmation; until then, messages
+remain eligible for re-presentation.`,
   },
 );
 
@@ -199,6 +214,17 @@ const TOOLS = [
     inputSchema: { type: "object" as const, properties: {} },
   },
   {
+    name: "ack_messages",
+    description: "Explicitly acknowledge peer messages only after processing them.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        message_ids: { type: "array" as const, items: { type: "integer" as const, minimum: 1 }, minItems: 1, maxItems: MAX_ACK_TOKENS },
+      },
+      required: ["message_ids"],
+    },
+  },
+  {
     name: "rename_peer",
     description: "Rename YOURSELF. 1-32 chars, [a-zA-Z0-9_-].",
     inputSchema: {
@@ -210,26 +236,6 @@ const TOOLS = [
 ];
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
-
-const MAX_PENDING_ACKS = 500;
-const pendingAcks: string[] = [];
-
-// Dedupe state (see top-of-file state-machine comment):
-//   - `presentedPendingConfirm`: messages in the CURRENT response's
-//     [PEER INBOX] block. Promoted to `seen` at the START of the NEXT call.
-//   - `seen`: messages we are SURE reached the model. Only these get their
-//     lease acked + are pruned from the durable queue.
-const presentedPendingConfirm = new Set<number>();
-const seen = new Set<number>();
-
-function enqueueAck(token: string) {
-  pendingAcks.push(token);
-  if (pendingAcks.length > MAX_PENDING_ACKS) {
-    const drop = pendingAcks.length - MAX_PENDING_ACKS;
-    pendingAcks.splice(0, drop);
-    log(`pendingAcks trimmed: dropped ${drop} oldest token(s); exceeding cap ${MAX_PENDING_ACKS}`);
-  }
-}
 
 async function pollBrokerIntoQueue(): Promise<void> {
   if (!myId || !mySession || !inboxStore) return;
@@ -243,53 +249,30 @@ async function pollBrokerIntoQueue(): Promise<void> {
     try {
       leased = await client.pollMessages({ id: myId!, session_token: mySession! });
     } catch (e) {
+      exitIfSessionExpired(e);
       log(`poll failed: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
 
     if (leased.length === 0) return;
 
-    // Triage leased messages by dedupe state.
-    const freshlyUnread: LeasedMessage[] = [];
-    for (const message of leased) {
-      if (seen.has(message.id)) {
-        // We're certain the model saw this one already (previous tool
-        // call's piggyback, confirmed by the call after). The lease just
-        // got re-offered because our earlier ack was lost or the lease
-        // expired before ack. Close it now — this is safe because the
-        // model-delivery evidence is already in hand.
-        enqueueAck(message.lease_token);
-      } else if (presentedPendingConfirm.has(message.id)) {
-        // We drew this into the CURRENT response's [PEER INBOX] block but
-        // haven't yet seen the next tool call that would confirm
-        // delivery. DO NOT ack (would silently drop if the response was
-        // lost). DO NOT re-queue in the durable inbox (would make the
-        // piggyback double-surface it within the same call). Just stash
-        // the new lease token so next-call confirm-flush closes both old
-        // + new leases atomically.
-        enqueueAck(message.lease_token);
-      } else {
-        freshlyUnread.push(message);
-      }
-    }
-
-    if (freshlyUnread.length === 0) return;
+    const existingIds = new Set((await inboxStore.getUnreadMessages()).map((message) => message.id));
+    const freshlyUnread = leased.filter((message) => !existingIds.has(message.id));
 
     // Authoritative persistence FIRST — if this fails, we do not push and
     // do not ack; next poll tick retries because the lease will expire at
     // the broker and the message will be re-leased.
     try {
-      await inboxStore.queueLeasedMessages(freshlyUnread);
+      await inboxStore.queueLeasedMessages(leased);
       log(`queued ${freshlyUnread.length} unread peer message(s): ${freshlyUnread.map((msg) => `#${msg.id} from ${msg.from_name}`).join(", ")}`);
     } catch (e) {
       log(`failed to persist unread peer messages: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
 
-    // Best-effort signal-only preview push. Recent Codex CLI versions
-    // surface MCP log notifications into the live transcript — this
-    // fires a "heads up, message waiting" nudge so the model can decide
-    // whether to interrupt current work or finish first. It carries NO
+    // Best-effort signal-only preview push. Current Codex clients do not
+    // surface MCP log notifications to the model, so this is dormant,
+    // future-compatible plumbing. It carries NO
     // body and NO reply cues; full content + reply_action live in the
     // authoritative [PEER INBOX] block in the next tool response. This
     // split avoids the double-reply risk where the model would see the
@@ -335,134 +318,47 @@ async function pollBrokerIntoQueue(): Promise<void> {
 
 async function withPiggyback(
   handler: () => Promise<{ text: string; isError?: boolean }>,
+  opts: { suppressInbox?: boolean } = {},
 ): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
   if (!myId || !mySession) {
-    return {
-      content: [{ type: "text", text: "Not registered with broker yet" }],
-      isError: true,
-    };
+    return { content: [{ type: "text", text: "Not registered with broker yet" }], isError: true };
   }
 
-  // ------------------------------------------------------------------------
-  // STEP 1a — Unconditional ack flush.
-  //
-  // We always attempt to ack every token in pendingAcks, even when
-  // presentedPendingConfirm is empty. pollBrokerIntoQueue's seen-branch
-  // stashes re-lease tokens for messages we already confirmed delivered
-  // — those must be flushed even in tool calls that don't draw any new
-  // inbox items, otherwise the broker re-leases the row forever and it
-  // never transitions to acked=1 (perpetually-unacked zombie row per
-  // codex review PR #2 round 2).
-  //
-  // Tokens are removed from pendingAcks only on HTTP success; an
-  // exception leaves them for the next call to retry. HTTP success with
-  // `acked: 0` at the broker (stale tokens) still counts — the next
-  // re-lease will land new tokens in pendingAcks via the seen-branch,
-  // and this flush will eventually succeed against the current lease.
-  if (pendingAcks.length > 0) {
-    const toFlush = pendingAcks.slice();
-    try {
-      await client.ackMessages({
-        id: myId, session_token: mySession, lease_tokens: toFlush,
-      });
-      for (const tok of toFlush) {
-        const idx = pendingAcks.indexOf(tok);
-        if (idx !== -1) pendingAcks.splice(idx, 1);
-      }
-    } catch (e) {
-      log(`ack flush failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-
-  // ------------------------------------------------------------------------
-  // STEP 1b — Confirm-promote: items drawn into the PREVIOUS response
-  // are now (with Codex calling us again as evidence) known to have
-  // reached the model. Prune them from the durable queue and move their
-  // ids into `seen`. Pruning can fail independently of the ack above
-  // (disk I/O vs broker HTTP); if it does we keep the items in
-  // presentedPendingConfirm and retry next call. Partial promotion is
-  // not allowed — would re-open the silent-loss window.
-  if (presentedPendingConfirm.size > 0) {
-    const confirming = [...presentedPendingConfirm];
-    try {
-      if (inboxStore) await inboxStore.removeByIds(confirming);
-      for (const id of confirming) {
-        seen.add(id);
-        presentedPendingConfirm.delete(id);
-      }
-    } catch (e) {
-      log(`confirm-flush queue-prune failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-
-  // ------------------------------------------------------------------------
-  // STEP 2 — Inline poll so we pick up anything that arrived in the last
-  // POLL_INTERVAL_MS window. Background loop does the same thing on a
-  // timer; calling it here collapses the worst-case "message landed 0.99s
-  // before this tool call" tail.
+  // Pull immediately so the response includes mail that arrived just before
+  // this tool call. Durable entries remain eligible on every response until
+  // the model explicitly acknowledges their message IDs.
   try {
     await pollBrokerIntoQueue();
-  } catch (e) {
-    log(`inline poll failed: ${e instanceof Error ? e.message : String(e)}`);
+  } catch (error) {
+    log(`inline poll failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  // ------------------------------------------------------------------------
-  // STEP 3 — Read (do NOT consume) the durable queue. Items stay on disk
-  // until the NEXT call's confirm-flush promotes them to `seen` and
-  // removes them. A dropped response thus leaves the message in place
-  // for re-delivery, fixing the silent-loss race the codex-reviewer bot
-  // flagged on PR #2 round 1.
   let queued: LeasedMessage[] = [];
   try {
     queued = inboxStore ? await inboxStore.getUnreadMessages() : [];
-  } catch (e) {
-    log(`failed to read unread peer messages: ${e instanceof Error ? e.message : String(e)}`);
+  } catch (error) {
+    log(`failed to read unread peer messages: ${error instanceof Error ? error.message : String(error)}`);
   }
+  const displayed = opts.suppressInbox ? [] : selectMessagesForPresentation(queued, {
+    maxMessages: MAX_PRESENTED_MESSAGES,
+    maxBytes: MAX_PRESENTATION_BYTES,
+  });
 
-  // Filter out anything already confirmed delivered (defensive — the
-  // durable queue shouldn't contain `seen` ids, but pollBrokerIntoQueue's
-  // seen-branch guarantees it) and anything we already drew into an
-  // earlier-but-unconfirmed response (presentedPendingConfirm). The
-  // latter can happen if the previous call's confirm-flush partially
-  // failed above; we want to keep showing the same items until flush
-  // succeeds, not start dealing duplicates.
-  const fresh: LeasedMessage[] = [];
-  for (const m of queued) {
-    if (seen.has(m.id)) continue;
-    if (presentedPendingConfirm.has(m.id)) {
-      // Already showed this in an earlier response whose confirm-flush
-      // hasn't completed yet. Skip re-drawing — the earlier presentation
-      // is still the one we're waiting to confirm.
-      continue;
-    }
-    fresh.push(m);
-  }
-
-  // Mark fresh items as "presented this call, awaiting confirm" and
-  // stash their lease tokens for the NEXT call's confirm-flush. This is
-  // the single write point where a message transitions from "sitting in
-  // queue" to "shown to the model."
-  for (const m of fresh) {
-    presentedPendingConfirm.add(m.id);
-    enqueueAck(m.lease_token);
-  }
-
-  // ------------------------------------------------------------------------
-  // STEP 4 — Run the tool handler + build the response.
   let toolText = "";
   let toolError: boolean | undefined;
   try {
-    const r = await handler();
-    toolText = r.text;
-    toolError = r.isError;
-  } catch (e) {
-    toolText = `Tool error: ${e instanceof Error ? e.message : String(e)}`;
+    const result = await handler();
+    toolText = result.text;
+    toolError = result.isError;
+  } catch (error) {
+    toolText = `Tool error: ${error instanceof Error ? error.message : String(error)}`;
     toolError = true;
   }
 
-  const inbox = formatInboxBlock(fresh);
-  const finalText = inbox + toolText;
-  return { content: [{ type: "text", text: finalText }], isError: toolError };
+  return {
+    content: [{ type: "text", text: formatInboxBlock(displayed) + toolText }],
+    isError: toolError,
+  };
 }
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -471,10 +367,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   return withPiggyback(async () => {
     switch (name) {
       case "list_peers": {
-        const { scope, peer_type } = args as {
-          scope: "machine" | "directory" | "repo";
-          peer_type?: "claude" | "codex";
-        };
+        const { scope, peer_type } = parseListPeersToolArgs(args);
         const peers = await client.listPeers({
           scope, cwd: myCwd, git_root: myGitRoot, exclude_id: myId!, peer_type,
         });
@@ -483,11 +376,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         const lines = peers.map((p) =>
           [
-            `Peer ${p.name} (${p.peer_type})`,
-            `  ID: ${p.id}`,
-            `  CWD: ${p.cwd}`,
-            p.tty ? `  TTY: ${p.tty}` : null,
-            p.summary ? `  Summary: ${p.summary}` : null,
+            `Peer ${safe(p.name, 32)} (${p.peer_type})`,
+            `  ID: ${safe(p.id, 128)}`,
+            `  CWD: ${safe(p.cwd)}`,
+            p.tty ? `  TTY: ${safe(p.tty, 256)}` : null,
+            p.summary ? `  Summary: ${safe(p.summary, 1024)}` : null,
             `  Last seen: ${p.last_seen}`,
           ].filter(Boolean).join("\n")
         );
@@ -495,7 +388,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "send_message": {
-        const { to_id, message } = args as { to_id: string; message: string };
+        const { to_id, message } = parseSendMessageToolArgs(args);
         const res = await client.sendMessage({
           from_id: myId!, session_token: mySession!, to_id_or_name: to_id, text: message,
         });
@@ -504,7 +397,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       case "set_summary": {
-        const { summary } = args as { summary: string };
+        const { summary } = parseSetSummaryToolArgs(args);
         await client.setSummary({ id: myId!, session_token: mySession!, summary });
         return { text: `Summary set: "${summary}"` };
       }
@@ -514,22 +407,65 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return { text: `Checked inbox.` };
       }
 
+      case "ack_messages": {
+        if (!inboxStore) return { text: "Durable inbox is unavailable.", isError: true };
+        const messageIds = parseExplicitAckIds(args);
+        const result = await acknowledgeDurableMessages({
+          store: inboxStore,
+          messageIds,
+          maxBatchSize: MAX_ACK_TOKENS,
+          ackBroker: async (leaseTokens) => {
+            const response = await client.ackMessages({ id: myId!, session_token: mySession!, lease_tokens: leaseTokens });
+            return response.acked_tokens;
+          },
+        });
+        const missing = result.missing_ids.length > 0
+          ? ` IDs not present in the durable inbox: ${result.missing_ids.join(", ")}.`
+          : "";
+        const warning = result.broker_error
+          ? " Broker acknowledgement failed; safe duplicate delivery may occur."
+          : result.broker_acked < result.acknowledged_ids.length
+            ? " Some broker leases had expired; safe duplicate delivery may occur."
+            : "";
+        return { text: `Acknowledged message IDs: ${result.acknowledged_ids.join(", ") || "none"}.${missing}${warning}` };
+      }
+
       case "rename_peer": {
-        const { new_name } = args as { new_name: string };
-        if (!isValidName(new_name)) {
-          return { text: `Invalid name: must be 1-32 chars, [a-zA-Z0-9_-] only.`, isError: true };
-        }
-        const res = await client.renamePeer({ id: myId!, session_token: mySession!, new_name });
-        if (!res.ok) return { text: `Rename failed: ${res.error}`, isError: true };
-        myName = res.name ?? new_name;
-        setTabTitle(`peer:${myName}`);
-        return { text: `Renamed to ${myName}` };
+        return renameMutex.runExclusive(async () => {
+          const { new_name } = parseRenameToolArgs(args);
+          if (!isValidName(new_name)) {
+            return { text: `Invalid name: must be 1-32 chars, [a-zA-Z0-9_-] only.`, isError: true };
+          }
+          const res = await client.renamePeer({ id: myId!, session_token: mySession!, new_name });
+          if (!res.ok) return { text: `Rename failed: ${res.error}`, isError: true };
+          const oldName = myName;
+          const renamedName = res.name ?? new_name;
+          if (stableIdentityKey && myReclaimToken && ownsStableIdentity) {
+            try {
+              const saved = await savePeerIdentity("codex", stableIdentityKey, {
+                name: renamedName,
+                reclaim_token: myReclaimToken,
+              }, undefined, myReclaimToken, oldName ?? undefined);
+              if (!saved) throw new Error("stable identity changed concurrently");
+            } catch {
+              const rollback = oldName
+                ? await client.renamePeer({ id: myId!, session_token: mySession!, new_name: oldName })
+                : { ok: false };
+              if (rollback.ok) return { text: "Rename could not be persisted and was rolled back.", isError: true };
+              myName = renamedName;
+              return { text: "Renamed, but durable identity persistence failed; restart recovery is not safe.", isError: true };
+            }
+          }
+          myName = renamedName;
+          setTabTitle(`peer:${myName}`);
+          return { text: `Renamed to ${myName}` };
+        });
       }
 
       default:
         return { text: `Unknown tool: ${name}`, isError: true };
     }
-  });
+  }, { suppressInbox: name === "ack_messages" });
 });
 
 async function main() {
@@ -576,7 +512,7 @@ async function main() {
   const sharedSecret = await waitForSharedSecret();
   client = createClient(BROKER_URL, sharedSecret);
 
-  myCwd = process.cwd();
+  myCwd = await canonicalizePath(process.cwd());
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
 
@@ -596,18 +532,31 @@ async function main() {
   })();
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
+  const requestedName = process.env.PEER_NAME;
+  stableIdentityKey = requestedName;
+  const storedIdentity = await loadPeerIdentity("codex", requestedName);
   const reg = await client.register({
     peer_type: "codex",
-    name: process.env.PEER_NAME,
+    name: storedIdentity?.name ?? requestedName,
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    reclaim_token: storedIdentity?.reclaim_token,
   });
+  ownsStableIdentity = await savePeerIdentity(
+    "codex",
+    requestedName,
+    { name: reg.name, reclaim_token: reg.reclaim_token },
+    undefined,
+    storedIdentity?.reclaim_token ?? null,
+    storedIdentity?.name,
+  );
   myId = reg.id;
   myName = reg.name;
   mySession = reg.session_token;
+  myReclaimToken = reg.reclaim_token;
   inboxStore = new CodexInboxStore({ peerId: myId });
   await inboxStore.init();
   setTabTitle(`peer:${myName}`);
@@ -640,13 +589,14 @@ async function main() {
 
   const hb = setInterval(async () => {
     if (myId && mySession) {
-      try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
+      try { await client.heartbeat({ id: myId, session_token: mySession }); }
+      catch (e) { exitIfSessionExpired(e); }
     }
   }, HEARTBEAT_INTERVAL_MS);
 
   // Wire deferred lifecycle cleanup into the earlyKillHandler registered at
-  // the top of main(). Intentionally NO pendingAcks flush (spec §5.5) and NO
-  // unregister (preserves reclaim-by-name window). Timer cleanup only.
+  // the top of main(). Intentionally do not acknowledge durable inbox entries
+  // and do not unregister (preserves reclaim-by-name window). Timer cleanup only.
   lifecycleCleanup = async () => {
     clearInterval(hb);
     pollStopped = true;

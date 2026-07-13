@@ -8,8 +8,10 @@
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
+import { createLogger } from "./logger.ts";
 
 export const DEFAULT_SECRET_PATH = resolve(homedir(), ".agent-peers-secret");
+const secretLog = createLogger("shared-secret");
 
 import { lstatSync } from "node:fs";
 
@@ -23,7 +25,7 @@ import { lstatSync } from "node:fs";
  * mode-weakened file means another local user could have read it.
  *
  * Exported so the broker side can apply the identical check to an existing
- * secret file before trusting it (Codex round-E finding).
+ * secret file before trusting it (Security invariant finding).
  */
 export function validateSecretFilePerms(path: string): void {
   const lst = lstatSync(path);
@@ -33,6 +35,9 @@ export function validateSecretFilePerms(path: string): void {
   const st = statSync(path);
   if (!st.isFile()) {
     throw new Error(`shared secret at ${path} is not a regular file`);
+  }
+  if (st.nlink !== 1) {
+    throw new Error(`shared secret at ${path} has ${st.nlink} hard links; expected exactly one link`);
   }
   // POSIX: stat.uid compared to process.getuid()
   if (typeof (process as unknown as { getuid?: () => number }).getuid === "function") {
@@ -57,7 +62,7 @@ export function readSharedSecret(path: string = DEFAULT_SECRET_PATH): string | n
   } catch (e) {
     // Surface permission/ownership errors to stderr so the user sees them,
     // but don't crash the caller — they may have a degraded fallback path.
-    console.error(`[agent-peers] shared secret validation failed: ${e instanceof Error ? e.message : String(e)}`);
+    secretLog.error("validation_failed", { error_type: e instanceof Error ? e.name : "unknown" });
     return null;
   }
 }

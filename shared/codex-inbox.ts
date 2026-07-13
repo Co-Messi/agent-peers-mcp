@@ -1,33 +1,52 @@
-// shared/codex-inbox.ts
-// Durable on-disk queue of unread peer messages for a Codex session. Lives
-// at ~/.agent-peers-codex/<peer-id>.json (overridable via
-// AGENT_PEERS_CODEX_STATE_DIR) and survives MCP process restarts within the
-// 60s reclaim window.
-//
-// SECURITY INVARIANT: this file mirrors the broker's SQLite trust boundary.
-// Message bodies here are identical to rows in ~/.agent-peers.db, which the
-// broker hardens to 0o600 via multiple audit rounds (see broker.ts
-// enforceDbFilePerms). We enforce the same invariant here:
-//   - directory created with mode 0o700 and chmod re-applied defensively
-//   - file written with mode 0o600 (temp file + rename preserves perms)
-//   - on read, we stat the file and refuse to load it if perms are wider
-//     than 0o600 (fail closed — don't silently serve a leak)
-// Only POSIX platforms get the perm enforcement; on Windows we skip it.
+// Durable, bounded, crash-safe inbox used by the Codex MCP adapter.
 
-import { mkdir, readFile, rename, writeFile, chmod, stat } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  rename,
+  rm,
+} from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 
+import { MAX_ID_CHARS, MAX_MESSAGE_BYTES, MAX_PATH_CHARS, MAX_SUMMARY_CHARS, utf8ByteLength } from "./limits.ts";
 import type { LeasedMessage, PeerId } from "./types.ts";
+import { createLogger } from "./logger.ts";
+
+const inboxLog = createLogger("durable-inbox");
 
 interface CodexInboxState {
+  version: 1;
   unread: LeasedMessage[];
 }
 
-const EMPTY_STATE: CodexInboxState = { unread: [] };
+const EMPTY_STATE: CodexInboxState = { version: 1, unread: [] };
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
 const IS_POSIX = platform() !== "win32";
+const MAX_INBOX_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_INBOX_MESSAGES = 1_000;
+const LOCK_TIMEOUT_MS = 2_000;
+const LOCK_STALE_MS = 10_000;
+
+function processStartIdentity(pid: number): string | null {
+  try {
+    const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (result.exitCode !== 0) return null;
+    const value = result.stdout.toString().trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
 
 function cloneMessages(messages: LeasedMessage[]): LeasedMessage[] {
   return messages.map((message) => ({ ...message }));
@@ -37,35 +56,97 @@ function defaultRootDir(): string {
   return join(homedir(), ".agent-peers-codex");
 }
 
+async function ensureSafeDirectory(dir: string): Promise<void> {
+  try {
+    const before = await lstat(dir);
+    if (before.isSymbolicLink() || !before.isDirectory()) {
+      throw new Error(`inbox state directory is a symlink or not a directory: ${dir}`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await mkdir(dir, { recursive: true, mode: DIR_MODE });
+  }
+  const after = await lstat(dir);
+  if (after.isSymbolicLink() || !after.isDirectory()) {
+    throw new Error(`inbox state directory is a symlink or not a directory: ${dir}`);
+  }
+  if (IS_POSIX) {
+    const mine = (process as unknown as { getuid?: () => number }).getuid?.();
+    if (typeof mine === "number" && after.uid !== mine) {
+      throw new Error(`inbox state directory is not owned by the current user: ${dir}`);
+    }
+    await chmod(dir, DIR_MODE);
+  }
+}
+
 async function atomicWriteJson(path: string, value: CodexInboxState): Promise<void> {
   const dir = dirname(path);
-  // Create the dir with 0o700 and re-chmod defensively — mkdir's mode can be
-  // masked by umask on some Node/Bun versions, so we always follow up with
-  // an explicit chmod to close the window.
-  await mkdir(dir, { recursive: true, mode: DIR_MODE });
-  if (IS_POSIX) {
-    try { await chmod(dir, DIR_MODE); } catch { /* best effort */ }
+  await ensureSafeDirectory(dir);
+  const serialized = JSON.stringify(value, null, 2);
+  if (utf8ByteLength(serialized) > MAX_INBOX_FILE_BYTES) {
+    throw new Error("inbox state is too large");
   }
-
-  const tempPath = `${path}.tmp`;
-  // writeFile with `mode` only takes effect on file creation; if the temp
-  // file already exists from a crashed prior write, the mode is ignored —
-  // we chmod explicitly right after to guarantee the invariant.
-  await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE });
-  if (IS_POSIX) {
-    try { await chmod(tempPath, FILE_MODE); } catch { /* best effort */ }
+  const tempPath = `${path}.tmp.${process.pid}.${randomUUID()}`;
+  const noFollow = IS_POSIX ? fsConstants.O_NOFOLLOW : 0;
+  const handle = await open(
+    tempPath,
+    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | noFollow,
+    FILE_MODE,
+  );
+  try {
+    await handle.writeFile(serialized, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
   }
+  if (IS_POSIX) await chmod(tempPath, FILE_MODE);
+  try {
+    await rename(tempPath, path);
+    try {
+      const dirHandle = await open(dir, fsConstants.O_RDONLY);
+      try { await dirHandle.sync(); } finally { await dirHandle.close(); }
+    } catch { /* some filesystems do not support directory fsync */ }
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    throw error;
+  }
+}
 
-  // rename is atomic on the same filesystem and preserves the 0o600 mode
-  // we just set. If the destination already existed with wider perms, the
-  // rename replaces it wholesale.
-  await rename(tempPath, path);
+function validString(value: unknown, maxChars: number, allowEmpty = true): value is string {
+  return typeof value === "string" && (allowEmpty || value.length > 0) && value.length <= maxChars;
+}
+
+function isLeasedMessage(value: unknown): value is LeasedMessage {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const m = value as Partial<LeasedMessage>;
+  return Number.isSafeInteger(m.id) && (m.id ?? 0) > 0
+    && validString(m.from_id, MAX_ID_CHARS, false)
+    && validString(m.from_name, 32, false)
+    && (m.from_peer_type === "claude" || m.from_peer_type === "codex")
+    && validString(m.from_cwd, MAX_PATH_CHARS)
+    && validString(m.from_summary, MAX_SUMMARY_CHARS)
+    && validString(m.to_id, MAX_ID_CHARS, false)
+    && validString(m.text, MAX_MESSAGE_BYTES, false)
+    && utf8ByteLength(m.text!) <= MAX_MESSAGE_BYTES
+    && validString(m.sent_at, 64, false)
+    && Number.isFinite(Date.parse(m.sent_at!))
+    && validString(m.lease_token, MAX_ID_CHARS, false);
+}
+
+function parseState(raw: string): CodexInboxState {
+  const parsed = JSON.parse(raw) as { version?: unknown; unread?: unknown };
+  if (parsed.version !== undefined && parsed.version !== 1) throw new Error("unsupported inbox version");
+  if (!Array.isArray(parsed.unread)) throw new Error("inbox unread must be an array");
+  if (parsed.unread.length > MAX_INBOX_MESSAGES) throw new Error("too many inbox messages");
+  if (!parsed.unread.every(isLeasedMessage)) throw new Error("invalid inbox message schema");
+  return { version: 1, unread: cloneMessages(parsed.unread) };
 }
 
 export class CodexInboxStore {
   private readonly filePath: string;
+  private readonly lockPath: string;
   private readonly persistState: (path: string, value: CodexInboxState) => Promise<void>;
-  private state: CodexInboxState = { unread: [] };
+  private state: CodexInboxState = { ...EMPTY_STATE, unread: [] };
   private queue: Promise<void> = Promise.resolve();
 
   constructor(opts: {
@@ -76,11 +157,13 @@ export class CodexInboxStore {
     const rootDir = opts.rootDir ?? process.env.AGENT_PEERS_CODEX_STATE_DIR ?? defaultRootDir();
     const safePeerId = encodeURIComponent(opts.peerId);
     this.filePath = join(rootDir, `${safePeerId}.json`);
+    this.lockPath = `${this.filePath}.lock`;
     this.persistState = opts.persistState ?? atomicWriteJson;
   }
 
   async init(): Promise<void> {
     await this.withLock(async () => {
+      await ensureSafeDirectory(dirname(this.filePath));
       this.state = await this.readStateFromDisk();
     });
   }
@@ -90,114 +173,158 @@ export class CodexInboxStore {
   }
 
   async queueLeasedMessages(messages: LeasedMessage[]): Promise<void> {
-    await this.withLock(async () => {
-      const unreadById = new Map(this.state.unread.map((message) => [message.id, { ...message }]));
+    if (!messages.every(isLeasedMessage)) throw new Error("invalid leased message");
+    await this.mutate(async (current) => {
+      const unreadById = new Map(current.unread.map((message) => [message.id, { ...message }]));
       for (const message of messages) unreadById.set(message.id, { ...message });
-      const nextState = { unread: Array.from(unreadById.values()).sort((a, b) => a.id - b.id) };
-      await this.persistState(this.filePath, nextState);
-      this.state = nextState;
+      if (unreadById.size > MAX_INBOX_MESSAGES) throw new Error("too many unread inbox messages");
+      return { version: 1, unread: Array.from(unreadById.values()).sort((a, b) => a.id - b.id) };
     });
   }
 
   async consumeUnreadMessages(): Promise<LeasedMessage[]> {
-    return this.withLock(async () => {
-      const unread = cloneMessages(this.state.unread);
-      const nextState = { unread: [] };
-      await this.persistState(this.filePath, nextState);
-      this.state = nextState;
-      return unread;
+    let unread: LeasedMessage[] = [];
+    await this.mutate(async (current) => {
+      unread = cloneMessages(current.unread);
+      return { ...EMPTY_STATE, unread: [] };
     });
+    return unread;
   }
 
-  // Remove specific messages by id, atomically. Used by the "confirm on
-  // next tool call" flow in codex-server.ts: when the NEXT call fires we
-  // know the PREVIOUS response cycle completed, so messages drawn into
-  // that response can finally be pruned from the durable queue. A plain
-  // consumeUnreadMessages() would drop EVERYTHING including messages that
-  // arrived between the last draw and this call — which must stay queued.
   async removeByIds(ids: number[]): Promise<void> {
     if (ids.length === 0) return;
-    await this.withLock(async () => {
+    await this.mutate(async (current) => {
       const drop = new Set(ids);
-      const nextState = {
-        unread: this.state.unread.filter((m) => !drop.has(m.id)),
-      };
-      // Only write if something actually changed — avoids a write storm
-      // when removeByIds is called with ids that are no longer in the
-      // queue (harmless but noisy in tests).
-      if (nextState.unread.length === this.state.unread.length) return;
-      await this.persistState(this.filePath, nextState);
-      this.state = nextState;
+      return { version: 1, unread: current.unread.filter((m) => !drop.has(m.id)) };
     });
   }
 
   async reset(): Promise<void> {
+    await this.mutate(async () => ({ ...EMPTY_STATE, unread: [] }));
+  }
+
+  private async mutate(fn: (current: CodexInboxState) => Promise<CodexInboxState>): Promise<void> {
     await this.withLock(async () => {
-      const nextState = { unread: [] };
-      await this.persistState(this.filePath, nextState);
-      this.state = nextState;
+      await this.withFileLock(async () => {
+        // Refresh inside the process-wide lock so concurrent writers merge
+        // against the latest durable state rather than stale memory.
+        const current = await this.readStateFromDisk();
+        const next = await fn(current);
+        await this.persistState(this.filePath, next);
+        this.state = next;
+      });
     });
   }
 
   private async readStateFromDisk(): Promise<CodexInboxState> {
+    let fileStat;
     try {
-      // Fail-closed perm check (matches broker.ts enforceDbFilePerms). If
-      // the file exists with perms wider than 0o600 or owned by another
-      // user, refuse to read it — another local user may have stuffed
-      // crafted messages in to spoof peer identities, or may be reading
-      // our message bodies. We return empty state rather than throwing so
-      // the session still starts cleanly; the operator will see the
-      // refusal in stderr and can investigate.
-      if (IS_POSIX) {
-        const st = await stat(this.filePath);
-        if (!st.isFile()) {
-          console.error(
-            `[agent-peers/codex-inbox] ${this.filePath} is not a regular file — refusing to load; starting with empty inbox`,
-          );
-          return { unread: [] };
-        }
-        const mine = (process as unknown as { getuid?: () => number }).getuid?.();
-        if (typeof mine === "number" && st.uid !== mine) {
-          console.error(
-            `[agent-peers/codex-inbox] ${this.filePath} owned by uid ${st.uid}, not ${mine} — refusing to load; starting with empty inbox`,
-          );
-          return { unread: [] };
-        }
-        const mode = st.mode & 0o777;
-        if (mode !== FILE_MODE) {
-          console.error(
-            `[agent-peers/codex-inbox] ${this.filePath} has mode ${mode.toString(8)}, expected 0600 — refusing to load; starting with empty inbox`,
-          );
-          return { unread: [] };
+      fileStat = await lstat(this.filePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ...EMPTY_STATE, unread: [] };
+      throw error;
+    }
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
+      throw new Error(`inbox path is a symlink or not a regular file: ${this.filePath}`);
+    }
+    if (fileStat.nlink !== 1) {
+      throw new Error(`inbox file has ${fileStat.nlink} hard links; expected exactly one link`);
+    }
+    if (IS_POSIX) {
+      const mine = (process as unknown as { getuid?: () => number }).getuid?.();
+      if (typeof mine === "number" && fileStat.uid !== mine) {
+        throw new Error(`inbox file is not owned by the current user: ${this.filePath}`);
+      }
+      if ((fileStat.mode & 0o777) !== FILE_MODE) {
+        inboxLog.error("insecure_file_mode");
+        throw new Error("insecure inbox file mode");
+      }
+    }
+    if (fileStat.size > MAX_INBOX_FILE_BYTES) return this.quarantine("file too large");
+    try {
+      return parseState(await readFile(this.filePath, "utf8"));
+    } catch (error) {
+      return this.quarantine(error instanceof Error ? error.message : "corrupt state");
+    }
+  }
+
+  private async quarantine(reason: string): Promise<CodexInboxState> {
+    const quarantinePath = `${this.filePath}.corrupt-${Date.now()}-${randomUUID()}`;
+    await rename(this.filePath, quarantinePath);
+    inboxLog.warn("state_quarantined", { reason });
+    return { ...EMPTY_STATE, unread: [] };
+  }
+
+  private async withFileLock<T>(fn: () => Promise<T>): Promise<T> {
+    await ensureSafeDirectory(dirname(this.filePath));
+    const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    let handle;
+    while (!handle) {
+      try {
+        handle = await open(this.lockPath, "wx", FILE_MODE);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        try {
+          const lockStat = await lstat(this.lockPath);
+          let ownerAlive = false;
+          try {
+            const parsed = JSON.parse(await readFile(this.lockPath, "utf8")) as { pid?: unknown; process_start?: unknown };
+            if (Number.isSafeInteger(parsed.pid) && (parsed.pid as number) > 0) {
+              try { process.kill(parsed.pid as number, 0); ownerAlive = true; }
+              catch (probe) { ownerAlive = (probe as NodeJS.ErrnoException).code === "EPERM"; }
+              if (ownerAlive && typeof parsed.process_start === "string") {
+                const currentStart = processStartIdentity(parsed.pid as number);
+                // A live process with the same PID but a different start time
+                // is a PID-reuse collision, not the lock owner.
+                if (currentStart !== null && currentStart !== parsed.process_start) ownerAlive = false;
+              }
+              if (!ownerAlive) await rm(this.lockPath, { force: true });
+            } else if (Date.now() - lockStat.mtimeMs > LOCK_STALE_MS) {
+              await rm(this.lockPath, { force: true });
+            }
+          } catch {
+            if (Date.now() - lockStat.mtimeMs > LOCK_STALE_MS) await rm(this.lockPath, { force: true });
+          }
+        } catch { /* lock disappeared; retry */ }
+        if (Date.now() >= deadline) throw new Error("timed out waiting for inbox file lock");
+        await Bun.sleep(10);
+      }
+      if (handle) {
+        try {
+          await handle.writeFile(JSON.stringify({
+            pid: process.pid,
+            process_start: processStartIdentity(process.pid),
+            created_at: Date.now(),
+          }), "utf8");
+          await handle.sync();
+        } catch (error) {
+          await handle.close();
+          await rm(this.lockPath, { force: true });
+          throw error;
         }
       }
-
-      const raw = await readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<CodexInboxState>;
-      if (!Array.isArray(parsed.unread)) return { unread: [] };
-      return { unread: cloneMessages(parsed.unread as LeasedMessage[]) };
-    } catch {
-      // File doesn't exist yet (common on first boot) or JSON parse failed.
-      // Either way: start empty. stat() throws ENOENT before we can
-      // distinguish, so we can't narrow here without double-statting.
-      return { unread: [] };
+    }
+    const ownedStat = await handle.stat();
+    try {
+      return await fn();
+    } finally {
+      await handle.close();
+      try {
+        const current = await lstat(this.lockPath);
+        if (current.dev === ownedStat.dev && current.ino === ownedStat.ino) {
+          await rm(this.lockPath, { force: true });
+        }
+      } catch { /* lock was already removed or replaced */ }
     }
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
     const previous = this.queue;
     let release!: () => void;
-    this.queue = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-
+    this.queue = new Promise<void>((resolve) => { release = resolve; });
     await previous;
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
+    try { return await fn(); } finally { release(); }
   }
 }
 
-export { EMPTY_STATE as EMPTY_CODEX_INBOX_STATE };
+export { EMPTY_STATE as EMPTY_CODEX_INBOX_STATE, MAX_INBOX_MESSAGES };

@@ -18,7 +18,9 @@ export async function ensureBroker(
   // ENOENT the encoded form.
   const scriptPath = fileURLToPath(brokerScriptUrl);
 
-  const proc = Bun.spawn(["bun", scriptPath], {
+  // Reuse the executable running this MCP process. This avoids PATH
+  // substitution and works when Bun is installed outside the shell PATH.
+  const proc = Bun.spawn([process.execPath, scriptPath], {
     stdio: ["ignore", "ignore", "inherit"],
   });
   proc.unref();

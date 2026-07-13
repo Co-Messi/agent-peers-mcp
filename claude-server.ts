@@ -3,11 +3,10 @@
 // MCP stdio server for Claude Code. Registers as peer_type="claude", declares
 // claude/channel, pushes inbound messages instantly via channel notifications.
 //
-// Delivery pipeline: every 1s the polling loop leases any new messages from the
-// broker, pushes each via mcp.notification(...), adds successfully-pushed
-// message_ids to an in-memory seen-set, and batches the corresponding lease
-// tokens for a single /ack-messages call. Re-deliveries (lease expired and
-// re-leased) are detected via seen-set and acked without a duplicate push.
+// Delivery pipeline: every 1s the polling loop leases messages, persists them
+// in a stable-ID durable inbox, and emits a best-effort live channel push only
+// for entries newly added to that inbox. Messages stay durable and eligible for
+// re-presentation until the model explicitly calls ack_messages with their IDs.
 //
 // Shutdown: on SIGINT/SIGTERM we clear timers and exit without unregistering.
 // Leaving the peer row lets a restart with the same PEER_NAME reclaim the UUID
@@ -23,47 +22,69 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { createClient } from "./shared/broker-client.ts";
+import { createClient, isSessionExpiredError } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
-import { waitForSharedSecret } from "./shared/shared-secret.ts";
-import { getGitRoot, getTty } from "./shared/peer-context.ts";
+import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts";
+import { canonicalizePath, getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
 import { formatInboxBlock } from "./shared/piggyback.ts";
-import { recordDelivered, getRecentDelivered } from "./shared/recent-delivered.ts";
+import { CodexInboxStore as DurableInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId } from "./shared/types.ts";
+import { sanitizeTerminalText as safe } from "./shared/safe-output.ts";
+import { MAX_ACK_TOKENS, MAX_PRESENTATION_BYTES, MAX_PRESENTED_MESSAGES } from "./shared/limits.ts";
+import { selectMessagesForPresentation } from "./shared/delivery-state.ts";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { createLogger } from "./shared/logger.ts";
+import { parsePort } from "./shared/config.ts";
+import { loadPeerIdentity, savePeerIdentity } from "./shared/peer-identity.ts";
+import { AsyncMutex } from "./shared/async-mutex.ts";
+import { acknowledgeDurableMessages, parseExplicitAckIds } from "./shared/explicit-ack.ts";
+import {
+  parseListPeersToolArgs,
+  parseRenameToolArgs,
+  parseSendMessageToolArgs,
+  parseSetSummaryToolArgs,
+} from "./shared/validation.ts";
 
-const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
+const BROKER_PORT = parsePort(process.env.AGENT_PEERS_PORT, 7900);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
+const logger = createLogger("claude-mcp");
+const renameMutex = new AsyncMutex();
 
 function log(msg: string) {
-  // MCP stdio servers must only use stderr for logging (stdout is the protocol).
-  console.error(`[agent-peers/claude] ${msg}`);
+  logger.info("status", { detail: msg });
+}
+
+function exitIfSessionExpired(error: unknown): void {
+  if (isSessionExpiredError(error)) {
+    logger.error("session_expired");
+    process.exit(1);
+  }
 }
 
 // The shared secret is only known after the broker has provisioned it, so
 // we defer client construction until main() can read the secret file.
 let client: ReturnType<typeof createClient>;
 async function isBrokerAlive(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-    return res.ok;
-  } catch { return false; }
+  const secret = readSharedSecret();
+  return secret ? createClient(BROKER_URL, secret).isAlive() : false;
 }
 
 let myId: PeerId | null = null;
 let myName: string | null = null;
 let mySession: string | null = null;
+let myReclaimToken: string | null = null;
+let stableIdentityKey: string | undefined;
+let ownsStableIdentity = false;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
-
-// The recent-delivered ring buffer is the backfill surface for check_messages.
-// See shared/recent-delivered.ts for the full rationale. Extracted out of this
-// file so the behavior (retention, TTL, cap) is unit-testable in isolation.
+let claudeInboxStore: DurableInboxStore | null = null;
 
 const mcp = new Server(
   { name: "agent-peers", version: "0.1.0" },
@@ -90,8 +111,8 @@ to use both:
      prompt, Claude Code queues the channel push — the model doesn't
      see it until the next turn begins, and it may not render
      visibly even then. Calling \`check_messages\` returns a
-     [PEER INBOX] block containing every peer message received in
-     the last 15 minutes, so nothing gets lost to idle-queue silence.
+     [PEER INBOX] block containing every unconfirmed peer message in
+     the durable local inbox, so nothing gets lost to idle-queue silence.
 
 RULE: Call \`check_messages\` as the FIRST thing you do at the START of
 every user turn. This is the same rule Codex uses. It's one cheap
@@ -103,7 +124,12 @@ Exception: you do NOT need to call \`check_messages\` again within the
 same turn — once per turn is enough. If the user sent you a task
 right after a peer message arrived mid-task, you've already seen it
 via the live channel push, and check_messages will just re-show the
-same thing.`,
+same thing.
+
+After actually processing displayed messages, call
+\`ack_messages(message_ids=[...])\` with their exact IDs. This explicit
+call is the only durable delivery confirmation; until then, messages
+remain eligible for re-presentation.`,
   },
 );
 
@@ -146,8 +172,19 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Surface peer messages received in the last 15 minutes. Call this at the START of every user turn — it is the only reliable way to see messages that arrived while this session was idle at the prompt (Claude Code's channel push silently queues idle deliveries). One cheap call. Without this habit, peer DMs sent while you were idle wait invisibly until something else triggers a redraw.",
+      "Surface unconfirmed messages from the durable local inbox. Call this at the START of every user turn; the live channel is best effort and may queue or drop idle deliveries.",
     inputSchema: { type: "object" as const, properties: {} },
+  },
+  {
+    name: "ack_messages",
+    description: "Explicitly acknowledge peer messages only after processing them.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        message_ids: { type: "array" as const, items: { type: "integer" as const, minimum: 1 }, minItems: 1, maxItems: MAX_ACK_TOKENS },
+      },
+      required: ["message_ids"],
+    },
   },
   {
     name: "rename_peer",
@@ -174,10 +211,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   switch (name) {
     case "list_peers": {
-      const { scope, peer_type } = args as {
-        scope: "machine" | "directory" | "repo";
-        peer_type?: "claude" | "codex";
-      };
+      const { scope, peer_type } = parseListPeersToolArgs(args);
       const peers = await client.listPeers({
         scope, cwd: myCwd, git_root: myGitRoot, exclude_id: myId, peer_type,
       });
@@ -186,11 +220,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       const lines = peers.map((p) =>
         [
-          `Peer ${p.name} (${p.peer_type})`,
-          `  ID: ${p.id}`,
-          `  CWD: ${p.cwd}`,
-          p.tty ? `  TTY: ${p.tty}` : null,
-          p.summary ? `  Summary: ${p.summary}` : null,
+          `Peer ${safe(p.name, 32)} (${p.peer_type})`,
+          `  ID: ${safe(p.id, 128)}`,
+          `  CWD: ${safe(p.cwd)}`,
+          p.tty ? `  TTY: ${safe(p.tty, 256)}` : null,
+          p.summary ? `  Summary: ${safe(p.summary, 1024)}` : null,
           `  Last seen: ${p.last_seen}`,
         ].filter(Boolean).join("\n")
       );
@@ -198,7 +232,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      const { to_id, message } = parseSendMessageToolArgs(args);
       const res = await client.sendMessage({
         from_id: myId, session_token: mySession, to_id_or_name: to_id, text: message,
       });
@@ -209,32 +243,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "set_summary": {
-      const { summary } = args as { summary: string };
+      const { summary } = parseSetSummaryToolArgs(args);
       await client.setSummary({ id: myId, session_token: mySession, summary });
       return { content: [{ type: "text" as const, text: `Summary set: "${summary}"` }] };
     }
 
     case "check_messages": {
-      // BACKFILL: return whatever the background poll has recorded in the
-      // ring buffer. This is Claude's equivalent of Codex's [PEER INBOX]
-      // piggyback — the single reliable surface for "what peer messages
-      // have I received recently?" We keep the buffer independent of the
-      // broker (broker already acked those messages) so the user can
-      // always retrieve recent peer activity even when Claude Code's
-      // channel push was silently queued (which happens when the
-      // session was idle at the prompt).
-      //
-      // Dedupe is the model's job: each entry includes message_id, and
-      // the colleague protocol says "don't re-reply to something you
-      // already replied to." So repeated check_messages calls within
-      // the 15-min TTL window are safe — they show the same messages,
-      // Claude just won't re-respond to ones it already handled.
-      const recent = getRecentDelivered();
+      // Return messages persisted before broker acknowledgement. Entries
+      // remain durable until ack_messages provides explicit model evidence.
+      const queued = claudeInboxStore ? await claudeInboxStore.getUnreadMessages() : [];
+      const recent = selectMessagesForPresentation(queued, {
+        maxMessages: MAX_PRESENTED_MESSAGES,
+        maxBytes: MAX_PRESENTATION_BYTES,
+      });
       if (recent.length === 0) {
         return {
           content: [{
             type: "text" as const,
-            text: "No peer messages in the last 15 minutes. (Messages also arrive live mid-turn via the agent-peers channel when a peer sends something while you're active — this tool is the fallback for messages that arrived while this session was idle at the prompt.)",
+            text: "No unconfirmed peer messages in the durable inbox. (Messages also arrive live mid-turn via the agent-peers channel when a peer sends something while you're active — this tool is the fallback for messages that arrived while this session was idle at the prompt.)",
           }],
         };
       }
@@ -246,21 +272,66 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
 
+    case "ack_messages": {
+      if (!claudeInboxStore) throw new Error("durable inbox is unavailable");
+      const messageIds = parseExplicitAckIds(args);
+      const result = await acknowledgeDurableMessages({
+        store: claudeInboxStore,
+        messageIds,
+        maxBatchSize: MAX_ACK_TOKENS,
+        ackBroker: async (leaseTokens) => {
+          const response = await client.ackMessages({ id: myId!, session_token: mySession!, lease_tokens: leaseTokens });
+          return response.acked_tokens;
+        },
+      });
+      const missing = result.missing_ids.length > 0
+        ? ` IDs not present in the durable inbox: ${result.missing_ids.join(", ")}.`
+        : "";
+      const warning = result.broker_error
+        ? " Broker acknowledgement failed; safe duplicate delivery may occur."
+        : result.broker_acked < result.acknowledged_ids.length
+          ? " Some broker leases had expired; safe duplicate delivery may occur."
+          : "";
+      return { content: [{ type: "text" as const, text: `Acknowledged message IDs: ${result.acknowledged_ids.join(", ") || "none"}.${missing}${warning}` }] };
+    }
+
     case "rename_peer": {
-      const { new_name } = args as { new_name: string };
-      if (!isValidName(new_name)) {
-        return {
-          content: [{ type: "text" as const, text: `Invalid name: must be 1-32 chars, [a-zA-Z0-9_-] only.` }],
-          isError: true,
-        };
-      }
-      const res = await client.renamePeer({ id: myId, session_token: mySession, new_name });
-      if (!res.ok) {
-        return { content: [{ type: "text" as const, text: `Rename failed: ${res.error}` }], isError: true };
-      }
-      myName = res.name ?? new_name;
-      setTabTitle(`peer:${myName}`);
-      return { content: [{ type: "text" as const, text: `Renamed to ${myName}` }] };
+      return renameMutex.runExclusive(async () => {
+        const { new_name } = parseRenameToolArgs(args);
+        if (!isValidName(new_name)) {
+          return {
+            content: [{ type: "text" as const, text: `Invalid name: must be 1-32 chars, [a-zA-Z0-9_-] only.` }],
+            isError: true,
+          };
+        }
+        const res = await client.renamePeer({ id: myId!, session_token: mySession!, new_name });
+        if (!res.ok) {
+          return { content: [{ type: "text" as const, text: `Rename failed: ${res.error}` }], isError: true };
+        }
+        const oldName = myName;
+        const renamedName = res.name ?? new_name;
+        if (stableIdentityKey && myReclaimToken && ownsStableIdentity) {
+          try {
+            const saved = await savePeerIdentity("claude", stableIdentityKey, {
+              name: renamedName,
+              reclaim_token: myReclaimToken,
+            }, undefined, myReclaimToken, oldName ?? undefined);
+            if (!saved) throw new Error("stable identity changed concurrently");
+          } catch {
+            const rollback = oldName
+              ? await client.renamePeer({ id: myId!, session_token: mySession!, new_name: oldName })
+              : { ok: false };
+            if (rollback.ok) {
+              return { content: [{ type: "text" as const, text: "Rename could not be persisted and was rolled back." }], isError: true };
+            }
+            myName = renamedName;
+            return { content: [{ type: "text" as const, text: "Renamed, but durable identity persistence failed; restart recovery is not safe." }], isError: true };
+          }
+        }
+        myName = renamedName;
+        setTabTitle(`peer:${myName}`);
+        return { content: [{ type: "text" as const, text: `Renamed to ${myName}` }] };
+      });
     }
 
     default:
@@ -320,7 +391,7 @@ async function main() {
   const sharedSecret = await waitForSharedSecret();
   client = createClient(BROKER_URL, sharedSecret);
 
-  myCwd = process.cwd();
+  myCwd = await canonicalizePath(process.cwd());
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
 
@@ -341,18 +412,36 @@ async function main() {
   })();
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
+  const requestedName = process.env.PEER_NAME;
+  stableIdentityKey = requestedName;
+  const storedIdentity = await loadPeerIdentity("claude", requestedName);
   const reg = await client.register({
     peer_type: "claude",
-    name: process.env.PEER_NAME,
+    name: storedIdentity?.name ?? requestedName,
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    reclaim_token: storedIdentity?.reclaim_token,
   });
+  ownsStableIdentity = await savePeerIdentity(
+    "claude",
+    requestedName,
+    { name: reg.name, reclaim_token: reg.reclaim_token },
+    undefined,
+    storedIdentity?.reclaim_token ?? null,
+    storedIdentity?.name,
+  );
   myId = reg.id;
   myName = reg.name;
   mySession = reg.session_token;
+  myReclaimToken = reg.reclaim_token;
+  claudeInboxStore = new DurableInboxStore({
+    peerId: myId,
+    rootDir: process.env.AGENT_PEERS_CLAUDE_STATE_DIR ?? join(homedir(), ".agent-peers-claude"),
+  });
+  await claudeInboxStore.init();
   setTabTitle(`peer:${myName}`);
   // Note: keepalive was already armed earlier in main(), before register().
   // The setTabTitle above just updates `lastTitle`; the running keepalive
@@ -375,74 +464,48 @@ async function main() {
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
-  // In-memory dedupe: message_ids we have already pushed successfully this session.
-  // See spec §5.4 for rationale — deterministic dedupe, no model intelligence required.
-  const seen = new Set<number>();
-
   const pollAndPush = async () => {
-    if (!myId || !mySession) return;
+    if (!myId || !mySession || !claudeInboxStore) return;
     try {
       const msgs = await client.pollMessages({ id: myId, session_token: mySession });
-      const toAck: string[] = [];
+      if (msgs.length === 0) return;
+
+      const alreadyQueued = new Set((await claudeInboxStore.getUnreadMessages()).map((message) => message.id));
+      // Persist before presentation. Broker acknowledgement is deferred until
+      // the model explicitly calls ack_messages.
+      await claudeInboxStore.queueLeasedMessages(msgs);
+
       for (const m of msgs) {
-        if (seen.has(m.id)) {
-          // Re-delivery after lost ack. Queue the new lease_token so the broker
-          // can close the stuck lease, but do NOT push again.
-          toAck.push(m.lease_token);
-          continue;
-        }
+        if (alreadyQueued.has(m.id)) continue;
         try {
-          // Per the channels reference, `meta` is Record<string, string> —
-          // non-string values are silently dropped, and the `source` attribute
-          // is auto-generated from the server name (so passing it here would
-          // be redundant or conflict with the auto-set value). Stringify the
-          // numeric message_id and omit `source`.
           await mcp.notification({
             method: "notifications/claude/channel",
             params: {
-              content: m.text,
+              content: formatInboxBlock([m]),
               meta: {
                 message_id: String(m.id),
                 from_id: m.from_id,
                 from_name: m.from_name,
                 from_peer_type: m.from_peer_type,
-                from_summary: m.from_summary,
-                from_cwd: m.from_cwd,
                 sent_at: m.sent_at,
               },
             },
           });
-          // Mark delivered in seen BEFORE queueing the ack so a later ack
-          // failure cannot cause a re-push within this session. Also
-          // record in the recent-delivered ring buffer so check_messages
-          // can surface it if Claude Code silently queued the channel
-          // push (e.g. session was idle at the prompt).
-          seen.add(m.id);
-          recordDelivered(m);
-          toAck.push(m.lease_token);
-          // Visible proof-of-delivery in stderr so a live operator can
-          // tell from the log alone whether the push fired. Claude Code's
-          // rendering is opaque to us (especially in idle-at-prompt
-          // cases), so having a hard "yes, we pushed it" line in
-          // stderr is the one debug signal that always works.
-          log(`📬 pushed channel msg #${m.id} from ${m.from_name} (${m.from_peer_type}): ${m.text.slice(0, 80)}${m.text.length > 80 ? "…" : ""}`);
+          log(`pushed channel message id=${m.id} from=${m.from_name} type=${m.from_peer_type}`);
         } catch (e) {
-          log(`push failed (lease will expire + redeliver): ${e instanceof Error ? e.message : String(e)}`);
+          // The durable inbox remains authoritative even if the live hint is
+          // unavailable; check_messages will surface the message.
+          log(`channel push failed; durable inbox retained id=${m.id}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
-      if (toAck.length > 0 && mySession) {
-        try {
-          await client.ackMessages({ id: myId, session_token: mySession, lease_tokens: toAck });
-        } catch {
-          /* next poll picks up remainder */
-        }
-      }
+
     } catch (e) {
+      exitIfSessionExpired(e);
       log(`poll error: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
 
-  // Self-scheduling loop with re-entrancy guard (code review round-1 fix).
+  // Self-scheduling loop with re-entrancy guard (current lifecycle invariant).
   // Using setInterval would fire a new poll every 1s even if the previous one is
   // still in flight, causing overlapping reads of the same `seen` set and
   // duplicate pushes under slow I/O. This pattern guarantees strictly one
@@ -460,7 +523,8 @@ async function main() {
 
   const hb = setInterval(async () => {
     if (myId && mySession) {
-      try { await client.heartbeat({ id: myId, session_token: mySession }); } catch { /* non-critical */ }
+      try { await client.heartbeat({ id: myId, session_token: mySession }); }
+      catch (e) { exitIfSessionExpired(e); }
     }
   }, HEARTBEAT_INTERVAL_MS);
 

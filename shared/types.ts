@@ -9,12 +9,12 @@ export interface Peer {
   id: PeerId;
   name: PeerName;
   peer_type: PeerType;
-  pid: number;
+  pid?: number;
   cwd: string;
-  git_root: string | null;
-  tty: string | null;
+  git_root?: string | null;
+  tty?: string | null;
   summary: string;
-  registered_at: string; // ISO timestamp
+  registered_at?: string; // ISO timestamp
   last_seen: string; // ISO timestamp
 }
 
@@ -41,12 +41,14 @@ export interface RegisterRequest {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  reclaim_token?: string;
 }
 
 export interface RegisterResponse {
   id: PeerId;
   name: PeerName;
   session_token: string; // opaque per-session auth token; required on peer mutations
+  reclaim_token: string; // durable credential required to reclaim this peer identity
 }
 
 export interface HeartbeatRequest { id: PeerId; session_token: string; }
@@ -91,6 +93,7 @@ export interface AckMessagesRequest {
 export interface AckMessagesResponse {
   ok: boolean;
   acked: number;
+  acked_tokens: string[];
 }
 
 export interface RenamePeerRequest {
@@ -103,4 +106,12 @@ export interface RenamePeerResponse {
   ok: boolean;
   error?: string;
   name?: PeerName;
+}
+
+export interface BrokerDiagnostics {
+  peers: number;
+  pending_messages: number;
+  leased_messages: number;
+  acknowledged_messages: number;
+  orphaned_messages: number;
 }
