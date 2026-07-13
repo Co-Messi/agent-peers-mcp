@@ -2,8 +2,6 @@
 set -euo pipefail
 
 ROOT_DIR="${AGENT_PEERS_MCP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-GOOGLE_ADS_REPO="${GOOGLE_ADS_EXPERT_REPO:-/Users/mike/www/ai/google-ads-expert}"
-CCR_WEBSITE_REPO="${CCR_WEBSITE_REPO:-/Users/mike/www/ai/ccr-website}"
 DEFAULT_INSTALL_PATH="${HOME}/.local/bin/codex-peer"
 DOC_PATH="${ROOT_DIR}/docs/examples/wakeable-codex-peer-demo.html"
 
@@ -23,10 +21,8 @@ usage() {
   cat <<'EOF'
 codex-peer: easy launcher for wakeable Codex peers on the agent peer network
 
-Simple zsh aliases installed on Mike's machine:
+Optional shell aliases you can define locally:
   peerwake   -> codex-peer daemon
-  adspeer    -> codex-peer google-ads
-  ccrpeer    -> codex-peer ccr
   peerlist   -> codex-peer peers
   peerstatus -> codex-peer live
   peerrepair -> codex-peer repair-wake
@@ -36,15 +32,7 @@ Simple zsh aliases installed on Mike's machine:
 Usage:
   codex-peer
       Start wakeable Codex in the current directory.
-      Auto-names the peer from the repo, like ccr-website-codex.
-
-  codex-peer google-ads [-- extra codex args]
-      Start a wakeable Codex peer in /Users/mike/www/ai/google-ads-expert
-      with peer name google-ads-codex.
-
-  codex-peer ccr [-- extra codex args]
-      Start a wakeable Codex peer in /Users/mike/www/ai/ccr-website
-      with peer name ccr-codex.
+      Auto-names the peer from the repo, like my-service-codex.
 
   codex-peer start <peer-name> <repo-path> [-- extra codex args]
       Start any repo as a wakeable Codex peer with a stable peer name.
@@ -52,7 +40,7 @@ Usage:
   codex-peer daemon [seconds]
       Run the wake loop in the FOREGROUND. Keep this open in one Zed terminal.
       Default interval: 5 seconds. You normally do NOT need this — any launch
-      (codex-peer / google-ads / ccr / start) auto-starts a background daemon.
+      (`codex-peer` and `codex-peer start`) auto-start a background daemon.
 
   codex-peer daemon-stop
       Stop the background wake daemon.
@@ -89,12 +77,11 @@ Usage:
 Examples:
   codex-peer
   codex-peer daemon
-  codex-peer google-ads
-  codex-peer ccr
-  codex-peer send ccr-codex "Google Ads peer here. Please list peers and reply."
+  codex-peer start api-codex ~/code/api
+  codex-peer send api-codex "Please list peers and reply."
   codex-peer live
-  codex-peer retire ccr-codex-2
-  codex-peer repair-wake ccr-codex-2
+  codex-peer retire api-codex-2
+  codex-peer repair-wake api-codex-2
 EOF
 }
 
@@ -130,16 +117,9 @@ sanitize_peer_segment() {
 
 auto_peer_name() {
   local repo_path="$1"
-  local repo_root repo_root_canon google_canon ccr_canon base clean max_base
+  local repo_root repo_root_canon base clean max_base
   repo_root="$(repo_root_or_dir "$repo_path")"
   repo_root_canon="$(canonical_dir "$repo_root")"
-  google_canon="$(canonical_dir "$GOOGLE_ADS_REPO" 2>/dev/null || printf '%s' "$GOOGLE_ADS_REPO")"
-  ccr_canon="$(canonical_dir "$CCR_WEBSITE_REPO" 2>/dev/null || printf '%s' "$CCR_WEBSITE_REPO")"
-
-  case "$repo_root_canon" in
-    "$google_canon") printf 'google-ads-codex\n'; return ;;
-    "$ccr_canon") printf 'ccr-codex\n'; return ;;
-  esac
 
   base="$(basename "$repo_root_canon")"
   clean="$(sanitize_peer_segment "$base")"
@@ -179,12 +159,46 @@ start_here() {
 }
 
 # Print the PID of a live wake daemon (and succeed) or return non-zero.
+daemon_start_identity() {
+  ps -o lstart= -o command= -p "$1" 2>/dev/null | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+write_daemon_pidfile() {
+  local pid="$1" identity="" attempt
+  for attempt in 1 2 3 4 5; do
+    identity="$(daemon_start_identity "$pid")"
+    [ -n "$identity" ] && break
+    sleep 0.05
+  done
+  [ -n "$identity" ] || return 1
+  printf '%s|%s\n' "$pid" "$identity" >"$DAEMON_PIDFILE"
+}
+
 daemon_pid() {
   [ -f "$DAEMON_PIDFILE" ] || return 1
-  local pid
-  pid="$(cat "$DAEMON_PIDFILE" 2>/dev/null || true)"
-  [ -n "$pid" ] || return 1
+  local record pid expected actual
+  record="$(cat "$DAEMON_PIDFILE" 2>/dev/null || true)"
+  case "$record" in
+    *'|'*) ;;
+    *)
+      # One-time migration for pid-only files from older releases. Accept it
+      # only when the live command is visibly this daemon, then rewrite with a
+      # start+command identity before returning it.
+      case "$record" in ''|*[!0-9]*) return 1 ;; esac
+      local legacy_command
+      legacy_command="$(ps -o command= -p "$record" 2>/dev/null || true)"
+      case "$legacy_command" in *'/codex-peer daemon'|*'/codex-peer daemon '*) write_daemon_pidfile "$record" || return 1 ;; *) return 1 ;; esac
+      printf '%s' "$record"
+      return 0
+      ;;
+  esac
+  pid="${record%%|*}"
+  expected="${record#*|}"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$expected" ] || return 1
   if kill -0 "$pid" 2>/dev/null; then
+    actual="$(daemon_start_identity "$pid")"
+    [ -n "$actual" ] && [ "$actual" = "$expected" ] || return 1
     printf '%s' "$pid"
     return 0
   fi
@@ -192,7 +206,7 @@ daemon_pid() {
 }
 
 # Idempotently make sure a background wake daemon is running. Called by every
-# launch path so Mike never has to remember to start `peerwake` by hand — after
+# launch path so users do not have to remember to start the daemon — after
 # a reboot, the first `codexpeer` launch brings the waker up on its own. Safe to
 # call concurrently: an atomic lock dir ensures only one racer starts it.
 ensure_daemon() {
@@ -201,17 +215,28 @@ ensure_daemon() {
     return 0
   fi
   if ! mkdir "$DAEMON_LOCKDIR" 2>/dev/null; then
-    return 0  # another launch is already starting it
+    local lock_owner=""
+    lock_owner="$(cat "$DAEMON_LOCKDIR/owner" 2>/dev/null || true)"
+    if [ -n "$lock_owner" ] && kill -0 "$lock_owner" 2>/dev/null; then
+      return 0  # another live launch is already starting it
+    fi
+    rm -rf "$DAEMON_LOCKDIR" 2>/dev/null || return 0
+    mkdir "$DAEMON_LOCKDIR" 2>/dev/null || return 0
   fi
+  printf '%s\n' "$$" >"$DAEMON_LOCKDIR/owner"
   if daemon_pid >/dev/null 2>&1; then
-    rmdir "$DAEMON_LOCKDIR" 2>/dev/null || true
+    rm -rf "$DAEMON_LOCKDIR" 2>/dev/null || true
     return 0
   fi
   nohup "$ROOT_DIR/bin/codex-peer" daemon "$DAEMON_INTERVAL" >>"$DAEMON_LOGFILE" 2>&1 &
   local dpid=$!
-  printf '%s\n' "$dpid" >"$DAEMON_PIDFILE"
+  if ! write_daemon_pidfile "$dpid"; then
+    kill "$dpid" 2>/dev/null || true
+    rm -rf "$DAEMON_LOCKDIR" 2>/dev/null || true
+    die "could not record wake daemon process identity"
+  fi
   disown 2>/dev/null || true
-  rmdir "$DAEMON_LOCKDIR" 2>/dev/null || true
+  rm -rf "$DAEMON_LOCKDIR" 2>/dev/null || true
   printf 'codex-peer: started background wake daemon (pid %s, log %s)\n' "$dpid" "$DAEMON_LOGFILE" >&2
 }
 
@@ -268,7 +293,7 @@ run_daemon() {
       die "wake daemon already running (pid $existing). Stop it with 'codex-peer daemon-stop' first."
     fi
   fi
-  printf '%s\n' "$$" >"$DAEMON_PIDFILE"
+  write_daemon_pidfile "$$" || die "could not record wake daemon process identity"
   trap 'rm -f "$DAEMON_PIDFILE"' EXIT
   trap 'rm -f "$DAEMON_PIDFILE"; exit 130' INT TERM
   printf '%s codex-peer: wake daemon running every %s seconds. Leave this terminal open.\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$interval"
@@ -313,12 +338,6 @@ case "$cmd" in
     ;;
   here|.)
     start_here "$@"
-    ;;
-  google-ads|ads)
-    start_peer "google-ads-codex" "$GOOGLE_ADS_REPO" "$@"
-    ;;
-  ccr|ccr-website)
-    start_peer "ccr-codex" "$CCR_WEBSITE_REPO" "$@"
     ;;
   start)
     [ "$#" -ge 2 ] || die "usage: codex-peer start <peer-name> <repo-path> [-- extra codex args]"

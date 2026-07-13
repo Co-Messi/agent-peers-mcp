@@ -85,6 +85,7 @@ export class CodexAppServerWsClient implements AppServerClient {
       clientInfo: { name: "agent-peers-wake-daemon", version: "0.1.0" },
       capabilities: {},
     });
+    this.notify("initialized");
   }
 
   async listLoadedThreads(): Promise<string[]> {
@@ -154,6 +155,13 @@ export class CodexAppServerWsClient implements AppServerClient {
     });
     this.ws.send(JSON.stringify(payload));
     return promise;
+  }
+
+  private notify(method: string, params?: unknown): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("app-server websocket is not open");
+    }
+    this.ws.send(JSON.stringify(params === undefined ? { method } : { method, params }));
   }
 
   private onMessage(data: unknown): void {

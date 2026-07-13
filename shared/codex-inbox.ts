@@ -29,11 +29,6 @@ interface CodexInboxState {
 // the daemon needs only message identity, recipient identity, and arrival time.
 export interface CodexInboxMessageMetadata {
   id: number;
-  from_id: string;
-  from_name: string;
-  from_peer_type: string;
-  from_cwd: string;
-  from_summary: string;
   to_id: string;
   sent_at: string;
 }
@@ -378,11 +373,6 @@ export class CodexInboxStore {
 function metadataForMessages(messages: LeasedMessage[]): CodexInboxMessageMetadata[] {
   return messages.map((message) => ({
     id: message.id,
-    from_id: message.from_id,
-    from_name: message.from_name,
-    from_peer_type: message.from_peer_type,
-    from_cwd: message.from_cwd,
-    from_summary: message.from_summary,
     to_id: message.to_id,
     sent_at: message.sent_at,
   }));

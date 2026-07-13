@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { ThreadStatus } from "../shared/app-server-client.ts";
 
 import {
   buildCodexResumeArgs,
@@ -7,6 +8,8 @@ import {
   buildWakeableEnv,
   isEmptyRolloutRaceError,
   parseWakeableLauncherArgs,
+  waitForReadyz,
+  waitForThreadIdle,
 } from "../shared/wakeable-launcher.ts";
 
 test("parseWakeableLauncherArgs parses launcher flags and passthrough args", () => {
@@ -123,4 +126,36 @@ test("isEmptyRolloutRaceError matches only the transient app-server empty rollou
   ))).toBe(true);
   expect(isEmptyRolloutRaceError(new Error("thread-store internal error: permission denied"))).toBe(false);
   expect(isEmptyRolloutRaceError("rollout at /tmp/rollout.jsonl is empty")).toBe(false);
+});
+
+test("waitForReadyz aborts a probe whose server never responds", async () => {
+  const server = Bun.serve({
+    port: 0,
+    async fetch() {
+      await new Promise(() => {});
+      return new Response("never");
+    },
+  });
+  try {
+    const started = Date.now();
+    await expect(waitForReadyz(server.port!, { timeoutMs: 180, probeTimeoutMs: 40 })).rejects.toThrow(/ready/);
+    expect(Date.now() - started).toBeLessThan(1_000);
+  } finally {
+    server.stop(true);
+  }
+});
+
+test("waitForThreadIdle does not resume while the materialization turn is active", async () => {
+  const statuses: ThreadStatus[] = [
+    { type: "active", activeFlags: [] },
+    { type: "idle" },
+  ];
+  let reads = 0;
+  const thread = await waitForThreadIdle({
+    async readThread(threadId: string) {
+      return { id: threadId, cwd: "/repo", path: "/rollout", status: statuses[Math.min(reads++, 1)]! };
+    },
+  }, "thread-1", { timeoutMs: 500, pollIntervalMs: 1, sleep: async () => {} });
+  expect(thread.status.type).toBe("idle");
+  expect(reads).toBe(2);
 });

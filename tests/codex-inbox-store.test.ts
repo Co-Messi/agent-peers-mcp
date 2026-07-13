@@ -75,6 +75,22 @@ test("CodexInboxStore persists unread messages across restart", async () => {
   expect(unread.map((msg) => msg.id)).toEqual([7, 8]);
 });
 
+test("CodexInboxStore init rebuilds missing wake metadata from durable unread mail", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+  const peerId = "peer-repair-meta";
+  const first = new CodexInboxStore({ peerId, rootDir: dir });
+  await first.init();
+  await first.queueLeasedMessages([message(17)]);
+  const metadataPath = join(dir, `${encodeURIComponent(peerId)}.metadata.json`);
+  await rm(metadataPath);
+
+  const restarted = new CodexInboxStore({ peerId, rootDir: dir });
+  await restarted.init();
+  const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as { unread: Array<{ id: number }> };
+  expect(metadata.unread.map((item) => item.id)).toEqual([17]);
+});
+
 test("CodexInboxStore reset clears persisted unread messages", async () => {
   const store = await makeStore();
 
@@ -139,6 +155,8 @@ test("CodexInboxStore writes adjacent bodyless metadata without message bodies o
   expect(parsed.unread[0]?.id).toBe(1);
   expect(parsed.unread[0]).not.toHaveProperty("text");
   expect(parsed.unread[0]).not.toHaveProperty("lease_token");
+  expect(parsed.unread[0]).not.toHaveProperty("from_cwd");
+  expect(parsed.unread[0]).not.toHaveProperty("from_summary");
 });
 
 test("CodexInboxStore metadata updates do not remove authoritative queued messages", async () => {

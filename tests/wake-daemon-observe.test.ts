@@ -48,11 +48,6 @@ async function writeMetadata(rootDir: string): Promise<void> {
   const value: CodexInboxMetadataState = {
     unread: [{
       id: 10,
-      from_id: "sender",
-      from_name: "sender-peer",
-      from_peer_type: "claude",
-      from_cwd: "/other",
-      from_summary: "working elsewhere",
       to_id: "peer-1",
       sent_at: "2026-06-22T00:00:00.000Z",
     }],
@@ -89,6 +84,7 @@ test("systemError is logged once with a bounce hint, then backed off without re-
     rootDir,
     registry: { list: async () => [entry()] },
     appServerClientFactory: () => client,
+    minWakeIntervalMs: 0,
     now: () => new Date(nowMs),
   };
 
@@ -127,6 +123,7 @@ test("a recovered systemError peer is woken and its observation state resets", a
     rootDir,
     registry: { list: async () => [entry()] },
     appServerClientFactory: () => client,
+    minWakeIntervalMs: 0,
     now: () => new Date(nowMs),
   };
 

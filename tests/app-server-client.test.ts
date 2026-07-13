@@ -39,3 +39,29 @@ test("connect rejects fast when nothing is listening", async () => {
   expect(Date.now() - start).toBeLessThan(2_000);
   client.close();
 });
+
+test("connect completes the initialize handshake before thread requests", async () => {
+  const seen: string[] = [];
+  const server = Bun.serve({
+    port: 0,
+    fetch(req, srv) {
+      if (srv.upgrade(req)) return undefined;
+      return new Response("not a websocket", { status: 400 });
+    },
+    websocket: {
+      open() {},
+      message(ws, raw) {
+        const message = JSON.parse(String(raw)) as { id?: number; method: string };
+        seen.push(message.method);
+        if (message.method === "initialize") ws.send(JSON.stringify({ id: message.id, result: {} }));
+        if (message.method === "thread/loaded/list") ws.send(JSON.stringify({ id: message.id, result: { data: [] } }));
+      },
+    },
+  });
+  stoppers.push(() => server.stop(true));
+
+  const client = new CodexAppServerWsClient(`ws://127.0.0.1:${server.port}`);
+  await client.listLoadedThreads();
+  expect(seen).toEqual(["initialize", "initialized", "thread/loaded/list"]);
+  client.close();
+});

@@ -2,7 +2,7 @@
 
 The wake daemon is the background loop that lets idle, app-server-backed Codex
 peers be *woken* when another peer sends them a message. Each launch
-(`codexpeer`, `adspeer`, `ccrpeer`, `codex-peer start …`) auto-starts it; you can
+(`codex-peer` or `codex-peer start …`) auto-starts it; you can
 also run it in the foreground with `peerwake` (`codex-peer daemon`).
 
 - **Engine:** `shared/wake-daemon.ts` (`runWakePass`) — one bodyless pass.
@@ -20,7 +20,7 @@ thread status from its app-server and acts on it:
 
 | Thread state | What the daemon does |
 |---|---|
-| `idle` | Eligible to wake. The **wake ledger** fires one nudge, then backs off re-waking the *same* unread set on a `5m → 30m → 2h` schedule and abandons after the cap (the message still surfaces on the peer's next turn). |
+| `idle` | Eligible to wake. A per-peer 30-second budget coalesces newly arriving mail; the **wake ledger** fires one nudge, then backs off re-waking the *same* unread set on a `5m → 30m → 2h` schedule and abandons after the cap. |
 | `active` / `waitingOnApproval` / `waitingOnUserInput` | Peer's user is mid-turn — **not** woken. Polled every pass so delivery happens the instant it goes idle; the repeated log lines are coalesced. |
 | `systemError` | Thread is **wedged** (a failed/crashed turn). It can't be woken until bounced. Re-checked on an escalating `5m → 30m → 2h` backoff instead of every pass, and logged once with a bounce hint. |
 
@@ -29,8 +29,8 @@ thread status from its app-server and acts on it:
 Lines are timestamped (UTC ISO-8601):
 
 ```
-2026-06-22T21:15:03.124Z wake: nudged google-ads-codex (79eea704…) thread=019ee815…
-2026-06-22T21:20:40.880Z wake: skipped Brixton (4a12af35…) thread=019ee81d… (thread_system_error) — peer thread hit a system error (likely a failed/crashed turn) and can't be woken until bounced — close the TUI and relaunch `codexpeer` in /Users/mike/www/trophy-shopify-theme
+2026-06-22T21:15:03.124Z wake: nudged api-codex (79eea704…) thread=019ee815…
+2026-06-22T21:20:40.880Z wake: skipped web-codex (4a12af35…) thread=019ee81d… (thread_system_error) — close the TUI and relaunch `codex-peer` in ~/code/web-app
 ```
 
 The daemon **coalesces** repeated skips: a state is logged once when it starts
@@ -50,6 +50,7 @@ it: close that peer's TUI and relaunch it (`codexpeer` in the printed `cwd`).
 | Variable | Default | Meaning |
 |---|---|---|
 | `CODEX_PEER_DAEMON_INTERVAL` | `5` | Seconds between passes. |
+| `CODEX_PEER_MIN_WAKE_INTERVAL_MS` | `30000` | Minimum milliseconds between model-starting wakes for one peer, even when new messages change the unread signature. |
 | `CODEX_PEER_DAEMON_LOG_MAX_BYTES` | `5242880` (5 MiB) | Live log is copy-truncated to `wake-daemon.log.1`, `.2`, … once it reaches this size. |
 | `CODEX_PEER_DAEMON_LOG_KEEP` | `3` | Number of rotated log files to keep. |
 | `AGENT_PEERS_CODEX_STATE_DIR` | `~/.agent-peers-codex` | Root for the log, registry, and daemon state. |

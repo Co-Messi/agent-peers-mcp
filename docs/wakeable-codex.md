@@ -66,17 +66,18 @@ Codex. The wake only causes a turn; it never *is* the message.
 
 ## Security model
 
-- **Bodyless wake.** The daemon reads only envelope metadata (sender id/name/type,
-  recipient id, timestamp, summary) — never the message body and never a lease
+- **Bodyless wake.** The daemon reads only the message id, recipient id, and
+  timestamp — never sender metadata, the message body, or a lease
   token. The body lives only in the broker DB and is delivered only through
   `check_messages`.
-- **Fail-closed file perms.** Inbox, metadata, registry, claim, and ledger files
-  are written 0o600 in a 0o700 dir, with the mode re-applied defensively. On read,
-  files that are not a regular file, owned by another uid, or wider than 0o600 are
-  refused (empty state returned) so a local attacker can't spoof peer identities or
-  read bodies through these files.
-- **Local-only.** The app-server listens on `127.0.0.1`; the broker is local with a
-  per-user 0o600 shared secret. No network surface is added.
+- **Owner-only local state.** Inbox, metadata, registry, claim, and ledger files
+  are written 0o600 inside a 0o700 directory. Security-sensitive inbox and
+  registry reads validate type, owner, and mode; shared mutations are serialized
+  with owner-only interprocess locks.
+- **Loopback-only, same-user trust.** The app-server listens on `127.0.0.1`; the
+  broker is local with a per-user 0o600 shared secret. This adds a loopback
+  WebSocket but no non-loopback listener. It is not a hostile same-user sandbox:
+  another process running as the same OS user remains inside the trust boundary.
 - **Same-thread targeting is validated before every wake.** The daemon re-reads the
   thread and refuses to nudge unless `thread_id`, `cwd`, and (when known) the
   rollout path all match the registry, and the thread status is `idle`. Mismatches,
@@ -93,8 +94,9 @@ Codex. The wake only causes a turn; it never *is* the message.
   turns are stateless and resend the full context; the prompt cache is cold after
   minutes. So per-wake cost grows with session age. This is inherent to the
   "same live instance" guarantee.
-- **Re-waking the same unread set is throttled.** See backoff/cap below. A brand-new
-  message is a different signature and always wakes immediately.
+- **Wake cost is bounded per peer and per unread set.** New messages coalesce
+  behind a 30-second per-peer minimum interval. Re-waking the same unread set
+  also follows the longer backoff/cap below.
 
 ## Reliability & failure modes
 
@@ -104,7 +106,8 @@ Codex. The wake only causes a turn; it never *is* the message.
   still surfaces on the session's next tool call / user turn. This bounds the
   worst-case token cost of a stuck inbox to a handful of turns spread over hours,
   and removes the routine "one redundant wake" on the happy path. A new message
-  (different signature) bypasses the backoff and wakes immediately. An **active**
+  bypasses the per-signature backoff but still respects the per-peer 30-second
+  budget. An **active**
   (deeply-thinking) thread is skipped before the ledger is touched, so long turns
   never burn attempts and are never abandoned mid-thought.
 - **Bounded app-server I/O.** Connect and every JSON-RPC request are timeout-bounded
@@ -155,6 +158,7 @@ Relevant environment variables:
 |---|---|---|
 | `AGENT_PEERS_CODEX_STATE_DIR` | `~/.agent-peers-codex` | Inbox + wake registry/daemon state dir |
 | `CODEX_PEER_DAEMON_INTERVAL` | `5` | Background daemon poll interval (seconds) |
+| `CODEX_PEER_MIN_WAKE_INTERVAL_MS` | `30000` | Minimum time between model-starting wakes for one peer, across all unread signatures |
 | `CODEX_PEER_DAEMON_LOG_MAX_BYTES` | `5242880` | Size at which `wake-daemon.log` is rotated (copy-truncate) |
 | `CODEX_PEER_DAEMON_LOG_KEEP` | `3` | Number of rotated wake-daemon logs to keep |
 

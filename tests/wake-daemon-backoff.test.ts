@@ -48,11 +48,6 @@ async function writeMetadata(rootDir: string): Promise<void> {
   const value: CodexInboxMetadataState = {
     unread: [{
       id: 10,
-      from_id: "sender",
-      from_name: "sender-peer",
-      from_peer_type: "claude",
-      from_cwd: "/other",
-      from_summary: "working elsewhere",
       to_id: "peer-1",
       sent_at: "2026-06-18T00:00:00.000Z",
     }],
@@ -83,6 +78,7 @@ test("runWakePass backs off, re-wakes the same unread set on schedule, then aban
     rootDir,
     registry: { list: async () => [entry()] },
     appServerClientFactory: () => client,
+    minWakeIntervalMs: 0,
     backoffScheduleMs: [1_000, 2_000], // => 3 total attempts (initial + 2 retries)
     now: () => new Date(nowMs),
   };

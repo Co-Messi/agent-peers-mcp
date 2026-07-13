@@ -7,6 +7,7 @@ import { homedir, platform } from "node:os";
 import { join } from "node:path";
 
 import { CodexAppServerWsClient, type AppServerClient, type AppServerThread } from "./app-server-client.ts";
+import { withInterprocessFileLock } from "./file-lock.ts";
 import { WakeRegistry, type WakeRegistryEntry } from "./wake-registry.ts";
 import { WakeLaunchClaimStore } from "./wake-launch-claims.ts";
 import type { CodexInboxMetadataState } from "./codex-inbox.ts";
@@ -44,6 +45,9 @@ export interface WakeDaemonOptions {
   ledgerTtlMs?: number;
   // Dead registry rows older than this (since last_seen_at) are pruned.
   deadGraceMs?: number;
+  // Hard per-peer budget across all unread signatures. New messages coalesce
+  // during this interval instead of creating an unbounded sequence of turns.
+  minWakeIntervalMs?: number;
   now?: () => Date;
   registry?: Pick<WakeRegistry, "list"> & Partial<Pick<WakeRegistry, "prune">>;
   appServerClientFactory?: (entry: WakeRegistryEntry) => AppServerClient;
@@ -65,6 +69,14 @@ const IS_POSIX = platform() !== "win32";
 const DEFAULT_BACKOFF_SCHEDULE_MS = [5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
 const DEFAULT_LEDGER_TTL_MS = 24 * 60 * 60_000;
 const DEFAULT_DEAD_GRACE_MS = 30 * 60_000;
+const DEFAULT_MIN_WAKE_INTERVAL_MS = 30_000;
+
+function configuredMinWakeIntervalMs(): number {
+  const raw = process.env.CODEX_PEER_MIN_WAKE_INTERVAL_MS;
+  if (!raw) return DEFAULT_MIN_WAKE_INTERVAL_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : DEFAULT_MIN_WAKE_INTERVAL_MS;
+}
 
 // Skip reasons that mean the peer's thread is genuinely WEDGED (not just busy):
 // it has hit a system-level error and cannot be woken until a human bounces it.
@@ -102,6 +114,11 @@ export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeRes
     now: opts.now,
   });
   const observe = new WakeObservationLog({ rootDir, now: opts.now });
+  const wakeRate = new WakeRateLimiter({
+    rootDir,
+    minIntervalMs: opts.minWakeIntervalMs ?? configuredMinWakeIntervalMs(),
+    now: opts.now,
+  });
   const metadataByPeer = new Map((await readAllInboxMetadata(rootDir)).map((item) => [item.peerId, item.metadata]));
   const entries = await registry.list();
   const results: WakeResult[] = [];
@@ -152,8 +169,15 @@ export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeRes
         continue;
       }
 
+      const rateClaim = await wakeRate.claim(entry.peer_id);
+      if (!rateClaim.claimed) {
+        results.push(await annotatedSkip(entry, "peer_wake_rate_limited"));
+        continue;
+      }
+
       const claim = await ledger.claim(signature);
       if (!claim.claimed) {
+        await wakeRate.release(entry.peer_id, rateClaim);
         results.push(await annotatedSkip(entry, claim.reason ?? "duplicate_or_cooldown"));
         continue;
       }
@@ -202,6 +226,9 @@ export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeRes
   } catch { /* best effort */ }
   try {
     await observe.prune(opts.ledgerTtlMs ?? DEFAULT_LEDGER_TTL_MS);
+  } catch { /* best effort */ }
+  try {
+    await wakeRate.prune(opts.ledgerTtlMs ?? DEFAULT_LEDGER_TTL_MS);
   } catch { /* best effort */ }
   try {
     if (registry && "prune" in registry && typeof registry.prune === "function") {
@@ -298,41 +325,46 @@ class WakeLedger {
   async claim(signature: string): Promise<{ claimed: boolean; reason?: string }> {
     await this.ensureDir();
     const path = this.pathFor(signature);
-    const existing = await this.read(path);
+    return withInterprocessFileLock(`${path}.lock`, async () => {
+      const existing = await this.read(path);
 
-    if (!existing) {
-      await this.write(path, { signature, status: "claimed", attempts: 1, updated_at: this.now().toISOString() });
-      return { claimed: true };
-    }
+      if (!existing) {
+        await this.write(path, { signature, status: "claimed", attempts: 1, updated_at: this.now().toISOString() });
+        return { claimed: true };
+      }
 
-    const attempts = Number.isFinite(existing.attempts) && existing.attempts > 0 ? existing.attempts : 1;
-    if (attempts >= this.maxAttempts) {
+      const attempts = Number.isFinite(existing.attempts) && existing.attempts > 0 ? existing.attempts : 1;
+      if (attempts >= this.maxAttempts) {
       // Permanently stop proactive nudges for this exact unread set. The
       // message itself is NOT dropped — it stays in the durable inbox and is
       // still delivered on the session's next agent-peers tool call or user
       // turn. We just stop spending a full-context turn re-poking an unread
       // set the model has already been shown maxAttempts times.
-      if (existing.status !== "abandoned") {
-        await this.write(path, { ...existing, status: "abandoned", attempts, updated_at: this.now().toISOString() });
+        if (existing.status !== "abandoned") {
+          await this.write(path, { ...existing, status: "abandoned", attempts, updated_at: this.now().toISOString() });
+        }
+        return { claimed: false, reason: "max_attempts" };
       }
-      return { claimed: false, reason: "max_attempts" };
-    }
 
-    const requiredDelayMs = this.schedule[attempts - 1] ?? this.lastDelayMs;
-    const elapsed = this.now().getTime() - Date.parse(existing.updated_at);
-    if (!Number.isFinite(elapsed) || elapsed < requiredDelayMs) {
-      return { claimed: false, reason: "duplicate_or_cooldown" };
-    }
+      const requiredDelayMs = this.schedule[attempts - 1] ?? this.lastDelayMs;
+      const elapsed = this.now().getTime() - Date.parse(existing.updated_at);
+      if (!Number.isFinite(elapsed) || elapsed < requiredDelayMs) {
+        return { claimed: false, reason: "duplicate_or_cooldown" };
+      }
 
-    await this.write(path, { signature, status: "claimed", attempts: attempts + 1, updated_at: this.now().toISOString() });
-    return { claimed: true };
+      await this.write(path, { signature, status: "claimed", attempts: attempts + 1, updated_at: this.now().toISOString() });
+      return { claimed: true };
+    });
   }
 
   async mark(signature: string, status: WakeLedgerStatus, error?: string): Promise<void> {
     const path = this.pathFor(signature);
-    const existing = await this.read(path);
-    const attempts = existing && Number.isFinite(existing.attempts) && existing.attempts > 0 ? existing.attempts : 1;
-    await this.write(path, { signature, status, attempts, error, updated_at: this.now().toISOString() });
+    await this.ensureDir();
+    await withInterprocessFileLock(`${path}.lock`, async () => {
+      const existing = await this.read(path);
+      const attempts = existing && Number.isFinite(existing.attempts) && existing.attempts > 0 ? existing.attempts : 1;
+      await this.write(path, { signature, status, attempts, error, updated_at: this.now().toISOString() });
+    });
   }
 
   async prune(): Promise<void> {
@@ -348,11 +380,13 @@ class WakeLedger {
         .filter((name) => name.endsWith(".json"))
         .map(async (name) => {
           const path = join(this.dir, name);
-          const record = await this.read(path);
-          const ts = record ? Date.parse(record.updated_at) : Number.NaN;
-          if (!Number.isFinite(ts) || ts < cutoff) {
-            try { await unlink(path); } catch { /* already gone */ }
-          }
+          await withInterprocessFileLock(`${path}.lock`, async () => {
+            const record = await this.read(path);
+            const ts = record ? Date.parse(record.updated_at) : Number.NaN;
+            if (!Number.isFinite(ts) || ts < cutoff) {
+              try { await unlink(path); } catch { /* already gone */ }
+            }
+          });
         }),
     );
   }
@@ -377,7 +411,7 @@ class WakeLedger {
 
   private async write(path: string, value: WakeLedgerRecord): Promise<void> {
     await this.ensureDir();
-    const tempPath = `${path}.${process.pid}.tmp`;
+    const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE });
     if (IS_POSIX) {
       try { await chmod(tempPath, FILE_MODE); } catch { /* best effort */ }
@@ -388,6 +422,97 @@ class WakeLedger {
   private pathFor(signature: string): string {
     const hash = createHash("sha256").update(signature, "utf8").digest("hex");
     return join(this.dir, `${hash}.json`);
+  }
+}
+
+interface WakeRateRecord {
+  peer_id: string;
+  last_wake_at: string;
+  reservation: string;
+}
+
+interface WakeRateClaim {
+  claimed: boolean;
+  reservation?: string;
+  previous?: WakeRateRecord | null;
+}
+
+class WakeRateLimiter {
+  private readonly dir: string;
+  private readonly minIntervalMs: number;
+  private readonly now: () => Date;
+
+  constructor(opts: { rootDir: string; minIntervalMs: number; now?: () => Date }) {
+    this.dir = join(opts.rootDir, "wake-rate");
+    this.minIntervalMs = Math.max(0, opts.minIntervalMs);
+    this.now = opts.now ?? (() => new Date());
+  }
+
+  async claim(peerId: string): Promise<WakeRateClaim> {
+    await this.ensureDir();
+    const path = this.pathFor(peerId);
+    return withInterprocessFileLock(`${path}.lock`, async () => {
+      const previous = await this.read(path);
+      const elapsed = previous ? this.now().getTime() - Date.parse(previous.last_wake_at) : Number.POSITIVE_INFINITY;
+      if (Number.isFinite(elapsed) && elapsed < this.minIntervalMs) return { claimed: false };
+      const reservation = randomUUID();
+      await this.write(path, { peer_id: peerId, last_wake_at: this.now().toISOString(), reservation });
+      return { claimed: true, reservation, previous };
+    });
+  }
+
+  async release(peerId: string, claim: WakeRateClaim): Promise<void> {
+    if (!claim.claimed || !claim.reservation) return;
+    const path = this.pathFor(peerId);
+    await withInterprocessFileLock(`${path}.lock`, async () => {
+      const current = await this.read(path);
+      if (current?.reservation !== claim.reservation) return;
+      if (claim.previous) await this.write(path, claim.previous);
+      else {
+        try { await unlink(path); } catch { /* already removed */ }
+      }
+    });
+  }
+
+  async prune(ttlMs: number): Promise<void> {
+    let names: string[];
+    try { names = await readdir(this.dir); } catch { return; }
+    const cutoff = this.now().getTime() - ttlMs;
+    await Promise.all(names.filter((name) => name.endsWith(".json")).map(async (name) => {
+      const path = join(this.dir, name);
+      await withInterprocessFileLock(`${path}.lock`, async () => {
+        const record = await this.read(path);
+        const timestamp = record ? Date.parse(record.last_wake_at) : Number.NaN;
+        if (!Number.isFinite(timestamp) || timestamp < cutoff) {
+          try { await unlink(path); } catch { /* already removed */ }
+        }
+      });
+    }));
+  }
+
+  private async ensureDir(): Promise<void> {
+    await mkdir(this.dir, { recursive: true, mode: DIR_MODE });
+    if (IS_POSIX) await chmod(this.dir, DIR_MODE);
+  }
+
+  private async read(path: string): Promise<WakeRateRecord | null> {
+    try {
+      const parsed = JSON.parse(await readFile(path, "utf8")) as WakeRateRecord;
+      return parsed && typeof parsed.last_wake_at === "string" && typeof parsed.reservation === "string" ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async write(path: string, value: WakeRateRecord): Promise<void> {
+    const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE });
+    if (IS_POSIX) await chmod(tempPath, FILE_MODE);
+    await rename(tempPath, path);
+  }
+
+  private pathFor(peerId: string): string {
+    return join(this.dir, `${createHash("sha256").update(peerId, "utf8").digest("hex")}.json`);
   }
 }
 

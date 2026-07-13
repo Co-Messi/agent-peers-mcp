@@ -1,12 +1,13 @@
 // shared/wake-registry.ts
 // Durable registry for Codex sessions launched in wakeable app-server mode.
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { access, chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 
 import type { PeerId, PeerName } from "./types.ts";
+import { withInterprocessFileLock } from "./file-lock.ts";
 
 export type WakeRegistryStatus = "starting" | "ready" | "stale";
 
@@ -54,7 +55,7 @@ async function atomicWriteJson<T>(path: string, value: T): Promise<void> {
     try { await chmod(dir, DIR_MODE); } catch { /* best effort */ }
   }
 
-  const tempPath = `${path}.tmp`;
+  const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE });
   if (IS_POSIX) {
     try { await chmod(tempPath, FILE_MODE); } catch { /* best effort */ }
@@ -106,12 +107,14 @@ export class WakeRegistry {
 
   async init(): Promise<void> {
     await this.withLock(async () => {
+      await this.ensureDir();
       this.state = await this.readStateFromDisk();
     });
   }
 
   async list(opts: { includeStale?: boolean } = {}): Promise<WakeRegistryEntry[]> {
     return this.withLock(async () => {
+      this.state = await this.readStateFromDisk();
       const entries: WakeRegistryEntry[] = [];
       for (const entry of this.state.entries) {
         const live = await this.isLive(entry);
@@ -123,24 +126,31 @@ export class WakeRegistry {
 
   async upsert(entry: WakeRegistryEntry): Promise<void> {
     await this.withLock(async () => {
-      const nextEntries = this.state.entries
-        .filter((existing) => existing.peer_id !== entry.peer_id && existing.thread_id !== entry.thread_id)
-        .map(cloneEntry);
-      nextEntries.push(cloneEntry(entry));
-      const nextState = { entries: nextEntries.sort((a, b) => a.peer_id.localeCompare(b.peer_id)) };
-      await this.persistState(this.filePath, nextState);
-      this.state = nextState;
+      await this.withDiskLock(async () => {
+        const current = await this.readStateFromDisk();
+        const nextEntries = current.entries
+          .filter((existing) => existing.peer_id !== entry.peer_id && existing.thread_id !== entry.thread_id)
+          .map(cloneEntry);
+        nextEntries.push(cloneEntry(entry));
+        const nextState = { entries: nextEntries.sort((a, b) => a.peer_id.localeCompare(b.peer_id)) };
+        await this.persistState(this.filePath, nextState);
+        this.state = nextState;
+      });
     });
   }
 
   async removeByPeerId(peerId: PeerId): Promise<void> {
     await this.withLock(async () => {
-      const nextState = {
-        entries: this.state.entries.filter((entry) => entry.peer_id !== peerId),
-      };
-      if (nextState.entries.length === this.state.entries.length) return;
-      await this.persistState(this.filePath, nextState);
-      this.state = nextState;
+      await this.withDiskLock(async () => {
+        const current = await this.readStateFromDisk();
+        const nextState = { entries: current.entries.filter((entry) => entry.peer_id !== peerId) };
+        if (nextState.entries.length === current.entries.length) {
+          this.state = current;
+          return;
+        }
+        await this.persistState(this.filePath, nextState);
+        this.state = nextState;
+      });
     });
   }
 
@@ -152,27 +162,34 @@ export class WakeRegistry {
   async prune(opts: { deadGraceMs: number; now?: () => Date } = { deadGraceMs: 30 * 60_000 }): Promise<number> {
     const nowMs = (opts.now ?? (() => new Date()))().getTime();
     return this.withLock(async () => {
-      const kept: WakeRegistryEntry[] = [];
-      for (const entry of this.state.entries) {
-        if (await this.isLive(entry)) {
-          kept.push(entry);
-          continue;
+      return this.withDiskLock(async () => {
+        const current = await this.readStateFromDisk();
+        const kept: WakeRegistryEntry[] = [];
+        for (const entry of current.entries) {
+          if (await this.isLive(entry)) {
+            kept.push(entry);
+            continue;
+          }
+          const lastSeen = Date.parse(entry.last_seen_at);
+          const ageMs = Number.isFinite(lastSeen) ? nowMs - lastSeen : Number.POSITIVE_INFINITY;
+          if (ageMs <= opts.deadGraceMs) kept.push(entry);
         }
-        const lastSeen = Date.parse(entry.last_seen_at);
-        const ageMs = Number.isFinite(lastSeen) ? nowMs - lastSeen : Number.POSITIVE_INFINITY;
-        if (ageMs <= opts.deadGraceMs) kept.push(entry);
-      }
-      const removed = this.state.entries.length - kept.length;
-      if (removed === 0) return 0;
-      const nextState = { entries: kept.map(cloneEntry) };
-      await this.persistState(this.filePath, nextState);
-      this.state = nextState;
-      return removed;
+        const removed = current.entries.length - kept.length;
+        if (removed === 0) {
+          this.state = current;
+          return 0;
+        }
+        const nextState = { entries: kept.map(cloneEntry) };
+        await this.persistState(this.filePath, nextState);
+        this.state = nextState;
+        return removed;
+      });
     });
   }
 
   async getByPeerId(peerId: PeerId): Promise<WakeRegistryEntry | null> {
     return this.withLock(async () => {
+      this.state = await this.readStateFromDisk();
       const entry = this.state.entries.find((candidate) => candidate.peer_id === peerId);
       return entry ? cloneEntry(entry) : null;
     });
@@ -180,13 +197,16 @@ export class WakeRegistry {
 
   async markSeen(peerId: PeerId, at = new Date().toISOString()): Promise<void> {
     await this.withLock(async () => {
-      const nextEntries = this.state.entries.map((entry) =>
-        entry.peer_id === peerId
-          ? { ...entry, last_seen_at: at, updated_at: at, status: "ready" as const }
-          : cloneEntry(entry)
-      );
-      await this.persistState(this.filePath, { entries: nextEntries });
-      this.state = { entries: nextEntries };
+      await this.withDiskLock(async () => {
+        const current = await this.readStateFromDisk();
+        const nextEntries = current.entries.map((entry) =>
+          entry.peer_id === peerId
+            ? { ...entry, last_seen_at: at, updated_at: at, status: "ready" as const }
+            : cloneEntry(entry)
+        );
+        await this.persistState(this.filePath, { entries: nextEntries });
+        this.state = { entries: nextEntries };
+      });
     });
   }
 
@@ -215,6 +235,17 @@ export class WakeRegistry {
     } catch {
       return { entries: [] };
     }
+  }
+
+  private async ensureDir(): Promise<void> {
+    const dir = dirname(this.filePath);
+    await mkdir(dir, { recursive: true, mode: DIR_MODE });
+    if (IS_POSIX) await chmod(dir, DIR_MODE);
+  }
+
+  private async withDiskLock<T>(fn: () => Promise<T>): Promise<T> {
+    await this.ensureDir();
+    return withInterprocessFileLock(`${this.filePath}.lock`, fn);
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {

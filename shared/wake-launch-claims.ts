@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
+import { withInterprocessFileLock } from "./file-lock.ts";
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -47,7 +48,7 @@ async function ensurePrivateDir(path: string): Promise<void> {
 }
 
 async function atomicWriteJson(path: string, value: unknown): Promise<void> {
-  const tempPath = `${path}.tmp`;
+  const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(tempPath, JSON.stringify(value, null, 2), { encoding: "utf8", mode: FILE_MODE });
   if (IS_POSIX) {
     try { await chmod(tempPath, FILE_MODE); } catch { /* best effort */ }
@@ -121,6 +122,8 @@ export class WakeLaunchClaimStore {
 
   async update(claimId: string, patch: Partial<Omit<WakeLaunchClaim, "claim_id" | "created_at">>): Promise<WakeLaunchClaim | null> {
     await ensurePrivateDir(this.dir);
+    const path = this.pathFor(claimId);
+    return withInterprocessFileLock(`${path}.lock`, async () => {
     const existing = await this.read(claimId);
     if (!existing) return null;
     const next: WakeLaunchClaim = {
@@ -128,8 +131,9 @@ export class WakeLaunchClaimStore {
       ...patch,
       updated_at: new Date().toISOString(),
     };
-    await atomicWriteJson(this.pathFor(claimId), next);
+    await atomicWriteJson(path, next);
     return next;
+    });
   }
 
   async findMatching(opts: {
@@ -204,7 +208,11 @@ export class WakeLaunchClaimStore {
   }
 
   async remove(claimId: string): Promise<void> {
-    try { await unlink(this.pathFor(claimId)); } catch { /* already gone */ }
+    await ensurePrivateDir(this.dir);
+    const path = this.pathFor(claimId);
+    await withInterprocessFileLock(`${path}.lock`, async () => {
+      try { await unlink(path); } catch { /* already gone */ }
+    });
   }
 
   // Garbage-collect claim files that are neither live nor recent. A claim is

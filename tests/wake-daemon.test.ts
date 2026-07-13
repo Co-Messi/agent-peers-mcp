@@ -49,11 +49,6 @@ function metadata(overrides: Partial<CodexInboxMetadataState> = {}): CodexInboxM
   return {
     unread: [{
       id: 10,
-      from_id: "sender",
-      from_name: "sender-peer",
-      from_peer_type: "claude",
-      from_cwd: "/other",
-      from_summary: "working elsewhere",
       to_id: "peer-1",
       sent_at: "2026-06-18T00:00:00.000Z",
     }],
@@ -202,8 +197,33 @@ test("runWakePass duplicate signatures produce at most one nudge", async () => {
   const second = await runWakePass(opts);
 
   expect(first[0]?.action).toBe("wake");
-  expect(second[0]?.reason).toBe("duplicate_or_cooldown");
+  expect(["duplicate_or_cooldown", "peer_wake_rate_limited"]).toContain(second[0]?.reason ?? "");
   expect(client.startCalls).toHaveLength(1);
+});
+
+test("new unread signatures cannot bypass the per-peer wake budget", async () => {
+  const rootDir = await makeDir();
+  const metadataPath = await writeMetadata(rootDir);
+  const client = new MockClient(idleThread());
+  let now = Date.parse("2026-06-18T00:00:00.000Z");
+  const opts = {
+    rootDir,
+    registry: { list: async () => [entry()] },
+    appServerClientFactory: () => client,
+    minWakeIntervalMs: 30_000,
+    now: () => new Date(now),
+  };
+
+  expect((await runWakePass(opts))[0]?.action).toBe("wake");
+  await writeFile(metadataPath, JSON.stringify(metadata({
+    unread: [...metadata().unread, { ...metadata().unread[0]!, id: 11 }],
+  })), "utf8");
+  now += 1_000;
+  expect((await runWakePass(opts))[0]?.reason).toBe("peer_wake_rate_limited");
+  expect(client.startCalls).toHaveLength(1);
+  now += 30_000;
+  expect((await runWakePass(opts))[0]?.action).toBe("wake");
+  expect(client.startCalls).toHaveLength(2);
 });
 
 test("runWakePass failed wake leaves metadata untouched", async () => {

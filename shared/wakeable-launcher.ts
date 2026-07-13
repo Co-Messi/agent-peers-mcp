@@ -3,7 +3,7 @@
 
 import { createServer } from "node:net";
 
-import { CodexAppServerWsClient } from "./app-server-client.ts";
+import { CodexAppServerWsClient, type AppServerThread } from "./app-server-client.ts";
 import { WakeLaunchClaimStore } from "./wake-launch-claims.ts";
 import { getTty } from "./peer-context.ts";
 
@@ -180,7 +180,7 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
         wakeId: "wakeable-materialize",
         pendingSignature: "materialize",
       }));
-      thread = await retryEmptyRolloutRace(() => client.readThread(thread.id));
+      thread = await waitForThreadIdle(client, thread.id);
     }
     await claimStore.update(claim.claim_id, {
       thread_id: thread.id,
@@ -251,12 +251,18 @@ async function allocatePort(): Promise<number> {
   });
 }
 
-async function waitForReadyz(port: number): Promise<void> {
-  const deadline = Date.now() + 10_000;
+export async function waitForReadyz(
+  port: number,
+  opts: { timeoutMs?: number; probeTimeoutMs?: number } = {},
+): Promise<void> {
+  const timeoutMs = opts.timeoutMs ?? 10_000;
+  const probeTimeoutMs = opts.probeTimeoutMs ?? 1_000;
+  const deadline = Date.now() + timeoutMs;
   const url = `http://127.0.0.1:${port}/readyz`;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(url);
+      const remaining = Math.max(1, deadline - Date.now());
+      const res = await fetch(url, { signal: AbortSignal.timeout(Math.min(probeTimeoutMs, remaining)) });
       if (res.ok) return;
     } catch {
       /* keep polling */
@@ -264,6 +270,24 @@ async function waitForReadyz(port: number): Promise<void> {
     await Bun.sleep(100);
   }
   throw new Error(`app-server did not become ready at ${url}`);
+}
+
+export async function waitForThreadIdle(
+  client: Pick<CodexAppServerWsClient, "readThread">,
+  threadId: string,
+  opts: { timeoutMs?: number; pollIntervalMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<AppServerThread> {
+  const timeoutMs = opts.timeoutMs ?? 60_000;
+  const pollIntervalMs = opts.pollIntervalMs ?? 100;
+  const sleep = opts.sleep ?? Bun.sleep;
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const thread = await retryEmptyRolloutRace(() => client.readThread(threadId));
+    if (thread.status.type === "idle") return thread;
+    if (thread.status.type === "systemError") throw new Error(`materialization turn failed for thread ${threadId}`);
+    if (Date.now() >= deadline) throw new Error(`materialization turn did not become idle within ${timeoutMs}ms`);
+    await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - Date.now())));
+  }
 }
 
 function tomlString(value: string): string {

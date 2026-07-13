@@ -77,6 +77,21 @@ test("WakeRegistry upsert de-duplicates by peer id and thread id", async () => {
   expect(entries[0]?.thread_id).toBe("thread-2");
 });
 
+test("separate processes cannot lose concurrent registry updates", async () => {
+  const rootDir = await makeDir();
+  const first = new WakeRegistry({ rootDir });
+  const second = new WakeRegistry({ rootDir });
+  await Promise.all([first.init(), second.init()]);
+  await Promise.all([
+    first.upsert(entry({ peer_id: "peer-a", thread_id: "thread-a" })),
+    second.upsert(entry({ peer_id: "peer-b", thread_id: "thread-b" })),
+  ]);
+  const reloaded = new WakeRegistry({ rootDir });
+  await reloaded.init();
+  expect((await reloaded.list({ includeStale: true })).map((item) => item.peer_id).sort())
+    .toEqual(["peer-a", "peer-b"]);
+});
+
 test("WakeRegistry filters entries with stale pids", async () => {
   const rootDir = await makeDir();
   const registry = new WakeRegistry({ rootDir });

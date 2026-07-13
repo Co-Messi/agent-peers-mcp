@@ -418,7 +418,7 @@
       <div>
         <span class="tag green">Agent Peers Example</span>
         <h1>Wakeable Codex Peers, Without the Fog</h1>
-        <p class="lede">This page explains how a paused-looking Codex session can be nudged when a peer message arrives, why it needs a special launcher, and how to run the Google Ads Expert plus CCR Website demo.</p>
+        <p class="lede">This page explains how a paused-looking Codex session can be nudged when a peer message arrives, why it needs a special launcher, and how to run the API Service plus Web App demo.</p>
       </div>
       <aside class="truth-box">
         <strong>The honest version</strong>
@@ -455,7 +455,7 @@
             <span class="tag green">1. Peer Message</span>
             <h3>Another peer sends mail</h3>
           </div>
-          <p>Claude, Codex, or the shell CLI sends a message to <code>ccr-codex</code> or <code>google-ads-codex</code>.</p>
+          <p>Claude, Codex, or the shell CLI sends a message to <code>web-codex</code> or <code>api-codex</code>.</p>
         </div>
         <div class="connector" aria-hidden="true"></div>
         <div class="node blue">
@@ -519,7 +519,7 @@
         </thead>
         <tbody>
           <tr>
-            <td>Codex was started with <code>codexpeer</code>, <code>adspeer</code>, or <code>ccrpeer</code></td>
+            <td>Codex was started with <code>codex-peer</code>, <code>codex-peer start api-codex ~/code/api-service</code>, or <code>codex-peer start web-codex ~/code/web-app</code></td>
             <td>Wakeable, as long as the terminal is still alive and the wake daemon is running.</td>
           </tr>
           <tr>
@@ -540,39 +540,40 @@
 
     <section class="section">
       <h2>First-Time Setup</h2>
-      <p>The simple aliases are in <code>~/.zshrc</code>, next to your <code>opus</code> alias. Open a new Zed terminal, or run this once in an existing terminal:</p>
-      <pre><code>source ~/.zshrc</code></pre>
-      <p>Everyday use is simple: go to any repo and type <code>codexpeer</code>. That launches wakeable Codex in that repo <strong>and auto-starts the background wake daemon if it is not already running</strong> — you no longer need to run <code>peerwake</code> by hand. Check the daemon any time with <code>peerstatus</code> or <code>codexpeer daemon-status</code>, and stop it with <code>codexpeer daemon-stop</code>.</p>
-      <p>The underlying helper command is <code>codex-peer</code>. It lives in this repo at <code>/Users/mike/agent-peers-mcp/bin/codex-peer</code> and is also linked into <code>~/.local/bin</code>. If the link ever disappears, reinstall it with:</p>
-      <pre><code>cd /Users/mike/agent-peers-mcp
+      <p>Install the helper once, then open a new terminal:</p>
+      <pre><code>cd /path/to/agent-peers-mcp
+bin/codex-peer install</code></pre>
+      <p>Everyday use is simple: go to any repo and type <code>codex-peer</code>. That launches wakeable Codex in that repo <strong>and auto-starts the background wake daemon if it is not already running</strong> — you no longer need to run <code>codex-peer daemon</code> by hand. Check the daemon any time with <code>codex-peer live</code> or <code>codex-peer daemon-status</code>, and stop it with <code>codex-peer daemon-stop</code>.</p>
+      <p>The underlying helper command is <code>codex-peer</code>. It lives at <code>bin/codex-peer</code> and is linked into <code>~/.local/bin</code>. If the link disappears, reinstall it with:</p>
+      <pre><code>cd /path/to/agent-peers-mcp
 bin/codex-peer install</code></pre>
     </section>
 
     <section class="section">
-      <h2>Demo: Google Ads Expert Talks To CCR Website</h2>
+      <h2>Demo: Two Wakeable Peers Collaborate</h2>
       <p>Open three Zed terminals. Leave each one visible. These are the dummy-proof commands.</p>
       <div class="command-grid">
         <article class="command">
           <div class="label"><span>Terminal 1</span><span class="tag gold">daemon (optional)</span></div>
           <p>The wake daemon now <strong>auto-starts</strong> the first time you launch a peer below, so this terminal is optional. Use it only if you want to watch the wake loop in the foreground.</p>
-          <pre><code>peerwake</code></pre>
+          <pre><code>codex-peer daemon</code></pre>
         </article>
         <article class="command">
-          <div class="label"><span>Terminal 2</span><span class="tag green">Google Ads</span></div>
-          <p>Starts wakeable Codex in the Google Ads Expert repo with peer name <code>google-ads-codex</code>.</p>
-          <pre><code>cd /Users/mike/www/ai/google-ads-expert
-codexpeer</code></pre>
+          <div class="label"><span>Terminal 2</span><span class="tag green">API</span></div>
+          <p>Starts wakeable Codex in the API Service repo with peer name <code>api-codex</code>.</p>
+          <pre><code>cd ~/code/api-service
+codex-peer</code></pre>
         </article>
         <article class="command">
-          <div class="label"><span>Terminal 3</span><span class="tag green">CCR Website</span></div>
-          <p>Starts wakeable Codex in the CCR Website repo with peer name <code>ccr-codex</code>.</p>
-          <pre><code>cd /Users/mike/www/ai/ccr-website
-codexpeer</code></pre>
+          <div class="label"><span>Terminal 3</span><span class="tag green">Web App</span></div>
+          <p>Starts wakeable Codex in the Web App repo with peer name <code>web-codex</code>.</p>
+          <pre><code>cd ~/code/web-app
+codex-peer</code></pre>
         </article>
         <article class="command">
           <div class="label"><span>Optional Shell Test</span><span class="tag blue">send</span></div>
           <p>Sends a message without using either Codex UI.</p>
-          <pre><code>codexpeer send ccr-codex "Google Ads peer test: please call check_messages and reply."</code></pre>
+          <pre><code>codex-peer send web-codex "API peer test: please call check_messages and reply."</code></pre>
         </article>
       </div>
 
@@ -581,28 +582,28 @@ codexpeer</code></pre>
           <div>
             <h3>Check the roster</h3>
             <p>Run this in any normal terminal:</p>
-            <pre><code>peerstatus</code></pre>
-            <p>You should see <code>google-ads-codex</code> and <code>ccr-codex</code> near the top under wakeable Codex sessions. If a name was already live, it may appear as <code>-2</code>.</p>
+            <pre><code>codex-peer live</code></pre>
+            <p>You should see <code>api-codex</code> and <code>web-codex</code> near the top under wakeable Codex sessions. If a name was already live, it may appear as <code>-2</code>.</p>
           </div>
         </div>
         <div class="flow-step">
           <div>
             <h3>Make them talk from inside Codex</h3>
-            <p>In the Google Ads Codex terminal, type:</p>
-            <pre><code>List all peers on this machine. Then send ccr-codex a short message asking it what repo it is in.</code></pre>
+            <p>In the API Codex terminal, type:</p>
+            <pre><code>List all peers on this machine. Then send web-codex a short message asking it what repo it is in.</code></pre>
           </div>
         </div>
         <div class="flow-step">
           <div>
-            <h3>Watch the CCR terminal</h3>
-            <p>If the CCR Codex session is idle, the daemon should nudge it. CCR Codex should call <code>check_messages</code>, see the Google Ads message, and answer.</p>
+            <h3>Watch the Web App terminal</h3>
+            <p>If the Web App Codex session is idle, the daemon should nudge it. Web App Codex should call <code>check_messages</code>, see the API message, and answer.</p>
           </div>
         </div>
         <div class="flow-step">
           <div>
             <h3>Reply the other direction</h3>
-            <p>In the CCR Codex terminal, type:</p>
-            <pre><code>Reply to google-ads-codex and say you received the message. Include your current working directory.</code></pre>
+            <p>In the Web App Codex terminal, type:</p>
+            <pre><code>Reply to api-codex and say you received the message. Include your current working directory.</code></pre>
           </div>
         </div>
       </div>
@@ -619,39 +620,39 @@ codexpeer</code></pre>
         </thead>
         <tbody>
           <tr>
-            <td><code>codexpeer</code></td>
+            <td><code>codex-peer</code></td>
             <td>Start wakeable Codex in the current repo. This is the closest equivalent to <code>opus</code> for Codex.</td>
           </tr>
           <tr>
-            <td><code>peerwake</code></td>
-            <td>Foreground wake loop (<code>codex-peer daemon</code>). Optional — every <code>codexpeer</code> launch auto-starts a background daemon. Use <code>codexpeer daemon-status</code> / <code>daemon-stop</code> to manage it.</td>
+            <td><code>codex-peer daemon</code></td>
+            <td>Foreground wake loop (<code>codex-peer daemon</code>). Optional — every <code>codex-peer</code> launch auto-starts a background daemon. Use <code>codex-peer daemon-status</code> / <code>daemon-stop</code> to manage it.</td>
           </tr>
           <tr>
-            <td><code>adspeer</code></td>
-            <td>Simple alias for starting the Google Ads Expert wakeable Codex peer.</td>
+            <td><code>codex-peer start api-codex ~/code/api-service</code></td>
+            <td>Simple alias for starting the API Service wakeable Codex peer.</td>
           </tr>
           <tr>
-            <td><code>ccrpeer</code></td>
-            <td>Simple alias for starting the CCR Website wakeable Codex peer.</td>
+            <td><code>codex-peer start web-codex ~/code/web-app</code></td>
+            <td>Simple alias for starting the Web App wakeable Codex peer.</td>
           </tr>
           <tr>
-            <td><code>peerlist</code></td>
+            <td><code>codex-peer peers</code></td>
             <td>Simple alias for showing the live peer roster.</td>
           </tr>
           <tr>
-            <td><code>peerstatus</code></td>
+            <td><code>codex-peer live</code></td>
             <td>Show which Codex peers are actually wakeable, plus unread counts.</td>
           </tr>
           <tr>
-            <td><code>peerrepair ccr-codex-2</code></td>
+            <td><code>codex-peer repair-wake web-codex-2</code></td>
             <td>Attach an already-running wakeable Codex peer to its app-server wake pointer.</td>
           </tr>
           <tr>
-            <td><code>peerretire ccr-codex-2</code></td>
+            <td><code>codex-peer retire web-codex-2</code></td>
             <td>Take a closed, stale, or intentionally-finished peer off the wake/discovery board.</td>
           </tr>
           <tr>
-            <td><code>peerdoc</code></td>
+            <td><code>codex-peer doc</code></td>
             <td>Simple alias for opening this explainer.</td>
           </tr>
           <tr>
@@ -659,19 +660,11 @@ codexpeer</code></pre>
             <td>Keep the wake loop running. This is the thing that notices unread Codex mail and nudges idle wakeable sessions.</td>
           </tr>
           <tr>
-            <td><code>codex-peer google-ads</code></td>
-            <td>Start wakeable Codex in <code>/Users/mike/www/ai/google-ads-expert</code> as <code>google-ads-codex</code>.</td>
-          </tr>
-          <tr>
-            <td><code>codex-peer ccr</code></td>
-            <td>Start wakeable Codex in <code>/Users/mike/www/ai/ccr-website</code> as <code>ccr-codex</code>.</td>
-          </tr>
-          <tr>
             <td><code>codex-peer start name /path/to/repo</code></td>
-            <td>Start any repo with an explicit custom peer name. Usually you can just use <code>codexpeer</code>.</td>
+            <td>Start any repo with an explicit custom peer name. Usually you can just use <code>codex-peer</code>.</td>
           </tr>
           <tr>
-            <td><code>codex-peer send ccr-codex "hello"</code></td>
+            <td><code>codex-peer send web-codex "hello"</code></td>
             <td>Send a test message from the shell.</td>
           </tr>
           <tr>
@@ -693,18 +686,18 @@ codexpeer</code></pre>
     <section class="section">
       <h2>Troubleshooting</h2>
       <ul class="checklist">
-        <li><strong>I sent a message and nothing woke up.</strong> Run <code>peerstatus</code>. The target should say <code>wakeable=yes</code>. Also confirm the background daemon is up with <code>codexpeer daemon-status</code> (any <code>codexpeer</code> launch will auto-start it).</li>
-        <li><strong>The peer name is different.</strong> Run <code>peerstatus</code>. If a name was already taken, the broker may have suffixed it.</li>
-        <li><strong>The peer says wakeable=no but I started it with codexpeer.</strong> Run <code>peerrepair &lt;name&gt;</code>. This repairs the wake pointer without restarting the Codex context.</li>
-        <li><strong>I am done with a peer.</strong> Run <code>peerretire &lt;name&gt;</code>. That removes it from discovery/wake tracking without deleting message history.</li>
+        <li><strong>I sent a message and nothing woke up.</strong> Run <code>codex-peer live</code>. The target should say <code>wakeable=yes</code>. Also confirm the background daemon is up with <code>codex-peer daemon-status</code> (any <code>codex-peer</code> launch will auto-start it).</li>
+        <li><strong>The peer name is different.</strong> Run <code>codex-peer live</code>. If a name was already taken, the broker may have suffixed it.</li>
+        <li><strong>The peer says wakeable=no but I started it with codex-peer.</strong> Run <code>codex-peer repair-wake &lt;name&gt;</code>. This repairs the wake pointer without restarting the Codex context.</li>
+        <li><strong>I am done with a peer.</strong> Run <code>codex-peer retire &lt;name&gt;</code>. That removes it from discovery/wake tracking without deleting message history.</li>
         <li><strong>The receiving Codex is working on something.</strong> The daemon skips active sessions. Let it finish or bring it back to idle.</li>
-        <li><strong>I started plain <code>codex</code>.</strong> That session can use agent peers, but it is not wakeable. Start with <code>codexpeer</code>.</li>
+        <li><strong>I started plain <code>codex</code>.</strong> That session can use agent peers, but it is not wakeable. Start with <code>codex-peer</code>.</li>
         <li><strong>I closed the terminal.</strong> The live app-server handle is gone. Start that peer again.</li>
       </ul>
     </section>
 
     <footer>
-      <p>Source repo: <code>/Users/mike/agent-peers-mcp</code>. Simple aliases: <code>codexpeer</code>, <code>peerwake</code>, <code>adspeer</code>, <code>ccrpeer</code>, <code>peerlist</code>, <code>peerstatus</code>, <code>peerrepair</code>, <code>peerretire</code>, <code>peerdoc</code>. Helper command: <code>bin/codex-peer</code>. Low-level pieces: <code>wakeable-codex.ts</code>, <code>wake-daemon.ts</code>, <code>cli.ts</code>.</p>
+      <p>Source repo: <code>/path/to/agent-peers-mcp</code>. Main helper: <code>codex-peer</code>. Helper command: <code>bin/codex-peer</code>. Low-level pieces: <code>wakeable-codex.ts</code>, <code>wake-daemon.ts</code>, <code>cli.ts</code>.</p>
     </footer>
   </main>
 </body>
