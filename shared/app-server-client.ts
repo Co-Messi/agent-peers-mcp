@@ -52,7 +52,15 @@ export class CodexAppServerWsClient implements AppServerClient {
   private readonly timeoutMs: number;
 
   constructor(private readonly url: string, opts: { timeoutMs?: number } = {}) {
+    const parsed = new URL(url);
+    const loopback = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "[::1]";
+    if (parsed.protocol !== "ws:" || !loopback || parsed.username || parsed.password) {
+      throw new Error("app-server URL must be an unauthenticated loopback ws:// URL");
+    }
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0) {
+      throw new Error("app-server timeout must be positive");
+    }
   }
 
   async connect(): Promise<void> {
@@ -74,6 +82,7 @@ export class CodexAppServerWsClient implements AppServerClient {
 
     ws.addEventListener("message", (event) => this.onMessage(event.data));
     ws.addEventListener("close", () => {
+      if (this.ws === ws) this.ws = null;
       for (const { reject, timer } of this.pending.values()) {
         clearTimeout(timer);
         reject(new Error("app-server websocket closed"));
@@ -81,11 +90,17 @@ export class CodexAppServerWsClient implements AppServerClient {
       this.pending.clear();
     });
 
-    await this.request("initialize", {
-      clientInfo: { name: "agent-peers-wake-daemon", version: "0.1.0" },
-      capabilities: {},
-    });
-    this.notify("initialized");
+    try {
+      await this.request("initialize", {
+        clientInfo: { name: "agent-peers-wake-daemon", version: "0.1.0" },
+        capabilities: {},
+      });
+      this.notify("initialized");
+    } catch (error) {
+      try { ws.close(); } catch { /* best effort */ }
+      if (this.ws === ws) this.ws = null;
+      throw error;
+    }
   }
 
   async listLoadedThreads(): Promise<string[]> {
@@ -153,7 +168,16 @@ export class CodexAppServerWsClient implements AppServerClient {
       }, this.timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
     });
-    this.ws.send(JSON.stringify(payload));
+    try {
+      this.ws.send(JSON.stringify(payload));
+    } catch (error) {
+      const pending = this.pending.get(id);
+      if (pending) {
+        this.pending.delete(id);
+        clearTimeout(pending.timer);
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
     return promise;
   }
 

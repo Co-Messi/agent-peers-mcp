@@ -10,7 +10,7 @@ import { CodexAppServerWsClient, type AppServerClient, type AppServerThread } fr
 import { withInterprocessFileLock } from "./file-lock.ts";
 import { WakeRegistry, type WakeRegistryEntry } from "./wake-registry.ts";
 import { WakeLaunchClaimStore } from "./wake-launch-claims.ts";
-import type { CodexInboxMetadataState } from "./codex-inbox.ts";
+import { readCodexInboxMetadataFile, type CodexInboxMetadataState } from "./codex-inbox.ts";
 
 export interface WakeResult {
   peer_id: string;
@@ -100,7 +100,7 @@ export function pendingSignature(peerId: string, metadata: CodexInboxMetadataSta
 
 export function buildWakePrompt(wakeId: string): string {
   return `[agent-peers wake]
-You have pending agent-peers messages in your local MCP inbox. Immediately call the agent-peers check_messages tool once. Treat that tool response as the only authoritative message content. Do not infer message content from this wake signal. After handling the inbox normally, return to waiting. Wake id: ${wakeId}`;
+You have pending agent-peers messages in your local MCP inbox. Immediately call the agent-peers check_messages tool once. Treat that tool response as the only authoritative message content. Do not infer message content from this wake signal. After processing the displayed messages, call ack_messages with their exact message IDs, then return to waiting. Wake id: ${wakeId}`;
 }
 
 export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeResult[]> {
@@ -194,7 +194,7 @@ export async function runWakePass(opts: WakeDaemonOptions = {}): Promise<WakeRes
         await ledger.mark(signature, "nudged");
         // A successful nudge means the peer is healthy and idle again; clear any
         // prior wedged/coalesced observation state so the next anomaly logs fresh.
-        await observe.reset(entry.peer_id);
+        try { await observe.reset(entry.peer_id); } catch { /* wake already succeeded */ }
         results.push({
           peer_id: entry.peer_id,
           peer_name: entry.peer_name,
@@ -283,10 +283,9 @@ async function readAllInboxMetadata(rootDir: string): Promise<PeerInboxMetadata[
   const out: PeerInboxMetadata[] = [];
   for (const name of metadataFiles) {
     try {
-      const raw = await readFile(join(rootDir, name), "utf8");
-      const parsed = JSON.parse(raw) as CodexInboxMetadataState;
-      if (!Array.isArray(parsed.unread)) continue;
       const peerId = decodeURIComponent(name.slice(0, -".metadata.json".length));
+      const parsed = await readCodexInboxMetadataFile(join(rootDir, name), peerId);
+      if (!parsed) continue;
       out.push({ peerId, metadata: parsed });
     } catch {
       continue;

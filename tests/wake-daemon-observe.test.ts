@@ -53,7 +53,7 @@ async function writeMetadata(rootDir: string): Promise<void> {
     }],
     updated_at: "2026-06-22T00:00:00.000Z",
   };
-  await writeFile(join(rootDir, `${encodeURIComponent("peer-1")}.metadata.json`), JSON.stringify(value, null, 2), "utf8");
+  await writeFile(join(rootDir, `${encodeURIComponent("peer-1")}.metadata.json`), JSON.stringify(value, null, 2), { encoding: "utf8", mode: 0o600 });
 }
 
 // A client whose thread status can be swapped between passes; counts how many

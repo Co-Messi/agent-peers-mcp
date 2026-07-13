@@ -122,9 +122,9 @@ Codex. The wake only causes a turn; it never *is* the message.
   which matches by cwd/tty, **refuses** when two or more live distinct-thread
   sessions share a cwd/tty (e.g. two Codex in the same repo with no distinct TTY)
   rather than guessing and attaching to the wrong thread.
-- **Confirm-on-next-call delivery.** Messages stay in the durable inbox until the
-  *next* tool call proves the prior response reached the model, so a dropped wake
-  response re-delivers instead of silently losing mail.
+- **Explicit acknowledgement.** Messages stay in the durable inbox until the
+  model calls `ack_messages` with the IDs it processed. A dropped wake response
+  therefore re-delivers instead of silently losing mail.
 
 ## Operating it
 

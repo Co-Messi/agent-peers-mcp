@@ -59,7 +59,7 @@ function metadata(overrides: Partial<CodexInboxMetadataState> = {}): CodexInboxM
 
 async function writeMetadata(rootDir: string, peerId = "peer-1", value = metadata()): Promise<string> {
   const path = join(rootDir, `${encodeURIComponent(peerId)}.metadata.json`);
-  await writeFile(path, JSON.stringify(value, null, 2), "utf8");
+  await writeFile(path, JSON.stringify(value, null, 2), { encoding: "utf8", mode: 0o600 });
   return path;
 }
 
@@ -118,6 +118,7 @@ test("runWakePass nudges loaded idle thread with a bodyless prompt", async () =>
   expect(results[0]?.reason).toBe("nudged");
   expect(client.startCalls).toHaveLength(1);
   expect(client.startCalls[0]?.prompt).toContain("call the agent-peers check_messages tool once");
+  expect(client.startCalls[0]?.prompt).toContain("call ack_messages");
   expect(client.startCalls[0]?.prompt).not.toContain("sender-peer");
   expect(client.startCalls[0]?.prompt).not.toContain("working elsewhere");
 });
@@ -217,7 +218,7 @@ test("new unread signatures cannot bypass the per-peer wake budget", async () =>
   expect((await runWakePass(opts))[0]?.action).toBe("wake");
   await writeFile(metadataPath, JSON.stringify(metadata({
     unread: [...metadata().unread, { ...metadata().unread[0]!, id: 11 }],
-  })), "utf8");
+  })), { encoding: "utf8", mode: 0o600 });
   now += 1_000;
   expect((await runWakePass(opts))[0]?.reason).toBe("peer_wake_rate_limited");
   expect(client.startCalls).toHaveLength(1);

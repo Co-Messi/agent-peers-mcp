@@ -3,6 +3,7 @@
 // One-shot wake pass for app-server-backed Codex sessions.
 
 import { runWakePass } from "./shared/wake-daemon.ts";
+import { sanitizeTerminalText as safe } from "./shared/safe-output.ts";
 
 const args = new Set(process.argv.slice(2));
 const json = args.has("--json");
@@ -19,12 +20,12 @@ for (const result of results) {
   if (quietNoop && !result.log) continue;
 
   const ts = new Date().toISOString();
-  const target = `${result.peer_name} (${result.peer_id.slice(0, 8)}…) thread=${result.thread_id}`;
-  const note = result.note ? ` — ${result.note}` : "";
+  const target = `${safe(result.peer_name, 32)} (${safe(result.peer_id.slice(0, 8), 8)}…) thread=${safe(result.thread_id, 128)}`;
+  const note = result.note ? ` — ${safe(result.note, 1024)}` : "";
   if (result.action === "wake") {
     console.log(`${ts} wake: nudged ${target}${note}`);
   } else {
-    console.log(`${ts} wake: skipped ${target} (${result.reason})${note}`);
+    console.log(`${ts} wake: skipped ${target} (${safe(result.reason, 64)})${note}`);
   }
 }
 if (!json && !quietNoop && results.length === 0) {

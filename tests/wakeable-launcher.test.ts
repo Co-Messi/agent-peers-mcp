@@ -31,6 +31,16 @@ test("parseWakeableLauncherArgs parses launcher flags and passthrough args", () 
   expect(opts.extraCodexArgs).toEqual(["--model", "gpt-5"]);
 });
 
+test("parseWakeableLauncherArgs rejects out-of-range ports", () => {
+  expect(() => parseWakeableLauncherArgs(["--port", "0"])).toThrow(/1 and 65535/i);
+  expect(() => parseWakeableLauncherArgs(["--port", "65536"])).toThrow(/1 and 65535/i);
+  expect(() => parseWakeableLauncherArgs(["--port", "12oops"])).toThrow(/1 and 65535/i);
+});
+
+test("parseWakeableLauncherArgs rejects invalid peer names", () => {
+  expect(() => parseWakeableLauncherArgs(["--name", "not a peer"])).toThrow(/name/i);
+});
+
 test("parseWakeableLauncherArgs materializes by default so bare resume has a rollout", () => {
   const opts = parseWakeableLauncherArgs([]);
 

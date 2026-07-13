@@ -38,6 +38,37 @@ export interface CodexInboxMetadataState {
   updated_at: string;
 }
 
+export async function readCodexInboxMetadataFile(
+  path: string,
+  expectedPeerId: string,
+): Promise<CodexInboxMetadataState | null> {
+  try {
+    const fileStat = await lstat(path);
+    if (fileStat.isSymbolicLink() || !fileStat.isFile() || fileStat.nlink !== 1) return null;
+    if (fileStat.size > MAX_INBOX_FILE_BYTES) return null;
+    if (IS_POSIX) {
+      const mine = (process as unknown as { getuid?: () => number }).getuid?.();
+      if (typeof mine === "number" && fileStat.uid !== mine) return null;
+      if ((fileStat.mode & 0o777) !== FILE_MODE) return null;
+    }
+    const raw = await readFile(path, "utf8");
+    const parsed = JSON.parse(raw) as Partial<CodexInboxMetadataState>;
+    if (!Array.isArray(parsed.unread) || parsed.unread.length > MAX_INBOX_MESSAGES) return null;
+    if (typeof parsed.updated_at !== "string" || !Number.isFinite(Date.parse(parsed.updated_at))) return null;
+    const valid = parsed.unread.every((value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      const message = value as Partial<CodexInboxMessageMetadata>;
+      return Number.isSafeInteger(message.id) && (message.id ?? 0) > 0
+        && message.to_id === expectedPeerId
+        && typeof message.sent_at === "string"
+        && Number.isFinite(Date.parse(message.sent_at));
+    });
+    return valid ? { unread: parsed.unread as CodexInboxMessageMetadata[], updated_at: parsed.updated_at } : null;
+  } catch {
+    return null;
+  }
+}
+
 const EMPTY_STATE: CodexInboxState = { version: 1, unread: [] };
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;

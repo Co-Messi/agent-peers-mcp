@@ -2,6 +2,16 @@ import { afterEach, expect, test } from "bun:test";
 
 import { CodexAppServerWsClient } from "../shared/app-server-client.ts";
 
+test("client rejects non-positive request timeouts", () => {
+  expect(() => new CodexAppServerWsClient("ws://127.0.0.1:1", { timeoutMs: 0 })).toThrow(/timeout/i);
+});
+
+test("client rejects non-loopback or credential-bearing app-server URLs", () => {
+  expect(() => new CodexAppServerWsClient("ws://example.com:1234")).toThrow(/loopback/i);
+  expect(() => new CodexAppServerWsClient("ws://user:pass@127.0.0.1:1234")).toThrow(/loopback/i);
+  expect(() => new CodexAppServerWsClient("http://127.0.0.1:1234")).toThrow(/loopback/i);
+});
+
 const stoppers: Array<() => void> = [];
 
 afterEach(() => {

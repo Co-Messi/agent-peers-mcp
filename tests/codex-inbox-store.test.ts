@@ -3,7 +3,7 @@ import { chmod, link, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile }
 import { join } from "node:path";
 import { tmpdir, platform } from "node:os";
 
-import { CodexInboxStore } from "../shared/codex-inbox.ts";
+import { CodexInboxStore, readCodexInboxMetadataFile } from "../shared/codex-inbox.ts";
 import type { LeasedMessage } from "../shared/types.ts";
 
 const IS_POSIX = platform() !== "win32";
@@ -172,6 +172,19 @@ test("CodexInboxStore metadata updates do not remove authoritative queued messag
   expect(unread.map((m) => m.id)).toEqual([1, 2]);
   expect(unread[0]?.text).toBe("message-1");
   expect(unread[0]?.lease_token).toBe("lease-1");
+});
+
+test("bodyless metadata reader rejects a mismatched recipient and unsafe file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+  const path = join(dir, "peer-123.metadata.json");
+  await writeFile(path, JSON.stringify({
+    unread: [{ id: 1, to_id: "different-peer", sent_at: "2026-04-15T00:00:00.000Z" }],
+    updated_at: "2026-04-15T00:00:00.000Z",
+  }), { mode: 0o600 });
+  expect(await readCodexInboxMetadataFile(path, "peer-123")).toBeNull();
+  await chmod(path, 0o644);
+  expect(await readCodexInboxMetadataFile(path, "different-peer")).toBeNull();
 });
 
 test.if(IS_POSIX)("CodexInboxStore writes inbox file at 0o600 and directory at 0o700", async () => {

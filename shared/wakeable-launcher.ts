@@ -2,10 +2,12 @@
 // Managed launcher for app-server-backed wakeable Codex TUI sessions.
 
 import { createServer } from "node:net";
+import { stat } from "node:fs/promises";
 
 import { CodexAppServerWsClient, type AppServerThread } from "./app-server-client.ts";
 import { WakeLaunchClaimStore } from "./wake-launch-claims.ts";
-import { getTty } from "./peer-context.ts";
+import { canonicalizePath, getTty } from "./peer-context.ts";
+import { isValidName } from "./names.ts";
 
 export interface WakeableLauncherOptions {
   cwd: string;
@@ -42,12 +44,17 @@ export function parseWakeableLauncherArgs(argv: string[]): WakeableLauncherOptio
       continue;
     }
     if (arg === "--port") {
-      opts.port = Number.parseInt(requireValue(argv, ++i, arg), 10);
-      if (!Number.isInteger(opts.port) || opts.port <= 0) throw new Error("--port must be a positive integer");
+      const rawPort = requireValue(argv, ++i, arg);
+      if (!/^\d+$/.test(rawPort)) throw new Error("--port must be an integer between 1 and 65535");
+      opts.port = Number(rawPort);
+      if (!Number.isInteger(opts.port) || opts.port <= 0 || opts.port > 65_535) {
+        throw new Error("--port must be an integer between 1 and 65535");
+      }
       continue;
     }
     if (arg === "--name") {
       opts.peerName = requireValue(argv, ++i, arg);
+      if (!isValidName(opts.peerName)) throw new Error("--name must be 1-32 characters using only letters, numbers, underscore, or hyphen");
       continue;
     }
     if (arg === "--alt-screen") {
@@ -142,11 +149,14 @@ export function buildWakeableEnv(opts: {
 }
 
 export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promise<number> {
+  const cwd = await canonicalizePath(opts.cwd);
+  const cwdStat = await stat(cwd).catch(() => null);
+  if (!cwdStat?.isDirectory()) throw new Error(`working directory does not exist or is not a directory: ${opts.cwd}`);
   const port = opts.port ?? await allocatePort();
   const appServerUrl = `ws://127.0.0.1:${port}`;
   const claimStore = new WakeLaunchClaimStore();
   const claim = await claimStore.create({
-    cwd: opts.cwd,
+    cwd,
     tty: getTty(),
     requestedPeerName: opts.peerName,
   });
@@ -169,9 +179,14 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
   });
 
   try {
-    await waitForReadyz(port);
+    await Promise.race([
+      waitForReadyz(port),
+      appServer.exited.then((code) => {
+        throw new Error(`app-server exited before becoming ready (code ${code})`);
+      }),
+    ]);
     const client = new CodexAppServerWsClient(appServerUrl);
-    let thread = await client.startThread({ cwd: opts.cwd });
+    let thread = await client.startThread({ cwd });
     if (opts.materialize) {
       await retryEmptyRolloutRace(() => client.startWakeTurn({
         threadId: thread.id,
@@ -211,7 +226,7 @@ export async function runWakeableLauncher(opts: WakeableLauncherOptions): Promis
     console.error(`[agent-peers/wakeable] app-server=${appServerUrl} pid=${appServer.pid}`);
     console.error(`[agent-peers/wakeable] thread=${thread.id}`);
     const tui = Bun.spawn(["codex", ...codexArgs], {
-      cwd: opts.cwd,
+      cwd,
       stdin: "inherit",
       stdout: "inherit",
       stderr: "inherit",

@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
-ROOT_DIR="${AGENT_PEERS_MCP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE_PATH" ]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+  SOURCE_PATH="$(readlink "$SOURCE_PATH")"
+  case "$SOURCE_PATH" in /*) ;; *) SOURCE_PATH="$SOURCE_DIR/$SOURCE_PATH" ;; esac
+done
+ROOT_DIR="${AGENT_PEERS_MCP_DIR:-$(cd "$(dirname "$SOURCE_PATH")/.." && pwd -P)}"
 DEFAULT_INSTALL_PATH="${HOME}/.local/bin/codex-peer"
 DOC_PATH="${ROOT_DIR}/docs/examples/wakeable-codex-peer-demo.html"
 
@@ -163,6 +170,18 @@ daemon_start_identity() {
   ps -o lstart= -o command= -p "$1" 2>/dev/null | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
 }
 
+process_record_alive() {
+  local record="$1" pid expected actual
+  case "$record" in *'|'*) ;; *) return 1 ;; esac
+  pid="${record%%|*}"
+  expected="${record#*|}"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$expected" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  actual="$(daemon_start_identity "$pid")"
+  [ -n "$actual" ] && [ "$actual" = "$expected" ]
+}
+
 write_daemon_pidfile() {
   local pid="$1" identity="" attempt
   for attempt in 1 2 3 4 5; do
@@ -192,17 +211,9 @@ daemon_pid() {
       return 0
       ;;
   esac
+  process_record_alive "$record" || return 1
   pid="${record%%|*}"
-  expected="${record#*|}"
-  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  [ -n "$expected" ] || return 1
-  if kill -0 "$pid" 2>/dev/null; then
-    actual="$(daemon_start_identity "$pid")"
-    [ -n "$actual" ] && [ "$actual" = "$expected" ] || return 1
-    printf '%s' "$pid"
-    return 0
-  fi
-  return 1
+  printf '%s' "$pid"
 }
 
 # Idempotently make sure a background wake daemon is running. Called by every
@@ -211,6 +222,7 @@ daemon_pid() {
 # call concurrently: an atomic lock dir ensures only one racer starts it.
 ensure_daemon() {
   mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
   if daemon_pid >/dev/null 2>&1; then
     return 0
   fi
@@ -224,13 +236,22 @@ ensure_daemon() {
       sleep 0.1
       lock_owner="$(cat "$DAEMON_LOCKDIR/owner" 2>/dev/null || true)"
     fi
-    if [ -n "$lock_owner" ] && kill -0 "$lock_owner" 2>/dev/null; then
-      return 0  # another live launch is already starting it
+    if [ -n "$lock_owner" ] && process_record_alive "$lock_owner"; then
+      local attempt
+      for attempt in {1..50}; do
+        daemon_pid >/dev/null 2>&1 && return 0
+        process_record_alive "$lock_owner" || break
+        sleep 0.1
+      done
+      process_record_alive "$lock_owner" && die "another launch is still starting the wake daemon; retry shortly"
     fi
     rm -rf "$DAEMON_LOCKDIR" 2>/dev/null || return 0
     mkdir "$DAEMON_LOCKDIR" 2>/dev/null || return 0
   fi
-  printf '%s\n' "$$" >"$DAEMON_LOCKDIR/owner"
+  local owner_identity
+  owner_identity="$(daemon_start_identity "$$")"
+  [ -n "$owner_identity" ] || { rm -rf "$DAEMON_LOCKDIR"; die "could not identify daemon startup lock owner"; }
+  printf '%s|%s\n' "$$" "$owner_identity" >"$DAEMON_LOCKDIR/owner"
   if daemon_pid >/dev/null 2>&1; then
     rm -rf "$DAEMON_LOCKDIR" 2>/dev/null || true
     return 0
@@ -276,6 +297,8 @@ daemon_status() {
 rotate_daemon_log_if_needed() {
   [ -f "$DAEMON_LOGFILE" ] || return 0
   case "$DAEMON_LOG_MAX_BYTES" in ''|*[!0-9]*) return 0 ;; esac
+  case "$DAEMON_LOG_KEEP" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$DAEMON_LOG_KEEP" -ge 1 ] || return 0
   local size
   size="$(wc -c <"$DAEMON_LOGFILE" 2>/dev/null | tr -d '[:space:]')" || return 0
   [ -n "$size" ] || return 0
@@ -293,7 +316,9 @@ run_daemon() {
   case "$interval" in
     ''|*[!0-9]*) die "daemon interval must be a whole number of seconds" ;;
   esac
+  [ "$interval" -ge 1 ] || die "daemon interval must be at least one second"
   mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
   local existing
   if existing="$(daemon_pid 2>/dev/null)"; then
     if [ "$existing" != "$$" ]; then
