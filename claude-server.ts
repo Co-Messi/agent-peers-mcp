@@ -26,14 +26,20 @@ import {
 import { createClient } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
 import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts";
-import { getGitRoot, getTty } from "./shared/peer-context.ts";
+import { canonicalizePath, getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
 import { formatInboxBlock } from "./shared/piggyback.ts";
-import { recordDelivered, getRecentDelivered } from "./shared/recent-delivered.ts";
+import { CodexInboxStore as DurableInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId } from "./shared/types.ts";
+import { sanitizeTerminalText as safe } from "./shared/safe-output.ts";
+import { MAX_ACK_TOKENS } from "./shared/limits.ts";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { createLogger } from "./shared/logger.ts";
+import { parsePort } from "./shared/config.ts";
 import {
   parseListPeersToolArgs,
   parseRenameToolArgs,
@@ -41,14 +47,14 @@ import {
   parseSetSummaryToolArgs,
 } from "./shared/validation.ts";
 
-const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
+const BROKER_PORT = parsePort(process.env.AGENT_PEERS_PORT, 7900);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
+const logger = createLogger("claude-mcp");
 
 function log(msg: string) {
-  // MCP stdio servers must only use stderr for logging (stdout is the protocol).
-  console.error(`[agent-peers/claude] ${msg}`);
+  logger.info("status", { detail: msg });
 }
 
 // The shared secret is only known after the broker has provisioned it, so
@@ -64,6 +70,8 @@ let myName: string | null = null;
 let mySession: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let claudeInboxStore: DurableInboxStore | null = null;
+const presentedClaudeMessages = new Set<number>();
 
 // The recent-delivered ring buffer is the backfill surface for check_messages.
 // See shared/recent-delivered.ts for the full rationale. Extracted out of this
@@ -176,6 +184,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
 
+  if (presentedClaudeMessages.size > 0 && claudeInboxStore) {
+    const confirmed = [...presentedClaudeMessages];
+    await claudeInboxStore.removeByIds(confirmed);
+    presentedClaudeMessages.clear();
+  }
+
   switch (name) {
     case "list_peers": {
       const { scope, peer_type } = parseListPeersToolArgs(args);
@@ -187,11 +201,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       const lines = peers.map((p) =>
         [
-          `Peer ${p.name} (${p.peer_type})`,
-          `  ID: ${p.id}`,
-          `  CWD: ${p.cwd}`,
-          p.tty ? `  TTY: ${p.tty}` : null,
-          p.summary ? `  Summary: ${p.summary}` : null,
+          `Peer ${safe(p.name, 32)} (${p.peer_type})`,
+          `  ID: ${safe(p.id, 128)}`,
+          `  CWD: ${safe(p.cwd)}`,
+          p.tty ? `  TTY: ${safe(p.tty, 256)}` : null,
+          p.summary ? `  Summary: ${safe(p.summary, 1024)}` : null,
           `  Last seen: ${p.last_seen}`,
         ].filter(Boolean).join("\n")
       );
@@ -230,7 +244,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       // already replied to." So repeated check_messages calls within
       // the 15-min TTL window are safe — they show the same messages,
       // Claude just won't re-respond to ones it already handled.
-      const recent = getRecentDelivered();
+      const recent = claudeInboxStore ? await claudeInboxStore.getUnreadMessages() : [];
       if (recent.length === 0) {
         return {
           content: [{
@@ -239,6 +253,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           }],
         };
       }
+      for (const message of recent) presentedClaudeMessages.add(message.id);
       return {
         content: [{
           type: "text" as const,
@@ -321,7 +336,7 @@ async function main() {
   const sharedSecret = await waitForSharedSecret();
   client = createClient(BROKER_URL, sharedSecret);
 
-  myCwd = process.cwd();
+  myCwd = await canonicalizePath(process.cwd());
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
 
@@ -354,6 +369,11 @@ async function main() {
   myId = reg.id;
   myName = reg.name;
   mySession = reg.session_token;
+  claudeInboxStore = new DurableInboxStore({
+    peerId: `claude-${myName}`,
+    rootDir: process.env.AGENT_PEERS_CLAUDE_STATE_DIR ?? join(homedir(), ".agent-peers-claude"),
+  });
+  await claudeInboxStore.init();
   setTabTitle(`peer:${myName}`);
   // Note: keepalive was already armed earlier in main(), before register().
   // The setTabTitle above just updates `lastTitle`; the running keepalive
@@ -381,69 +401,55 @@ async function main() {
   const seen = new Set<number>();
 
   const pollAndPush = async () => {
-    if (!myId || !mySession) return;
+    if (!myId || !mySession || !claudeInboxStore) return;
     try {
       const msgs = await client.pollMessages({ id: myId, session_token: mySession });
-      const toAck: string[] = [];
+      if (msgs.length === 0) return;
+
+      // Persist before acknowledging the broker. Channel notification success
+      // is not proof of model visibility; the durable inbox is authoritative
+      // and check_messages keeps the content until a later tool call confirms
+      // that its response completed.
+      await claudeInboxStore.queueLeasedMessages(msgs);
+
       for (const m of msgs) {
-        if (seen.has(m.id)) {
-          // Re-delivery after lost ack. Queue the new lease_token so the broker
-          // can close the stuck lease, but do NOT push again.
-          toAck.push(m.lease_token);
-          continue;
-        }
+        if (seen.has(m.id)) continue;
         try {
-          // Per the channels reference, `meta` is Record<string, string> —
-          // non-string values are silently dropped, and the `source` attribute
-          // is auto-generated from the server name (so passing it here would
-          // be redundant or conflict with the auto-set value). Stringify the
-          // numeric message_id and omit `source`.
           await mcp.notification({
             method: "notifications/claude/channel",
             params: {
-              content: m.text,
+              content: formatInboxBlock([m]),
               meta: {
                 message_id: String(m.id),
                 from_id: m.from_id,
                 from_name: m.from_name,
                 from_peer_type: m.from_peer_type,
-                from_summary: m.from_summary,
-                from_cwd: m.from_cwd,
                 sent_at: m.sent_at,
               },
             },
           });
-          // Mark delivered in seen BEFORE queueing the ack so a later ack
-          // failure cannot cause a re-push within this session. Also
-          // record in the recent-delivered ring buffer so check_messages
-          // can surface it if Claude Code silently queued the channel
-          // push (e.g. session was idle at the prompt).
           seen.add(m.id);
-          recordDelivered(m);
-          toAck.push(m.lease_token);
-          // Visible proof-of-delivery in stderr so a live operator can
-          // tell from the log alone whether the push fired. Claude Code's
-          // rendering is opaque to us (especially in idle-at-prompt
-          // cases), so having a hard "yes, we pushed it" line in
-          // stderr is the one debug signal that always works.
-          log(`📬 pushed channel msg #${m.id} from ${m.from_name} (${m.from_peer_type}): ${m.text.slice(0, 80)}${m.text.length > 80 ? "…" : ""}`);
+          log(`pushed channel message id=${m.id} from=${m.from_name} type=${m.from_peer_type}`);
         } catch (e) {
-          log(`push failed (lease will expire + redeliver): ${e instanceof Error ? e.message : String(e)}`);
+          // The durable inbox remains authoritative even if the live hint is
+          // unavailable; check_messages will surface the message.
+          log(`channel push failed; durable inbox retained id=${m.id}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
-      if (toAck.length > 0 && mySession) {
-        try {
-          await client.ackMessages({ id: myId, session_token: mySession, lease_tokens: toAck });
-        } catch {
-          /* next poll picks up remainder */
-        }
+
+      for (let i = 0; i < msgs.length; i += MAX_ACK_TOKENS) {
+        await client.ackMessages({
+          id: myId,
+          session_token: mySession,
+          lease_tokens: msgs.slice(i, i + MAX_ACK_TOKENS).map((m) => m.lease_token),
+        });
       }
     } catch (e) {
       log(`poll error: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
 
-  // Self-scheduling loop with re-entrancy guard (code review round-1 fix).
+  // Self-scheduling loop with re-entrancy guard (current lifecycle invariant).
   // Using setInterval would fire a new poll every 1s even if the previous one is
   // still in flight, causing overlapping reads of the same `seen` set and
   // duplicate pushes under slow I/O. This pattern guarantees strictly one

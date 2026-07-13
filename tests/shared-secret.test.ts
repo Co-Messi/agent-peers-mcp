@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   rmSync,
   symlinkSync,
+  linkSync,
   existsSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -67,6 +68,15 @@ describe("validateSecretFilePerms", () => {
     chmodSync(real, 0o600);
     symlinkSync(real, link);
     expect(() => validateSecretFilePerms(link)).toThrow(/symlink/);
+  });
+
+  test("rejects a multiply-linked secret file", () => {
+    const dir = mkScratch();
+    const target = join(dir, "target-hardlink");
+    const linked = join(dir, "secret-hardlink");
+    writeFileSync(target, "x".repeat(64), { mode: 0o600 });
+    linkSync(target, linked);
+    expect(() => validateSecretFilePerms(linked)).toThrow(/hard link|links/i);
   });
 });
 

@@ -9,12 +9,12 @@ export interface Peer {
   id: PeerId;
   name: PeerName;
   peer_type: PeerType;
-  pid: number;
+  pid?: number;
   cwd: string;
-  git_root: string | null;
-  tty: string | null;
+  git_root?: string | null;
+  tty?: string | null;
   summary: string;
-  registered_at: string; // ISO timestamp
+  registered_at?: string; // ISO timestamp
   last_seen: string; // ISO timestamp
 }
 
@@ -103,4 +103,12 @@ export interface RenamePeerResponse {
   ok: boolean;
   error?: string;
   name?: PeerName;
+}
+
+export interface BrokerDiagnostics {
+  peers: number;
+  pending_messages: number;
+  leased_messages: number;
+  acknowledged_messages: number;
+  orphaned_messages: number;
 }

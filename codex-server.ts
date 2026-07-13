@@ -70,7 +70,7 @@ import {
 import { createClient } from "./shared/broker-client.ts";
 import { ensureBroker } from "./shared/ensure-broker.ts";
 import { readSharedSecret, waitForSharedSecret } from "./shared/shared-secret.ts";
-import { getGitRoot, getTty } from "./shared/peer-context.ts";
+import { canonicalizePath, getGitRoot, getTty } from "./shared/peer-context.ts";
 import { getGitBranch, getRecentFiles, generateSummary } from "./shared/summarize.ts";
 import { setTabTitle, clearTabTitle, clearTabTitleSync, startTabTitleKeepalive } from "./shared/tab-title.ts";
 import { formatInboxBlock, formatInboxPreview } from "./shared/piggyback.ts";
@@ -78,6 +78,11 @@ import { CodexInboxStore } from "./shared/codex-inbox.ts";
 import { isValidName } from "./shared/names.ts";
 import { COLLEAGUE_PROTOCOL } from "./shared/colleague-prompt.ts";
 import type { PeerId, LeasedMessage } from "./shared/types.ts";
+import { sanitizeTerminalText as safe } from "./shared/safe-output.ts";
+import { PendingAckQueue } from "./shared/delivery-state.ts";
+import { MAX_ACK_TOKENS } from "./shared/limits.ts";
+import { createLogger } from "./shared/logger.ts";
+import { parsePort } from "./shared/config.ts";
 import {
   parseListPeersToolArgs,
   parseRenameToolArgs,
@@ -85,13 +90,14 @@ import {
   parseSetSummaryToolArgs,
 } from "./shared/validation.ts";
 
-const BROKER_PORT = parseInt(process.env.AGENT_PEERS_PORT ?? "7900", 10);
+const BROKER_PORT = parsePort(process.env.AGENT_PEERS_PORT, 7900);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
+const logger = createLogger("codex-mcp");
 
 function log(msg: string) {
-  console.error(`[agent-peers/codex] ${msg}`);
+  logger.info("status", { detail: msg });
 }
 
 let client: ReturnType<typeof createClient>;
@@ -215,8 +221,7 @@ const TOOLS = [
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-const MAX_PENDING_ACKS = 500;
-const pendingAcks: string[] = [];
+const pendingAcks = new PendingAckQueue(MAX_ACK_TOKENS);
 
 // Dedupe state (see top-of-file state-machine comment):
 //   - `presentedPendingConfirm`: messages in the CURRENT response's
@@ -226,13 +231,8 @@ const pendingAcks: string[] = [];
 const presentedPendingConfirm = new Set<number>();
 const seen = new Set<number>();
 
-function enqueueAck(token: string) {
-  pendingAcks.push(token);
-  if (pendingAcks.length > MAX_PENDING_ACKS) {
-    const drop = pendingAcks.length - MAX_PENDING_ACKS;
-    pendingAcks.splice(0, drop);
-    log(`pendingAcks trimmed: dropped ${drop} oldest token(s); exceeding cap ${MAX_PENDING_ACKS}`);
-  }
+function enqueueAck(messageId: number, token: string) {
+  pendingAcks.enqueue(messageId, token);
 }
 
 async function pollBrokerIntoQueue(): Promise<void> {
@@ -262,7 +262,7 @@ async function pollBrokerIntoQueue(): Promise<void> {
         // got re-offered because our earlier ack was lost or the lease
         // expired before ack. Close it now — this is safe because the
         // model-delivery evidence is already in hand.
-        enqueueAck(message.lease_token);
+        enqueueAck(message.id, message.lease_token);
       } else if (presentedPendingConfirm.has(message.id)) {
         // We drew this into the CURRENT response's [PEER INBOX] block but
         // haven't yet seen the next tool call that would confirm
@@ -271,7 +271,7 @@ async function pollBrokerIntoQueue(): Promise<void> {
         // piggyback double-surface it within the same call). Just stash
         // the new lease token so next-call confirm-flush closes both old
         // + new leases atomically.
-        enqueueAck(message.lease_token);
+        enqueueAck(message.id, message.lease_token);
       } else {
         freshlyUnread.push(message);
       }
@@ -356,23 +356,20 @@ async function withPiggyback(
   // — those must be flushed even in tool calls that don't draw any new
   // inbox items, otherwise the broker re-leases the row forever and it
   // never transitions to acked=1 (perpetually-unacked zombie row per
-  // codex review PR #2 round 2).
+  // delivery invariant).
   //
   // Tokens are removed from pendingAcks only on HTTP success; an
   // exception leaves them for the next call to retry. HTTP success with
   // `acked: 0` at the broker (stale tokens) still counts — the next
   // re-lease will land new tokens in pendingAcks via the seen-branch,
   // and this flush will eventually succeed against the current lease.
-  if (pendingAcks.length > 0) {
-    const toFlush = pendingAcks.slice();
+  if (pendingAcks.size > 0) {
+    const toFlush = pendingAcks.nextBatch();
     try {
       await client.ackMessages({
-        id: myId, session_token: mySession, lease_tokens: toFlush,
+        id: myId, session_token: mySession, lease_tokens: toFlush.map((item) => item.token),
       });
-      for (const tok of toFlush) {
-        const idx = pendingAcks.indexOf(tok);
-        if (idx !== -1) pendingAcks.splice(idx, 1);
-      }
+      pendingAcks.confirm(toFlush);
     } catch (e) {
       log(`ack flush failed (will retry next call): ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -415,7 +412,7 @@ async function withPiggyback(
   // until the NEXT call's confirm-flush promotes them to `seen` and
   // removes them. A dropped response thus leaves the message in place
   // for re-delivery, fixing the silent-loss race the codex-reviewer bot
-  // flagged on PR #2 round 1.
+  // identified in delivery analysis.
   let queued: LeasedMessage[] = [];
   try {
     queued = inboxStore ? await inboxStore.getUnreadMessages() : [];
@@ -448,7 +445,7 @@ async function withPiggyback(
   // queue" to "shown to the model."
   for (const m of fresh) {
     presentedPendingConfirm.add(m.id);
-    enqueueAck(m.lease_token);
+    enqueueAck(m.id, m.lease_token);
   }
 
   // ------------------------------------------------------------------------
@@ -484,11 +481,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         const lines = peers.map((p) =>
           [
-            `Peer ${p.name} (${p.peer_type})`,
-            `  ID: ${p.id}`,
-            `  CWD: ${p.cwd}`,
-            p.tty ? `  TTY: ${p.tty}` : null,
-            p.summary ? `  Summary: ${p.summary}` : null,
+            `Peer ${safe(p.name, 32)} (${p.peer_type})`,
+            `  ID: ${safe(p.id, 128)}`,
+            `  CWD: ${safe(p.cwd)}`,
+            p.tty ? `  TTY: ${safe(p.tty, 256)}` : null,
+            p.summary ? `  Summary: ${safe(p.summary, 1024)}` : null,
             `  Last seen: ${p.last_seen}`,
           ].filter(Boolean).join("\n")
         );
@@ -577,7 +574,7 @@ async function main() {
   const sharedSecret = await waitForSharedSecret();
   client = createClient(BROKER_URL, sharedSecret);
 
-  myCwd = process.cwd();
+  myCwd = await canonicalizePath(process.cwd());
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
 

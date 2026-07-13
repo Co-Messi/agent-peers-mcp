@@ -2,14 +2,14 @@
 // Best-effort terminal tab title updater via OSC escape sequences.
 // Never throws — cosmetic affordance must not crash the MCP server.
 //
-// Keepalive model (round 2):
+// Keepalive model:
 //   Modern terminals (iTerm2, Terminal.app, Warp, Ghostty, …) track the
 //   currently-running foreground process and periodically overwrite the
 //   tab title with the binary name ("node" / "bun"). Writing OSC once at
 //   startup therefore decays: the shell-side process tracker beats us.
 //   We re-assert every KEEPALIVE_INTERVAL_MS.
 //
-//   Round-2 tightening (based on live-session report that tab still
+//   Compatibility details (based on terminals where the tab still
 //   reverted to "node"):
 //     1. Interval dropped from 3s → 1s so the worst-case "node" window
 //        is ≤1s instead of ≤3s.

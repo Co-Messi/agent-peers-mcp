@@ -18,7 +18,7 @@ import {
   listOrphanedMessages,
 } from "../broker.ts";
 import type { Database } from "bun:sqlite";
-import { unlinkSync, existsSync } from "node:fs";
+import { unlinkSync, existsSync, symlinkSync, writeFileSync } from "node:fs";
 
 let db: Database;
 let TEST_DB: string;
@@ -64,6 +64,19 @@ test("initDb creates tables and indices with WAL", () => {
 
   const pragma = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get();
   expect(pragma?.journal_mode.toLowerCase()).toBe("wal");
+});
+
+test("initDb refuses a symlinked database path", () => {
+  const target = `${TEST_DB}.target`;
+  const link = `${TEST_DB}.link`;
+  writeFileSync(target, "not a database", { mode: 0o600 });
+  symlinkSync(target, link);
+  try {
+    expect(() => initDb(link)).toThrow(/symlink/i);
+  } finally {
+    if (existsSync(link)) unlinkSync(link);
+    if (existsSync(target)) unlinkSync(target);
+  }
 });
 
 // ---------- peer CRUD ----------
@@ -166,11 +179,11 @@ test("heartbeatPeer bumps last_seen with valid token", async () => {
   expect(getPeer(db, a.id)!.last_seen > initial).toBe(true);
 });
 
-test("heartbeatPeer with WRONG token silently no-ops (auth)", async () => {
+test("heartbeatPeer reports a wrong or expired session token", async () => {
   const a = reg({});
   const initial = getPeer(db, a.id)!.last_seen;
   await new Promise((r) => setTimeout(r, 20));
-  heartbeatPeer(db, a.id, "wrong-token");
+  expect(heartbeatPeer(db, a.id, "wrong-token")).toBe(false);
   expect(getPeer(db, a.id)!.last_seen).toBe(initial);
 });
 
@@ -180,9 +193,9 @@ test("setPeerSummary updates summary with valid token", () => {
   expect(getPeer(db, a.id)?.summary).toBe("Working on X");
 });
 
-test("setPeerSummary with wrong token is silently ignored (auth)", () => {
+test("setPeerSummary reports a wrong or expired session token", () => {
   const a = reg({});
-  setPeerSummary(db, a.id, "wrong", "MALICIOUS");
+  expect(setPeerSummary(db, a.id, "wrong", "MALICIOUS")).toBe(false);
   expect(getPeer(db, a.id)?.summary).toBe("");
 });
 
@@ -198,11 +211,11 @@ test("unregisterPeer removes peer row with valid token, preserves messages", () 
   expect(remaining?.c).toBe(1);
 });
 
-test("unregisterPeer with wrong token silently no-ops (auth — cannot delete another peer)", () => {
+test("unregisterPeer reports a wrong token and cannot delete another peer", () => {
   const a = reg({ name: "a" });
   const b = reg({ name: "b" });
   // 'a' tries to unregister 'b' using a's token
-  unregisterPeer(db, b.id, a.session_token);
+  expect(unregisterPeer(db, b.id, a.session_token)).toBe(false);
   expect(getPeer(db, b.id)).not.toBeNull();
 });
 
@@ -213,6 +226,15 @@ test("listPeers scope=machine returns all minus excluded", () => {
   const b = reg({ peer_type: "codex" });
   const peers = listPeers(db, { scope: "machine", cwd: "/any", git_root: null, exclude_id: a.id });
   expect(peers.map((p) => p.id)).toEqual([b.id]);
+});
+
+test("machine-wide discovery does not expose process or filesystem metadata", () => {
+  reg({ name: "private-peer", cwd: "/Users/alice/secret", tty: "ttys001", pid: 4242 });
+  const [peer] = listPeers(db, { scope: "machine", cwd: "/any", git_root: null });
+  expect(peer?.cwd).toBe("");
+  expect(Object.prototype.hasOwnProperty.call(peer, "pid")).toBe(false);
+  expect(Object.prototype.hasOwnProperty.call(peer, "tty")).toBe(false);
+  expect(Object.prototype.hasOwnProperty.call(peer, "git_root")).toBe(false);
 });
 
 test("listPeers scope=directory filters by cwd", () => {
@@ -239,6 +261,13 @@ test("listPeers filters out stale peers (closed-tab ghosts disappear immediately
   // Stale ghost is filtered; only live peer shows up.
   expect(peers.map((p) => p.name)).toEqual(["alive"]);
   expect(peers.map((p) => p.id)).not.toContain(b.id);
+});
+
+test("listPeers rejects implausible future timestamps after clock rollback or corruption", () => {
+  const future = reg({ name: "future-ghost" });
+  db.query("UPDATE peers SET last_seen = ? WHERE id = ?")
+    .run(new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), future.id);
+  expect(listPeers(db, { scope: "machine", cwd: "/", git_root: null })).toEqual([]);
 });
 
 test("listPeers NEVER returns session_token (critical auth regression)", () => {
@@ -398,13 +427,10 @@ test("pollMessages returns leased messages with enriched fields", () => {
 test("pollMessages returns at most 100 messages per request", () => {
   const from = reg({ name: "batch-sender" });
   const to = reg({ name: "batch-recipient" });
+  const insert = db.query("INSERT INTO messages (from_id, to_id, text, sent_at) VALUES (?, ?, ?, ?)");
+  const ts = new Date().toISOString();
   for (let i = 0; i < 105; i++) {
-    expect(sendMessage(db, {
-      from_id: from.id,
-      session_token: from.session_token,
-      to_id_or_name: to.id,
-      text: `message ${i}`,
-    }).ok).toBe(true);
+    insert.run(from.id, to.id, `message ${i}`, ts);
   }
   expect(pollMessages(db, to.id, to.session_token)).toHaveLength(100);
 });
@@ -574,4 +600,51 @@ test("gcStalePeers does NOT delete a peer whose last_seen was refreshed", () => 
   const removed = gcStalePeers(db);
   expect(removed).toBe(0);
   expect(getPeer(db, p.id)).not.toBeNull();
+});
+
+test("gc purges acknowledged messages after 24h and old orphans after 7d", () => {
+  const live = reg({ name: "retention-live" });
+  const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+  const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+  db.query("INSERT INTO messages (from_id, to_id, text, sent_at, acked) VALUES (?, ?, ?, ?, 1)")
+    .run(live.id, live.id, "old acked", twoDaysAgo);
+  db.query("INSERT INTO messages (from_id, to_id, text, sent_at, acked) VALUES (?, ?, ?, ?, 0)")
+    .run("gone", "gone", "old orphan", eightDaysAgo);
+  db.query("INSERT INTO messages (from_id, to_id, text, sent_at, acked) VALUES (?, ?, ?, ?, 0)")
+    .run(live.id, live.id, "recent pending", new Date().toISOString());
+
+  gcStalePeers(db);
+
+  const texts = db.query<{ text: string }, []>("SELECT text FROM messages ORDER BY id").all().map((r) => r.text);
+  expect(texts).toEqual(["recent pending"]);
+});
+
+test("sendMessage rejects a recipient mailbox above its pending quota", () => {
+  const from = reg({ name: "quota-sender" });
+  const to = reg({ name: "quota-recipient" });
+  const insert = db.query("INSERT INTO messages (from_id, to_id, text, sent_at) VALUES (?, ?, ?, ?)");
+  const ts = new Date().toISOString();
+  db.transaction(() => {
+    for (let i = 0; i < 1_000; i++) insert.run("other-senders", to.id, `queued-${i}`, ts);
+  })();
+  const result = sendMessage(db, {
+    from_id: from.id, session_token: from.session_token, to_id_or_name: to.id, text: "one too many",
+  });
+  expect(result.ok).toBe(false);
+  expect(result.error).toMatch(/mailbox.*full/i);
+});
+
+test("sendMessage rate-limits a sender to 60 messages per minute", () => {
+  const from = reg({ name: "rate-sender" });
+  const to = reg({ name: "rate-recipient" });
+  const insert = db.query("INSERT INTO messages (from_id, to_id, text, sent_at) VALUES (?, ?, ?, ?)");
+  const ts = new Date().toISOString();
+  db.transaction(() => {
+    for (let i = 0; i < 60; i++) insert.run(from.id, to.id, `recent-${i}`, ts);
+  })();
+  const result = sendMessage(db, {
+    from_id: from.id, session_token: from.session_token, to_id_or_name: to.id, text: "too fast",
+  });
+  expect(result.ok).toBe(false);
+  expect(result.error).toMatch(/rate limit/i);
 });

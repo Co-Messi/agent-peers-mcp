@@ -51,6 +51,10 @@ test("broker-client end-to-end: register → send → poll → ack", async () =>
     lease_tokens: polled.map((m) => m.lease_token),
   });
   expect(acked.acked).toBe(1);
+
+  const diagnostics = await client.diagnostics();
+  expect(diagnostics.peers).toBeGreaterThanOrEqual(2);
+  expect(diagnostics.acknowledged_messages).toBeGreaterThanOrEqual(1);
 });
 
 test("broker-client self-rename with peer session token", async () => {

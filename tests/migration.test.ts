@@ -1,6 +1,6 @@
 // Regression: opening a DB file created by the PRE-session_token schema must
-// transparently migrate, drop pre-upgrade peers, then serve register/send/poll
-// normally for freshly-registered peers. Self-heal on NULL tokens.
+// transparently migrate while preserving peer IDs and pending mail, then serve
+// register/send/poll normally. Self-heal on NULL tokens.
 // Code review round-3/round-4 findings.
 
 import { test, expect, afterEach } from "bun:test";
@@ -12,7 +12,7 @@ import {
   pollMessages,
   ackMessages,
 } from "../broker.ts";
-import { unlinkSync, existsSync } from "node:fs";
+import { chmodSync, unlinkSync, existsSync } from "node:fs";
 
 let TEST_DB: string;
 afterEach(() => {
@@ -58,9 +58,10 @@ function createLegacyDb(path: string) {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run("legacy-uuid-2", "legacy-beta", "codex", 2, "/legacy", null, null, "", ts, ts);
   db.close();
+  chmodSync(path, 0o600);
 }
 
-test("initDb migrates pre-session_token DB: adds column, DROPS legacy peers, messages table intact", () => {
+test("initDb migrates pre-session_token DB without orphaning pending messages", () => {
   TEST_DB = `/tmp/agent-peers-migration-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
   createLegacyDb(TEST_DB);
 
@@ -80,13 +81,22 @@ test("initDb migrates pre-session_token DB: adds column, DROPS legacy peers, mes
     ).all().map((r) => r.name);
     expect(cols).toContain("session_token");
 
-    // Legacy peer rows are gone (migration drops them)
+    // Legacy peers remain but are forced stale, so a same-name registration
+    // reclaims the original UUID and mailbox with a fresh token.
     const peerCount = db.query<{ c: number }, []>(
       "SELECT COUNT(*) AS c FROM peers"
     ).get()!.c;
-    expect(peerCount).toBe(0);
+    expect(peerCount).toBe(2);
 
-    // Pre-upgrade message survives (now visible as orphan via the LEFT JOIN)
+    const reclaimed = registerPeer(db, {
+      peer_type: "codex", pid: 22, cwd: "/new", git_root: null, tty: null,
+      summary: "", name: "legacy-beta",
+    });
+    expect(reclaimed.id).toBe("legacy-uuid-2");
+    expect(pollMessages(db, reclaimed.id, reclaimed.session_token).map((m) => m.text))
+      .toEqual(["pre-upgrade in-flight"]);
+
+    // Pre-upgrade message remains attached to the recoverable mailbox.
     const msgCount = db.query<{ c: number }, []>(
       "SELECT COUNT(*) AS c FROM messages WHERE acked = 0"
     ).get()!.c;

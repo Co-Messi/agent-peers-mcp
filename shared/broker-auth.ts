@@ -40,3 +40,10 @@ export function verifyHealthProof(
     return false;
   }
 }
+
+export function safeSecretEqual(presented: string | null, expected: string): boolean {
+  if (presented === null) return false;
+  const left = Buffer.from(presented, "utf8");
+  const right = Buffer.from(expected, "utf8");
+  return left.length === right.length && timingSafeEqual(left, right);
+}

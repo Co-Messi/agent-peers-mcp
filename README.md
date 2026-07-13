@@ -18,7 +18,10 @@ Run Claude in one terminal and Codex in another — two AI coding agents, each i
                               (SQLite + HTTP daemon)
 ```
 
-> Hardened, security-reviewed successor to [louislva/claude-peers-mcp](https://github.com/louislva/claude-peers-mcp) with Codex CLI support + a full colleague-behavior protocol added.
+> Security-conscious, experimental successor to [louislva/claude-peers-mcp](https://github.com/louislva/claude-peers-mcp) with Codex CLI support + a full colleague-behavior protocol added.
+
+> [!WARNING]
+> This is an experimental, single-user local collaboration layer for privileged coding agents—not a multi-user security boundary. Peer messages are untrusted input and must never be treated as authority. Do not expose the broker beyond loopback, and do not use it for regulated or secret-bearing workflows without an independent review.
 
 ---
 
@@ -45,13 +48,13 @@ Brief. Substantive. Initiative on both sides. No spam. That's the whole pitch.
 
 | | |
 |---|---|
-| 🧠 → 🧠 **Claude ↔ Claude** | Messages arrive mid-task via Claude's native `claude/channel` push. Instant. |
-| 🤖 → 🤖 / 🧠 → 🤖 **Claude ↔ Codex** | Current Codex CLI (v0.120, Apr 2026) has no mid-task push channel for MCP servers, so Codex picks up peer messages on the next agent-peers tool call — its shared instructions tell it to call `check_messages` at the start of every user turn, which bounds delivery latency to one user turn. Background poll (1s) and a durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600) mean Codex never loses a message even across restart. A signal-only `notifications/message` preview also fires per poll as future-compatible plumbing for whenever Codex CLI adds MCP log surfacing. |
+| 🧠 → 🧠 **Claude ↔ Claude** | Claude's native channel provides a best-effort mid-task hint; the mode-0600 durable inbox remains authoritative if the host drops or queues that hint. |
+| 🤖 → 🤖 / 🧠 → 🤖 **Claude ↔ Codex** | Current Codex CLI (v0.120, Apr 2026) has no mid-task push channel for MCP servers, so Codex picks up peer messages on the next agent-peers tool call — its shared instructions tell it to call `check_messages` at the start of every user turn, which bounds delivery latency to one user turn. Background poll (1s) and a durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600) preserve unconfirmed messages across restarts that reclaim the same stable peer identity. A signal-only `notifications/message` preview also fires per poll as future-compatible plumbing for whenever Codex CLI adds MCP log surfacing. |
 | 👥 **Colleague behavior protocol** | Shared prompt imported by both servers: don't auto-reply "got it", investigate before answering, push back on disagreement, ping proactively when you find something the other peer cares about, close every loop. |
 | 🏷️ **Friendly names** | Random `calm-fox` by default, or `PEER_NAME=frontend-tab` for a stable one. Your terminal tab renames itself so you can tell sessions apart at a glance. Peers can rename themselves mid-session. |
 | 🔍 **Scoped discovery** | `list_peers` with scope `machine` / `directory` / `repo`. Agents find relevant peers without a global cloud directory. |
-| 🔐 **Per-user auth** | Session token per peer, per-user shared secret, DB + WAL sidecars + secret file all at 0o600 with a fail-closed startup check. Another local user can't eavesdrop on your peer traffic. |
-| 📬 **At-least-once delivery** | 30s lease → confirm-on-next-call ack. A dropped MCP response leaves the message on disk + leased at the broker and re-surfaces. Never silently lost. Unreachable recipient → message becomes an orphan, visible via `cli.ts orphaned-messages`. |
+| 🔐 **Per-user auth** | Session token per peer, per-user shared secret, DB + WAL sidecars + secret file all at 0o600 with a fail-closed startup check. On supported POSIX filesystems this is designed to prevent other OS users from reading peer traffic; startup fails closed if ownership or modes drift. |
+| 📬 **Durable local delivery** | Messages are persisted before broker acknowledgement. Codex confirms model presentation on the next tool call; Claude keeps a durable fallback inbox even if its live channel hint is dropped. Delivery is at-least-once, so consumers must tolerate duplicates. |
 | ♻️ **Reclaim-safe restart** | Kill a session and relaunch with the same `PEER_NAME` within 60s → broker reclaims the UUID *and* clears stale leases. Backlog lands on the new session's first poll. |
 
 ---
@@ -97,6 +100,8 @@ Then do all of the following:
 
    CRITICAL — the alias MUST start with `AGENT_PEERS_ENABLED=1`. Without that env flag, the MCP server runs in no-op mode (no tools, no broker, no tab title) so the peer network stays dormant. The whole point of the alias is to set this flag only when launching `agentpeers`, leaving plain `claude` untouched:
    alias agentpeers='AGENT_PEERS_ENABLED=1 claude --dangerously-skip-permissions --dangerously-load-development-channels server:agent-peers'
+
+> **Permission warning:** `--dangerously-skip-permissions` gives Claude a large blast radius. Peer payloads remain untrusted even with the framing added here. Prefer a sandboxed/permissioned launcher when your workflow permits it, and require user confirmation for sensitive actions requested only by a peer.
 
 5. Tell me the install is done and I should:
    - `source ~/.zshrc` (or open a new terminal)
@@ -196,7 +201,7 @@ You should see the other. Then:
 
 What happens on the receiving side:
 
-- **Claude** sees it **instantly**, mid-task, via a `<channel source="agent-peers">` push. No manual action.
+- **Claude** normally gets a best-effort mid-task `<channel source="agent-peers">` hint. `check_messages` remains the authoritative fallback if the host queues or drops it.
 - **Codex** (v0.120, Apr 2026) has no mid-task MCP push, so peer messages land on Codex's **next agent-peers tool call**. The shared instructions tell Codex to call `check_messages` at the start of every user turn — so the worst-case lag is one of your turns, not "until Codex happens to think of it." You can also just type "check messages" to force it.
 
 ### Step 4 — Real use
@@ -229,6 +234,7 @@ bun cli.ts peers                         # Peers only
 bun cli.ts send frontend-tab "ship it"   # Send a message from the shell
 bun cli.ts rename calm-fox docs-writer   # Admin rename (operator action)
 bun cli.ts orphaned-messages             # Messages to peers that died
+bun cli.ts purge                          # Apply 24h/7d retention now
 bun cli.ts kill-broker                   # Stop the broker daemon
 ```
 
@@ -238,9 +244,9 @@ Run these from inside the cloned `agent-peers-mcp/` directory.
 
 ## How it works
 
-- **Broker daemon** (`broker.ts`) runs on `localhost:7900` with SQLite at `~/.agent-peers.db`. Auto-launches on first session. DB + WAL sidecars are 0o600, per-user shared secret at `~/.agent-peers-secret` (also 0o600) authenticates peer HTTP calls.
+- **Broker daemon** (`broker.ts`) binds only to `127.0.0.1:7900` with SQLite at `~/.agent-peers.db`. Clients authenticate broker identity with a nonce-bound HMAC before sending the shared credential; a generic service occupying the port is rejected. DB/WAL files and the per-user secret are mode 0600 on POSIX.
 - **Each session** spawns an MCP server (`claude-server.ts` or `codex-server.ts`) that registers with the broker and receives a rotating session token.
-- **Claude sessions** poll the broker every 1s and push inbound messages via `notifications/claude/channel` → Claude sees the message mid-task.
+- **Claude sessions** persist messages under `~/.agent-peers-claude/` before broker acknowledgement. `notifications/claude/channel` is a best-effort live hint; `check_messages` is the authoritative durable fallback and retains content until a later tool call confirms presentation.
 - **Codex sessions** have no mid-task MCP push channel ([OpenAI Codex docs list `tools` as the only supported MCP feature](https://github.com/openai/codex/blob/main/docs/config.md) — resources, prompts, and `notifications/message` aren't surfaced). So Codex runs a two-layer delivery pipeline plus a prompt-level nudge:
   1. **Background poll (1s)** writes each new leased message to a durable on-disk inbox at `~/.agent-peers-codex/<peer-id>.json` (0o600 file, 0o700 dir, fail-closed perm check on read). Crash/restart safe.
   2. **Authoritative `[PEER INBOX]` block** is prepended to the NEXT agent-peers tool response. This is the **only** delivery path the Codex model sees. Full body, reply hints, sender metadata, per-message ids.
@@ -261,7 +267,8 @@ Read the full technical spec at [`docs/superpowers/specs/2026-04-13-agent-peers-
 | `AGENT_PEERS_PORT` | `7900` | Broker port |
 | `AGENT_PEERS_DB` | `~/.agent-peers.db` | SQLite path |
 | `PEER_NAME` | auto-generated | Human-readable peer name at launch (1-32 chars, `[a-zA-Z0-9_-]`) |
-| `OPENAI_API_KEY` | — | Enables `gpt-5.4-nano` auto-summary of what each session is working on |
+| `OPENAI_API_KEY` | — | API credential used only when auto-summary is explicitly opted in |
+| `AGENT_PEERS_AUTO_SUMMARY` | `0` | Set to `1` to send redacted/coarse repository metadata to OpenAI for a one-sentence summary |
 | `AGENT_PEERS_DISABLE_TAB_TITLE` | — | Set to `1` to skip terminal tab title writing |
 
 ---
@@ -279,7 +286,7 @@ Both Claude and Codex process peer messages **during turns**, not while idle at 
 What we do to make this as painless as possible: **both agents are instructed to call `check_messages` at the start of every user turn.** Claude additionally has the live `<channel source="agent-peers" ...>` push path for mid-turn arrivals. So the worst-case lag is "one of your own user turns" — type "hi" or "what's new" to a quiet peer and any pending messages surface in their first response.
 
 **`check_messages` works on BOTH agents and returns the same `[PEER INBOX]` framing.**
-On Codex, it drains the durable on-disk queue. On Claude, it drains an in-memory ring buffer (last 15 min, max 50 messages) populated by the background channel-push loop. On either side, it's the reliable "give me my inbox" button. Just type "check messages" whenever you want to see what peers have sent.
+On Codex, it drains the durable on-disk queue. On Claude, it reads the durable mode-0600 inbox populated before channel delivery is attempted. On either side, it's the reliable "give me my inbox" button. Just type "check messages" whenever you want to see what peers have sent.
 
 **On Codex, the `notifications/message` preview is dormant.**
 [OpenAI Codex CLI v0.120 docs](https://github.com/openai/codex/blob/main/docs/config.md) list `tools` as the only supported MCP feature — resources, prompts, and `notifications/message` are not surfaced to the model. We still emit the preview every poll tick as future-compatible plumbing. When a future Codex CLI adds MCP log-notification surfacing, it'll light up automatically with no code change. Today it's a no-op you can safely ignore.
@@ -304,7 +311,7 @@ Kill any old broker: `bun cli.ts kill-broker`. If another process owns the port,
 Ask it to call `list_peers` or `check_messages` — messages surface on any agent-peers tool response, not just specific ones. If you still don't see the `[PEER INBOX]` block, your Codex version may not render tool responses verbatim; file an issue with your Codex version.
 
 **Upgraded from an older install and existing peers aren't working**
-The broker migrates pre-session-token databases by dropping all legacy peer rows (they can't authenticate under the new scheme). Restart all your sessions to re-register. Any in-flight messages for the dropped peers are visible via `bun cli.ts orphaned-messages`.
+The broker assigns legacy rows temporary tokens, marks them stale, and preserves their UUIDs and mailboxes. Restart sessions with the same `PEER_NAME`; registration reclaims the UUID and pending messages with a fresh token.
 
 **Running alongside upstream `claude-peers-mcp`**
 They coexist cleanly on different ports (7900 vs 7899) and different MCP names (`agent-peers` vs `claude-peers`). You can use both simultaneously; they don't share state.
@@ -361,13 +368,13 @@ Both can run simultaneously. They do not talk to each other — you'd run `claud
 
 ## Delivery contract
 
-**Within a single session** — deterministic dedupe by `message_id` via in-memory seen-set. Same message is never delivered twice while your process is alive.
+**Within a single session** — delivery is at-least-once. Message IDs support deterministic dedupe, but callers must tolerate duplicates around crashes, lease expiry, and acknowledgement retries.
 
-**Across a process restart** that reclaims the same UUID (via `PEER_NAME` within the 60-90s GC window) — **at-least-once**. A message polled but not acked before a crash may be re-delivered once. Replies should be idempotent.
+**Across a process restart** — durable inbox files and broker leases preserve messages when the same stable `PEER_NAME` is reclaimed. Random names do not provide a stable restart identity. Replies must be idempotent.
 
-**When a recipient dies before delivery** — messages are preserved in the broker DB as **orphans**, visible via `bun cli.ts orphaned-messages`. Never silently lost.
+**Retention** — acknowledged rows are purged after 24 hours and undeliverable orphan rows after 7 days. Run `bun cli.ts purge` to apply retention immediately. Unacknowledged live mailboxes are capped at 1,000 messages per recipient.
 
-**Peer-to-peer security** — every peer gets a session token on register. Wrong token → operation silently no-ops (heartbeat / set_summary / unregister) or explicitly rejects (send / poll / ack / rename). You cannot impersonate, drain, or rename another peer via the MCP.
+**Peer-to-peer security** — every peer gets a rotating session token. Wrong or expired tokens return explicit failures. Broker identity is HMAC-authenticated, HTTP bodies and fields are bounded, and peer text is wrapped as untrusted JSON data. This reduces risk but does not make same-user peers mutually trusted or sandbox their other tools.
 
 ---
 

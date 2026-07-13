@@ -23,7 +23,7 @@ import { lstatSync } from "node:fs";
  * mode-weakened file means another local user could have read it.
  *
  * Exported so the broker side can apply the identical check to an existing
- * secret file before trusting it (Codex round-E finding).
+ * secret file before trusting it (Security invariant finding).
  */
 export function validateSecretFilePerms(path: string): void {
   const lst = lstatSync(path);
@@ -33,6 +33,9 @@ export function validateSecretFilePerms(path: string): void {
   const st = statSync(path);
   if (!st.isFile()) {
     throw new Error(`shared secret at ${path} is not a regular file`);
+  }
+  if (st.nlink !== 1) {
+    throw new Error(`shared secret at ${path} has ${st.nlink} hard links; expected exactly one link`);
   }
   // POSIX: stat.uid compared to process.getuid()
   if (typeof (process as unknown as { getuid?: () => number }).getuid === "function") {

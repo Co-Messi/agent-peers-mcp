@@ -3,6 +3,7 @@ import {
   createHealthNonce,
   createHealthProof,
   verifyHealthProof,
+  safeSecretEqual,
 } from "../shared/broker-auth.ts";
 
 test("health proof authenticates the nonce and broker pid", () => {
@@ -10,6 +11,14 @@ test("health proof authenticates the nonce and broker pid", () => {
   const nonce = createHealthNonce();
   const value = { ok: true as const, pid: 42, nonce, proof: createHealthProof(secret, nonce, 42) };
   expect(verifyHealthProof(value, secret, nonce)).toBe(true);
+});
+
+test("shared-secret comparison rejects missing, short, and incorrect values", () => {
+  const secret = "s".repeat(64);
+  expect(safeSecretEqual(secret, secret)).toBe(true);
+  expect(safeSecretEqual(null, secret)).toBe(false);
+  expect(safeSecretEqual("s", secret)).toBe(false);
+  expect(safeSecretEqual("x".repeat(64), secret)).toBe(false);
 });
 
 test("health proof rejects another secret, nonce, pid, and malformed payload", () => {

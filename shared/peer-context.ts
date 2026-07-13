@@ -1,6 +1,12 @@
 // shared/peer-context.ts
 // Best-effort process metadata for peer registration.
 
+import { realpath } from "node:fs/promises";
+
+export async function canonicalizePath(path: string): Promise<string> {
+  try { return await realpath(path); } catch { return path; }
+}
+
 export async function getGitRoot(cwd: string): Promise<string | null> {
   try {
     const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
@@ -8,7 +14,7 @@ export async function getGitRoot(cwd: string): Promise<string | null> {
     });
     const text = await new Response(proc.stdout).text();
     const code = await proc.exited;
-    return code === 0 ? text.trim() : null;
+    return code === 0 ? await canonicalizePath(text.trim()) : null;
   } catch {
     return null;
   }

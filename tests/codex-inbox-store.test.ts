@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmod, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir, platform } from "node:os";
 
@@ -211,6 +211,17 @@ test.if(IS_POSIX)("CodexInboxStore refuses a symlinked state directory", async (
   await symlink(target, linked, "dir");
   const store = new CodexInboxStore({ peerId: "peer-link", rootDir: linked });
   await expect(store.init()).rejects.toThrow(/symlink|directory/i);
+});
+
+test.if(IS_POSIX)("CodexInboxStore refuses a multiply-linked inbox file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-peers-codex-"));
+  tempDirs.push(dir);
+  const target = join(dir, "target.json");
+  const inbox = join(dir, "peer-hardlink.json");
+  await writeFile(target, JSON.stringify({ version: 1, unread: [] }), { mode: 0o600 });
+  await link(target, inbox);
+  const store = new CodexInboxStore({ peerId: "peer-hardlink", rootDir: dir });
+  await expect(store.init()).rejects.toThrow(/hard link|links/i);
 });
 
 test("CodexInboxStore rejects an unbounded unread queue", async () => {

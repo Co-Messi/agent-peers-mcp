@@ -150,7 +150,7 @@ test("idle-arrival simulation for Claude's check_messages backfill path", async 
 
   const inbox = formatInboxBlock(recent);
   expect(inbox).toContain("PEER INBOX");
-  expect(inbox).toContain("from: idle-sender");
+  expect(inbox).toContain('"from_name":"idle-sender"');
   expect(inbox).toContain(body);
 });
 

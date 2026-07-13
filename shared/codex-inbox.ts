@@ -16,6 +16,9 @@ import { dirname, join } from "node:path";
 
 import { MAX_ID_CHARS, MAX_MESSAGE_BYTES, MAX_PATH_CHARS, MAX_SUMMARY_CHARS, utf8ByteLength } from "./limits.ts";
 import type { LeasedMessage, PeerId } from "./types.ts";
+import { createLogger } from "./logger.ts";
+
+const inboxLog = createLogger("durable-inbox");
 
 interface CodexInboxState {
   version: 1;
@@ -206,13 +209,16 @@ export class CodexInboxStore {
     if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
       throw new Error(`inbox path is a symlink or not a regular file: ${this.filePath}`);
     }
+    if (fileStat.nlink !== 1) {
+      throw new Error(`inbox file has ${fileStat.nlink} hard links; expected exactly one link`);
+    }
     if (IS_POSIX) {
       const mine = (process as unknown as { getuid?: () => number }).getuid?.();
       if (typeof mine === "number" && fileStat.uid !== mine) {
         throw new Error(`inbox file is not owned by the current user: ${this.filePath}`);
       }
       if ((fileStat.mode & 0o777) !== FILE_MODE) {
-        console.error(`[agent-peers/codex-inbox] refusing insecure inbox mode at ${this.filePath}`);
+        inboxLog.error("insecure_file_mode");
         return { ...EMPTY_STATE, unread: [] };
       }
     }
@@ -227,7 +233,7 @@ export class CodexInboxStore {
   private async quarantine(reason: string): Promise<CodexInboxState> {
     const quarantinePath = `${this.filePath}.corrupt-${Date.now()}-${randomUUID()}`;
     await rename(this.filePath, quarantinePath);
-    console.error(`[agent-peers/codex-inbox] quarantined corrupt inbox (${reason}) at ${quarantinePath}`);
+    inboxLog.warn("state_quarantined", { reason });
     return { ...EMPTY_STATE, unread: [] };
   }
 
